@@ -1,0 +1,183 @@
+# Design Tokens - Craft Design System
+# All code must use these tokens. Hooks enforce compliance.
+# Hardcoded values will be flagged.
+#
+# ROLE: this file is the SINGLE SOURCE for design VALUES (colors, spacing,
+# radius, type, shadows, motion timing, breakpoints). quality.yaml holds
+# standards/floors and references these values - it never re-encodes them.
+#
+# Design language: "Movie night, guided" - Seerr's midnight navy and
+# indigo-to-purple glow, with roomy frosted cards that make a technical
+# setup feel like settling in for a film. DARK THEME.
+# Locked 2026-09-19 from inspiration session (source: https://seerr.dev/).
+
+# ─────────────────────────────────────────────────────────────
+# COLORS
+# ─────────────────────────────────────────────────────────────
+colors:
+  # Primary palette
+  primary: "#625fff"                     # from Seerr (indigo-500) - main buttons, highlights
+  primary-hover: "#7d87ff"               # from Seerr (indigo-400) - lighter hover reads better on dark
+  primary-light: "rgba(98, 95, 255, 0.15)"  # from Seerr - selected cards, badges
+  accent: "#ac4bff"                      # from Seerr (purple-500) - gradient partner: primary -> accent
+
+  # Spotlight - gold has ONE meaning: "the light is on you right now"
+  # (active tile ring/glow, eyebrow label, finale badge, focus ring). Never a fill, never a status.
+  spotlight: "#ffd166"                   # Locked: 2026-09-18 - from mockup 2026-09-18-deploy-turns-green
+  spotlight-soft: "rgba(255, 209, 102, 0.4)"  # Locked: 2026-09-18 - from mockup 2026-09-18-deploy-turns-green - ring halo / glow
+  spotlight-text: "#ffd98a"              # Locked: 2026-09-18 - from mockup 2026-09-18-deploy-turns-green - reassuring "taking a little longer" notes
+  scrim: "rgba(0, 0, 0, 0.42)"           # Locked: 2026-09-18 - from mockup 2026-09-18-deploy-turns-green - flat layer under the purple gradient on lit tiles (keeps white text ~9.8:1)
+
+  # Neutrals
+  background: "#101828"                  # from Seerr (gray-900) - page background
+  background-alt: "#1e2939"              # from Seerr (gray-800) - page gradient start (alt -> background)
+  surface: "rgba(30, 41, 57, 0.5)"       # from Seerr (gray-800 @ 50%) - frosted card backgrounds
+  surface-hover: "rgba(54, 65, 83, 0.5)" # from Seerr (gray-700 @ 50%) - hover state
+  border: "rgba(54, 65, 83, 0.5)"        # from Seerr (gray-700 @ 50%) - borders, dividers
+  border-strong: "#4a5565"               # from Seerr (gray-600) - inputs, emphasized borders
+  border-accent: "rgba(98, 95, 255, 0.5)"  # from Seerr (indigo-500 @ 50%) - selected/active outlines
+
+  # Text
+  text-primary: "#ffffff"                # from Seerr - main text
+  text-secondary: "#99a1af"              # from Seerr (gray-400) - descriptions, help text (6.8:1 on background)
+  text-muted: "#6a7282"                  # from Seerr (gray-500) - DISABLED ONLY (3.6:1 - fails AA for body text)
+  text-accent: "#c7d2ff"                 # from Seerr (indigo-200) - text on primary-light
+  text-inverse: "#101828"                # from Seerr - text on light backgrounds
+
+  # Semantic
+  success: "#05df72"                     # from Seerr (green-400)
+  success-light: "rgba(5, 223, 114, 0.15)"   # derived - success backgrounds on dark
+  warning: "#F59E0B"                     # default
+  warning-light: "rgba(245, 158, 11, 0.15)"  # derived - warning backgrounds on dark
+  error: "#ff6568"                       # from Seerr (red-400)
+  error-light: "rgba(255, 101, 104, 0.15)"   # derived - error backgrounds on dark
+  info: "#7d87ff"                        # from Seerr (indigo-400)
+  info-light: "rgba(125, 135, 255, 0.15)"    # derived - info backgrounds on dark
+
+# ─────────────────────────────────────────────────────────────
+# SPACING
+# ─────────────────────────────────────────────────────────────
+spacing:
+  unit: 4px                              # from Seerr - base unit
+  scale:
+    0: "0px"
+    1: "4px"                             # xs
+    2: "8px"                             # sm
+    3: "12px"
+    4: "16px"                            # md
+    5: "20px"
+    6: "24px"                            # lg - card padding (from Seerr)
+    8: "32px"                            # xl
+    10: "40px"
+    12: "48px"                           # 2xl
+    16: "64px"                           # section padding (from Seerr)
+    20: "80px"
+    24: "96px"                           # section padding (from Seerr)
+
+  # Named aliases
+  xs: "4px"
+  sm: "8px"
+  md: "16px"
+  lg: "24px"
+  xl: "32px"
+  2xl: "48px"
+
+# ─────────────────────────────────────────────────────────────
+# BORDER RADIUS
+# ─────────────────────────────────────────────────────────────
+radius:
+  none: "0px"
+  sm: "4px"                              # default
+  md: "8px"                              # from Seerr - inputs, buttons
+  lg: "12px"                             # from Seerr - cards (dominant radius)
+  xl: "16px"                             # from Seerr - large panels, modals
+  2xl: "20px"                            # Locked: 2026-09-18 - from mockup 2026-09-18-deploy-turns-green - poster tiles
+  full: "9999px"                         # from Seerr - pills, step badges
+
+# ─────────────────────────────────────────────────────────────
+# TYPOGRAPHY
+# ─────────────────────────────────────────────────────────────
+typography:
+  # Font families
+  font-sans: "Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"  # from Seerr
+  font-mono: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace"          # from Seerr - file paths
+
+  # Font sizes (px)
+  text-xs: 12
+  text-sm: 14                            # from Seerr - most common
+  text-base: 16
+  text-lg: 18                            # from Seerr - lede / card titles
+  text-xl: 20
+  text-2xl: 24
+  text-3xl: 30                           # from Seerr - section headlines
+  text-4xl: 36                           # from Seerr - page headlines
+
+  # Font weights
+  weight-normal: 400
+  weight-medium: 500
+  weight-semibold: 600                   # from Seerr - dominant weight
+  weight-bold: 700
+  weight-extrabold: 800                  # from Seerr - headlines
+
+  # Line heights
+  leading-none: 1
+  leading-tight: 1.25
+  leading-snug: 1.375
+  leading-normal: 1.5
+  leading-relaxed: 1.625
+  leading-loose: 2
+
+  # Letter spacing
+  tracking-tighter: "-0.05em"
+  tracking-tight: "-0.025em"
+  tracking-normal: "0em"
+  tracking-wide: "0.025em"
+  tracking-wider: "0.1em"                # Locked: 2026-09-18 - from mockup 2026-09-18-deploy-turns-green - uppercase labels
+  tracking-widest: "0.18em"              # Locked: 2026-09-18 - from mockup 2026-09-18-deploy-turns-green - uppercase eyebrow
+
+# ─────────────────────────────────────────────────────────────
+# SHADOWS
+# ─────────────────────────────────────────────────────────────
+shadows:
+  none: "none"
+  sm: "0 1px 2px 0 rgba(0, 0, 0, 0.05)"                                              # default
+  md: "0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -2px rgba(0, 0, 0, 0.1)"         # default
+  lg: "0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -4px rgba(0, 0, 0, 0.1)"       # from Seerr
+  xl: "0 25px 50px -12px rgba(0, 0, 0, 0.25)"                                        # from Seerr - raised cards
+  glow: "0 10px 15px -3px rgba(98, 95, 255, 0.25)"                                   # from Seerr - primary button glow
+
+# ─────────────────────────────────────────────────────────────
+# TRANSITIONS
+# ─────────────────────────────────────────────────────────────
+transitions:
+  fast: "150ms ease"                     # Micro-interactions
+  normal: "200ms ease"                   # Standard transitions
+  slow: "300ms ease"                     # Larger animations
+
+  # Easing functions
+  ease-in: "cubic-bezier(0.4, 0, 1, 1)"
+  ease-out: "cubic-bezier(0, 0, 0.2, 1)"
+  ease-in-out: "cubic-bezier(0.4, 0, 0.2, 1)"
+
+# ─────────────────────────────────────────────────────────────
+# Z-INDEX
+# ─────────────────────────────────────────────────────────────
+z-index:
+  dropdown: 1000
+  sticky: 1020
+  fixed: 1030
+  modal-backdrop: 1040
+  modal: 1050
+  popover: 1060
+  tooltip: 1070
+  toast: 1080
+
+# ─────────────────────────────────────────────────────────────
+# BREAKPOINTS
+# ─────────────────────────────────────────────────────────────
+breakpoints:
+  sm: "640px"                            # Mobile landscape
+  md: "768px"                            # Tablet
+  lg: "1024px"                           # Desktop
+  xl: "1280px"                           # Large desktop
+  2xl: "1536px"                          # Extra large

@@ -9,4 +9,9 @@ dist/
 
 # Planning notebook (craft harness: plans, reports, mockups). Kept on the owner's machine only -
 # never uploaded to the public project. Owner decision, 2026-09-19.
-.craft/
+.craft/*
+# ...with ONE exception: the design values (colours, fonts, sizes - nothing personal).
+# The style file's tests read it, so it has to travel with the code.
+!.craft/design/
+.craft/design/*
+!.craft/design/tokens.yaml
