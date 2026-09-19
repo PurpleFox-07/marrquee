@@ -1,0 +1,172 @@
+/* Styles for the alive page.
+ *
+ * Every colour, spacing, type, radius, shadow and motion value here is a CSS
+ * custom property from tokens.css - never a literal. The only literals
+ * allowed are structural values with no matching token: 880px (wrap
+ * max-width), 1px (hairline border), 2px (focus-ring width/offset),
+ * scale(0.97) (button press) and brightness(1.12) (button hover).
+ */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  font-family: var(--font-sans);
+  color: var(--text-primary);
+  background: linear-gradient(to bottom right, var(--background-alt), var(--background)) fixed;
+  -webkit-font-smoothing: antialiased;
+}
+
+.wrap {
+  max-width: 880px;
+  margin: 0 auto;
+  padding: var(--space-12) var(--space-4) var(--space-24);
+}
+
+.eyebrow {
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-bold);
+  letter-spacing: var(--tracking-widest);
+  color: var(--spotlight);
+}
+
+h1 {
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-4xl);
+  font-weight: var(--weight-extrabold);
+  letter-spacing: var(--tracking-tight);
+  color: var(--text-primary);
+}
+
+/* The word "running" only - the gradient is a spotlight-adjacent accent,
+ * never applied to the whole headline. */
+h1 .accent {
+  background: linear-gradient(to right, var(--primary-hover), var(--accent));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.lede {
+  margin: 0 0 var(--space-8);
+  font-size: var(--text-lg);
+  line-height: var(--leading-normal);
+  color: var(--text-secondary);
+}
+
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-xl);
+  padding: var(--space-6);
+}
+
+.status-row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+}
+
+/* Decorative only (aria-hidden in the template) - the ok/fail wording lives
+ * in the title text, never in this icon's colour alone. */
+.status-icon {
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  width: var(--space-6);
+  height: var(--space-6);
+  border-radius: var(--radius-full);
+  font-size: var(--text-sm);
+}
+
+.status-icon--ok {
+  color: var(--success);
+  background: var(--success-light);
+}
+
+.status-icon--fail {
+  color: var(--error);
+  background: var(--error-light);
+}
+
+.status-title {
+  margin: 0;
+  font-size: var(--text-base);
+  font-weight: var(--weight-semibold);
+  color: var(--text-primary);
+}
+
+.status-detail {
+  margin: var(--space-1) 0 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text-secondary);
+}
+
+/* Reserved for a detail line that names a file path (none does today) - file
+ * paths read better in the monospace stack than in the body font. */
+.status-detail-path {
+  font-family: var(--font-mono);
+}
+
+.actions {
+  margin-top: var(--space-8);
+}
+
+.btn-primary {
+  display: inline-block;
+  font: inherit;
+  font-size: var(--text-base);
+  font-weight: var(--weight-semibold);
+  color: var(--text-primary);
+  text-decoration: none;
+  padding: var(--space-4) var(--space-8);
+  border: 0;
+  border-radius: var(--radius-full);
+  background: linear-gradient(to right, var(--primary), var(--accent));
+  box-shadow: var(--shadow-glow);
+  transition:
+    filter var(--transition-fast),
+    transform var(--transition-fast);
+}
+
+.btn-primary:hover {
+  filter: brightness(1.12);
+}
+
+.btn-primary:active {
+  transform: scale(0.97);
+}
+
+.btn-primary:focus-visible {
+  outline: 2px solid var(--spotlight);
+  outline-offset: 2px;
+}
+
+.footer {
+  margin-top: var(--space-12);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+
+/* No motion on initial page paint - the only transitions this page has are
+ * the button's hover and press above, both switched off here for anyone who
+ * has asked their OS to reduce motion. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition: none !important;
+    animation: none !important;
+  }
+}

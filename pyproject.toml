@@ -1,0 +1,58 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "marrquee"
+description = "A self-hosted web wizard that deploys and wires together the arr media stack."
+requires-python = ">=3.12"
+dynamic = ["version"]
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "jinja2",
+    "httpx",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "ruff",
+    "mypy",
+    "pyyaml",
+]
+
+[tool.hatch.version]
+path = "src/marrquee/__init__.py"
+pattern = "^__version__: str = ['\"](?P<version>[^'\"]+)['\"]"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/marrquee"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+# Makes "tools" (the build-time scripts, not part of the shipped package)
+# importable from tests without installing it into the venv.
+pythonpath = ["."]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src", "tools", "tests"]
+
+[[tool.mypy.overrides]]
+module = "marrquee.*"
+disallow_untyped_defs = true
+
+[[tool.mypy.overrides]]
+# PyYAML ships no type stubs and is dev-only, so a types-PyYAML runtime
+# stub package isn't worth adding for two call sites.
+module = "yaml"
+ignore_missing_imports = true
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

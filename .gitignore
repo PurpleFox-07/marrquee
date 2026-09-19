@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+.DS_Store
+
+# Planning notebook (craft harness: plans, reports, mockups). Kept on the owner's machine only -
+# never uploaded to the public project. Owner decision, 2026-09-19.
+.craft/

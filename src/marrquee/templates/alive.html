@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="wrap">
+  <p class="eyebrow">MARRQUEE</p>
+  <h1>Marrquee is <span class="accent">running</span>.</h1>
+  <p class="lede">
+    This is the first piece. Next comes the setup wizard that picks your
+    apps and builds your folders.
+  </p>
+
+  <div class="card">
+    {% for line in lines %}
+    <div class="status-row">
+      <span
+        class="status-icon {{ 'status-icon--ok' if line.ok else 'status-icon--fail' }}"
+        aria-hidden="true"
+      >{{ "✓" if line.ok else "✕" }}</span>
+      <div class="status-text">
+        <p class="status-title">{{ line.title }}</p>
+        <p class="status-detail">{{ line.detail }}</p>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+
+  <div class="actions">
+    <a class="btn-primary" href="/">Check again</a>
+  </div>
+
+  <p class="footer">Version {{ version }}</p>
+</div>
+{% endblock %}

@@ -1,0 +1,191 @@
+name: CI
+
+# Quoted so PyYAML (used by tests/test_workflow.py) reads this key back as
+# the string "on" rather than the boolean True, which is how YAML 1.1
+# parses a bare `on:` key.
+"on":
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install dependencies
+        run: uv sync --locked --dev
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Check formatting
+        run: uv run ruff format --check .
+
+      - name: Type check
+        run: uv run mypy
+
+      - name: Run the test suite
+        run: uv run pytest
+
+  image:
+    name: Build, smoke test and publish
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      # Registers QEMU binfmt handlers so the runner's amd64 kernel can
+      # execute an arm64 image - this is what proves "works on ARM" without
+      # the owner's NAS ever being involved.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # A multi-platform build cannot be `--load`ed into the local Docker
+      # daemon, so each architecture is built single-platform and loaded on
+      # its own for the smoke test below. The multi-arch build that actually
+      # gets pushed happens once, later, after both smokes pass.
+      - name: Build the amd64 image for the smoke test
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: marrquee:smoke-amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The runner's own /var/run/docker.sock is a real Linux daemon socket
+      # (not the VM shim a Mac's Docker Desktop presents), so this is a
+      # stronger check than the dev machine could ever give.
+      - name: Start the amd64 image against the runner's real Docker socket
+        run: |
+          docker run -d --name marrquee-smoke-amd64 \
+            -p 7788:7788 \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            marrquee:smoke-amd64
+
+      - name: Wait for the amd64 image to answer /healthz
+        run: |
+          for _ in $(seq 1 15); do
+            if curl -fsS http://127.0.0.1:7788/healthz; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::marrquee never answered /healthz within 30s on amd64"
+          docker logs marrquee-smoke-amd64
+          exit 1
+
+      - name: Assert the amd64 image is talking to the runner's real Docker daemon
+        run: curl -fsS http://127.0.0.1:7788/ | grep -q "Talking to Docker"
+
+      - name: Stop the amd64 smoke container
+        if: always()
+        run: docker rm -f marrquee-smoke-amd64
+
+      - name: Build the arm64 image for the smoke test
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/arm64
+          load: true
+          tags: marrquee:smoke-arm64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Only /healthz is asserted here - it needs no Docker socket, and the
+      # only thing this step is proving is "does this binary start on ARM".
+      - name: Start the arm64 image under QEMU emulation
+        run: |
+          docker run -d --name marrquee-smoke-arm64 \
+            --platform linux/arm64 \
+            -p 7788:7788 \
+            marrquee:smoke-arm64
+
+      - name: Wait for the arm64 image to answer /healthz
+        run: |
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:7788/healthz; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::marrquee never answered /healthz within 60s on arm64"
+          docker logs marrquee-smoke-arm64
+          exit 1
+
+      - name: Stop the arm64 smoke container
+        if: always()
+        run: docker rm -f marrquee-smoke-arm64
+
+      # Everything from here on only runs for a real push (never for a pull
+      # request, which cannot use `packages: write`), and only after both
+      # smokes above have passed - a half-tested image never reaches :latest.
+      - name: Prepare image metadata for the published tags
+        if: github.event_name == 'push'
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          # Written out literally, never derived from the repository's own
+          # name - that carries its real mixed case (PurpleFox-07/marrquee),
+          # and GHCR rejects uppercase image paths.
+          images: ghcr.io/purplefox-07/marrquee
+          flavor: latest=false
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,prefix=sha-,format=short,enable=${{ github.ref == 'refs/heads/main' }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+          # Written out on purpose: this label is what makes the published
+          # package's page on GitHub link back to the project page. The action
+          # would also derive it on its own, but a stated value can be read
+          # here and is pinned by a test.
+          labels: |
+            org.opencontainers.image.source=https://github.com/PurpleFox-07/marrquee
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish the multi-arch image
+        if: github.event_name == 'push'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify the published tag lists both platforms
+        if: github.event_name == 'push'
+        run: |
+          output=$(docker buildx imagetools inspect ghcr.io/purplefox-07/marrquee:latest)
+          echo "$output"
+          echo "$output" | grep -q "linux/amd64"
+          echo "$output" | grep -q "linux/arm64"

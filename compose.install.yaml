@@ -1,0 +1,30 @@
+# Marrquee - paste this whole file into your NAS's Docker app.
+#
+# On the Ugreen NAS: open the Docker app, choose Project, then Create, and
+# paste this in. Nothing here needs changing except the line marked below,
+# and only if something else on your NAS is already using port 7788.
+services:
+  marrquee:
+    image: ghcr.io/purplefox-07/marrquee:latest
+    container_name: marrquee
+    restart: unless-stopped
+    ports:
+      # If something already uses 7788, change only the first number - the
+      # second number is the port Marrquee listens on inside its own
+      # container, and must stay 7788.
+      - "7788:7788"
+    volumes:
+      # Lets Marrquee see whether Docker is running and read its version.
+      # In this version Marrquee only looks - nothing here can start, stop
+      # or change a container.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Where Marrquee keeps the choices you make and the settings it
+      # generates. This survives restarts and reinstalls.
+      - marrquee-config:/config
+      # This lets Marrquee see your drives, so it can check the folder you
+      # type and build the media folders inside it. Marrquee only ever
+      # writes inside the one folder you choose.
+      - /:/host
+
+volumes:
+  marrquee-config:

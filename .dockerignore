@@ -1,0 +1,15 @@
+# Keep the build context small and keep dev-only tooling out of the image.
+# Do NOT add src, pyproject.toml or uv.lock here - the builder stage's
+# `--no-editable` install needs the real source present to build the wheel.
+.git
+.craft
+tests
+tools
+.venv
+__pycache__
+*.pyc
+.ruff_cache
+.mypy_cache
+.pytest_cache
+.DS_Store
+dist
