@@ -47,6 +47,10 @@ def _image_job() -> dict[str, Any]:
     return _jobs()["image"]  # type: ignore[no-any-return]
 
 
+def _stack_smoke_job() -> dict[str, Any]:
+    return _jobs()["stack-smoke"]  # type: ignore[no-any-return]
+
+
 def _steps(job: dict[str, Any]) -> list[dict[str, Any]]:
     steps = job["steps"]
     assert isinstance(steps, list)
@@ -158,6 +162,55 @@ def test_smoke_step_mounts_the_docker_socket_and_the_port_settings_uses() -> Non
     assert f"-p {port}:{port}" in run
 
 
+def test_compose_binary_smoke_proves_it_runs_without_a_docker_cli() -> None:
+    """This is the only way to answer whether the standalone binary needs a
+    `docker` CLI - it runs the built image with no CLI installed, against the
+    runner's real socket.
+    """
+    job = _image_job()
+    steps = _steps(job)
+
+    version_step = _step_named(job, "prove", "compose binary")
+    assert "--entrypoint /usr/local/bin/docker-compose" in version_step["run"]
+    assert "marrquee:smoke-amd64" in version_step["run"]
+    assert "version" in version_step["run"]
+
+    up_step = _step_named(job, "bring", "compose")
+    assert _SOCKET_MOUNT in up_step["run"]
+    assert "--entrypoint /usr/local/bin/docker-compose" in up_step["run"]
+    assert "up -d" in up_step["run"]
+
+    assert_step = _step_named(job, "assert", "compose-binary smoke")
+    assert "marrquee-compose-smoke" in assert_step["run"]
+
+    cleanup_step = _step_named(job, "remove", "compose-binary smoke")
+    assert cleanup_step.get("if") == "always()"
+    assert "docker rm -f marrquee-compose-smoke" in cleanup_step["run"]
+
+    # The compose-binary smoke happens before the arm64 build and the
+    # publish gate, alongside the amd64 smoke - not as a late add-on that
+    # could silently be skipped.
+    names = [str(step.get("name", "")) for step in steps]
+    arm64_index = names.index("Build the arm64 image for the smoke test")
+    assert names.index(version_step["name"]) < arm64_index
+
+    # No `if:` guard of its own, so a real failure here fails the `image` job
+    # like any other step, and the publish steps later in that same job never
+    # run - this smoke depends only on our own image, not an external
+    # registry, so it is allowed to be a hard gate.
+    for step in (version_step, up_step, assert_step):
+        assert "if" not in step
+
+
+def test_compose_binary_smoke_does_not_gate_publishing() -> None:
+    """Publishing stays gated on the `test` job alone, exactly as before -
+    this smoke reports a real finding but never blocks `:latest`.
+    """
+    image_job = _image_job()
+
+    assert image_job["needs"] in ("test", ["test"])
+
+
 def test_test_job_uses_uvs_official_installer_not_a_third_party_action() -> None:
     test_job = _jobs()["test"]
 
@@ -189,3 +242,152 @@ def test_readme_tells_the_owner_to_make_the_package_public() -> None:
     assert "public" in readme
     assert "package" in readme
     assert "danger zone" in readme or "change visibility" in readme
+
+
+# --- stack-smoke: the real-Docker proof, and the guarantee it never gates ----
+
+
+def test_stack_smoke_job_exists_and_needs_only_test() -> None:
+    job = _stack_smoke_job()
+
+    assert job["needs"] in ("test", ["test"])
+
+
+def test_publish_job_does_not_depend_on_the_stack_smoke_job() -> None:
+    """`image` (which publishes) must never wait on a job that pulls three
+    external images and can fail for reasons unrelated to this repository.
+    """
+    image_needs = _image_job()["needs"]
+    normalized = image_needs if isinstance(image_needs, list) else [image_needs]
+
+    assert "stack-smoke" not in normalized
+
+
+def test_stack_smoke_job_is_not_needed_by_any_other_job() -> None:
+    for job_name, job in _jobs().items():
+        if job_name == "stack-smoke":
+            continue
+        needs = job.get("needs", [])
+        normalized = needs if isinstance(needs, list) else [needs]
+        assert "stack-smoke" not in normalized, f"{job_name} must not depend on stack-smoke"
+
+
+def test_stack_smoke_starts_the_image_with_the_socket_and_the_host_mount() -> None:
+    step = _step_named(_stack_smoke_job(), "start", "built image", "install file")
+
+    assert _SOCKET_MOUNT in step["run"]
+    assert "-v /:/host" in step["run"]
+    port = Settings().port
+    assert f"-p {port}:{port}" in step["run"]
+
+
+def test_stack_smoke_installs_all_three_apps_and_starts_a_deploy() -> None:
+    job = _stack_smoke_job()
+
+    install_step = _step_named(job, "install all three apps")
+    run = install_step["run"]
+    assert "/api/install" in run
+    assert "prowlarr" in run
+    assert "sonarr" in run
+    assert "radarr" in run
+
+    start_step = _step_named(job, "start the deploy")
+    assert "POST http://127.0.0.1:7788/api/deploy" in start_step["run"]
+
+
+def test_stack_smoke_polls_for_finale_with_a_bounded_loop() -> None:
+    step = _step_named(_stack_smoke_job(), "poll", "finale")
+
+    assert "/api/deploy" in step["run"]
+    assert "finale" in step["run"]
+    # Bounded - `seq 1 N`, never an unconditional `while true`.
+    assert "seq 1 " in step["run"]
+    assert "while true" not in step["run"]
+
+
+def test_stack_smoke_asserts_the_marrquee_network_lists_every_app_and_marrquee_itself() -> None:
+    """The exact regression this job exists to catch: a network of the right
+    name existing is not the same as every container actually being on it.
+    """
+    step = _step_named(_stack_smoke_job(), "network", "lists all three apps")
+
+    assert "docker network inspect marrquee" in step["run"]
+    for name in ("prowlarr", "sonarr", "radarr", "marrquee-stack-smoke"):
+        assert name in step["run"]
+
+
+def test_stack_smoke_asserts_the_compose_file_is_readable_before_reading_keys_from_it() -> None:
+    """`write_compose` chowns this file to the drive's owner instead of root
+    specifically so it can be read - checked here on its own, before the key
+    extraction step, so a regression reads as exactly that rather than a
+    mysterious 401 two steps later.
+    """
+    job = _stack_smoke_job()
+    readable_step = _step_named(job, "compose file is readable")
+
+    assert "compose.yaml" in readable_step["run"]
+    assert "-r " in readable_step["run"] or "! -r" in readable_step["run"]
+    assert readable_step["run"].count("::error::") >= 1
+
+    steps = _steps(job)
+    names = [str(step.get("name", "")) for step in steps]
+    keys_step = _step_named(job, "answers", "system/status")
+    assert names.index(readable_step["name"]) < names.index(keys_step["name"])
+
+
+def test_stack_smoke_reads_api_keys_from_the_generated_compose_file_not_the_api() -> None:
+    step = _step_named(_stack_smoke_job(), "answers", "system/status")
+    run = step["run"]
+
+    assert "compose.yaml" in run
+    assert "PROWLARR__AUTH__APIKEY" in run
+    assert "SONARR__AUTH__APIKEY" in run
+    assert "RADARR__AUTH__APIKEY" in run
+    assert "X-Api-Key" in run
+    assert "api/v1/system/status" in run
+    assert "api/v3/system/status" in run
+
+
+def test_stack_smoke_fails_loudly_on_an_empty_key_instead_of_sending_one() -> None:
+    step = _step_named(_stack_smoke_job(), "answers", "system/status")
+    run = step["run"]
+
+    # Every extracted key has to be checked non-empty before it's ever used
+    # in a curl call - sending an empty X-Api-Key would just be a confusing
+    # 401 instead of a named failure.
+    for key_var in ("prowlarr_key", "sonarr_key", "radarr_key"):
+        assert f'-z "${key_var}"' in run or f'-z "${{{key_var}}}"' in run
+    assert run.count("::error::") >= 3
+
+
+def test_stack_smoke_never_echoes_an_api_key() -> None:
+    step = _step_named(_stack_smoke_job(), "answers", "system/status")
+    run = step["run"]
+
+    for line in run.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("echo") or "::error::" in stripped:
+            assert "_key" not in stripped, f"a key variable appears in an echoed line: {line!r}"
+
+
+def test_stack_smoke_dumps_diagnostics_and_logs_only_on_failure() -> None:
+    step = _step_named(_stack_smoke_job(), "dump diagnostics")
+
+    assert step.get("if") == "failure()"
+    assert "/api/deploy/diagnostics" in step["run"]
+    assert "docker logs marrquee-stack-smoke" in step["run"]
+
+
+def test_stack_smoke_always_cleans_up_containers_network_and_temp_files() -> None:
+    step = _step_named(_stack_smoke_job(), "clean up")
+
+    assert step.get("if") == "always()"
+    run = step["run"]
+    for name in ("prowlarr", "sonarr", "radarr", "marrquee-stack-smoke"):
+        assert name in run
+    assert "docker network rm marrquee" in run
+    # `sudo`, not a plain `rm -rf`: some of what's under the temp folder can
+    # be created by the Docker daemon as root, which would otherwise block
+    # cleanup as the unprivileged runner user.
+    assert "sudo rm -rf" in run
+    assert '"$RUNNER_TEMP/marrquee-smoke"' in run

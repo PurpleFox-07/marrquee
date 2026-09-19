@@ -27,6 +27,14 @@ class Settings:
     docker_socket: Path = Path("/var/run/docker.sock")
     host: str = "0.0.0.0"
     port: int = 7788
+    # Where the host filesystem is mounted inside our container. Its env var
+    # is MARRQUEE_HOST_MOUNT, not MARRQUEE_HOST_ROOT or anything one
+    # character away from MARRQUEE_HOST (the bind address above) - the two
+    # are unrelated and a near-miss name would be a support ticket waiting
+    # to happen.
+    host_mount: Path = Path("/host")
+    compose_binary: Path = Path("/usr/local/bin/docker-compose")
+    stack_project: str = "marrquee"
 
     @staticmethod
     def from_env(env: Mapping[str, str] | None = None) -> Settings:
@@ -49,6 +57,13 @@ class Settings:
             else defaults.docker_socket,
             host=env.get("MARRQUEE_HOST", defaults.host),
             port=_parse_port(raw_port) if raw_port is not None else defaults.port,
+            host_mount=Path(env["MARRQUEE_HOST_MOUNT"])
+            if "MARRQUEE_HOST_MOUNT" in env
+            else defaults.host_mount,
+            compose_binary=Path(env["MARRQUEE_COMPOSE_BINARY"])
+            if "MARRQUEE_COMPOSE_BINARY" in env
+            else defaults.compose_binary,
+            stack_project=env.get("MARRQUEE_STACK_PROJECT", defaults.stack_project),
         )
 
 

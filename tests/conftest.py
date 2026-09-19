@@ -21,19 +21,30 @@ class RecordingDockerStub:
     def __init__(self) -> None:
         self.request_lines: list[str] = []
         self._server: asyncio.AbstractServer | None = None
-        self._response_body = b'{"Version": "27.3.1", "ApiVersion": "1.47"}'
-        self._status_line = "HTTP/1.1 200 OK"
+        self._responses: list[tuple[str, bytes]] = [
+            ("HTTP/1.1 200 OK", b'{"Version": "27.3.1", "ApiVersion": "1.47"}')
+        ]
 
     def respond_with(self, status_line: str, body: bytes) -> None:
-        """Configure the fixed reply the stub sends to the next connection."""
-        self._status_line = status_line
-        self._response_body = body
+        """Configure the fixed reply the stub sends to every connection from now on."""
+        self._responses = [(status_line, body)]
 
     def respond_with_json(
-        self, payload: dict[str, str], status_line: str = "HTTP/1.1 200 OK"
+        self, payload: dict[str, object], status_line: str = "HTTP/1.1 200 OK"
     ) -> None:
         """Convenience wrapper for JSON replies."""
         self.respond_with(status_line, json.dumps(payload).encode())
+
+    def respond_with_sequence(self, responses: list[tuple[str, bytes]]) -> None:
+        """Script a different reply for each successive connection, in order.
+
+        `self_container_id`'s hostname-then-name-then-None fallback issues
+        more than one request per call, and each needs its own scripted
+        answer. The last entry repeats once the sequence is exhausted, so a
+        test that under-counts requests still gets a sane reply rather than
+        an index error.
+        """
+        self._responses = list(responses)
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         request_line = await reader.readline()
@@ -44,12 +55,14 @@ class RecordingDockerStub:
             line = await reader.readline()
             if line in (b"\r\n", b""):
                 break
+        index = min(len(self.request_lines) - 1, len(self._responses) - 1)
+        status_line, body = self._responses[index]
         response = (
-            f"{self._status_line}\r\n"
+            f"{status_line}\r\n"
             "Content-Type: application/json\r\n"
-            f"Content-Length: {len(self._response_body)}\r\n"
+            f"Content-Length: {len(body)}\r\n"
             "\r\n"
-        ).encode() + self._response_body
+        ).encode() + body
         writer.write(response)
         await writer.drain()
         writer.close()

@@ -17,6 +17,9 @@ def test_settings_defaults_are_the_documented_ones() -> None:
     assert settings.docker_socket == Path("/var/run/docker.sock")
     assert settings.host == "0.0.0.0"
     assert settings.port == 7788
+    assert settings.host_mount == Path("/host")
+    assert settings.compose_binary == Path("/usr/local/bin/docker-compose")
+    assert settings.stack_project == "marrquee"
 
 
 def test_settings_from_env_overrides_each_field() -> None:
@@ -25,6 +28,9 @@ def test_settings_from_env_overrides_each_field() -> None:
         "MARRQUEE_DOCKER_SOCKET": "/run/docker.sock",
         "MARRQUEE_HOST": "127.0.0.1",
         "MARRQUEE_PORT": "9000",
+        "MARRQUEE_HOST_MOUNT": "/mnt/host",
+        "MARRQUEE_COMPOSE_BINARY": "/opt/bin/docker-compose",
+        "MARRQUEE_STACK_PROJECT": "media-stack",
     }
 
     settings = Settings.from_env(env)
@@ -33,6 +39,21 @@ def test_settings_from_env_overrides_each_field() -> None:
     assert settings.docker_socket == Path("/run/docker.sock")
     assert settings.host == "127.0.0.1"
     assert settings.port == 9000
+    assert settings.host_mount == Path("/mnt/host")
+    assert settings.compose_binary == Path("/opt/bin/docker-compose")
+    assert settings.stack_project == "media-stack"
+
+
+def test_settings_from_env_keeps_every_predecessor_default_when_only_new_vars_are_set() -> None:
+    settings = Settings.from_env({"MARRQUEE_HOST_MOUNT": "/mnt/host"})
+
+    assert settings.config_dir == Path("/config")
+    assert settings.docker_socket == Path("/var/run/docker.sock")
+    assert settings.host == "0.0.0.0"
+    assert settings.port == 7788
+    assert settings.host_mount == Path("/mnt/host")
+    assert settings.compose_binary == Path("/usr/local/bin/docker-compose")
+    assert settings.stack_project == "marrquee"
 
 
 def test_settings_from_env_none_reads_os_environ(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -31,6 +31,15 @@ _CONFIG_MOUNT = "marrquee-config:/config"
 _HOST_MOUNT = "/:/host"
 _EXPECTED_MOUNTS = {_SOCKET_MOUNT, _CONFIG_MOUNT, _HOST_MOUNT}
 
+# Pinned docker-compose release this Dockerfile ships - kept here as the
+# single source the test checks the Dockerfile against, so a version bump
+# that forgets to update one of the two files fails loudly.
+_COMPOSE_VERSION = "v5.5.1"
+_COMPOSE_SHA256 = {
+    "x86_64": "db1889184726840f75c4f9c001048430d4f25b3be3cb084d3ddd762bc0aed576",
+    "aarch64": "732e3a84c1a0f67256ce80bc2598a24546b10ca05f9faa97efceb1171ece2ef7",
+}
+
 
 def _dockerfile_text() -> str:
     return _DOCKERFILE_PATH.read_text()
@@ -157,6 +166,40 @@ def test_dockerfile_exposes_the_port_settings_uses_and_has_no_user_directive() -
 
     assert f"EXPOSE {Settings().port}" in dockerfile
     assert not re.search(r"^USER\s", dockerfile, re.MULTILINE)
+
+
+def test_dockerfile_ships_a_pinned_checksum_verified_compose_binary_per_architecture() -> None:
+    """The compose file the owner reads has to be what actually creates the
+    containers, or their own later `docker compose up` would collide on
+    container names - which is why the image ships this binary at all, pinned
+    and checksum-verified so a supply-chain change can't reach it silently.
+    """
+    dockerfile = _dockerfile_text()
+
+    for arch, digest in _COMPOSE_SHA256.items():
+        url = (
+            f"https://github.com/docker/compose/releases/download/"
+            f"{_COMPOSE_VERSION}/docker-compose-linux-{arch}"
+        )
+        assert url in dockerfile, f"Dockerfile does not fetch the pinned {arch} binary"
+        assert f"--checksum=sha256:{digest}" in dockerfile, (
+            f"Dockerfile does not verify the pinned {arch} checksum"
+        )
+
+    assert "FROM compose-${TARGETARCH}" in dockerfile
+    assert re.search(r"COPY --from=compose \S*/docker-compose \S*docker-compose", dockerfile)
+    assert str(Settings().compose_binary) == "/usr/local/bin/docker-compose"
+
+
+def test_dockerfile_does_not_install_a_docker_cli() -> None:
+    """The compose binary can bring services up through the socket alone, so
+    a full `docker` CLI install would only add weight for a code path never
+    exercised.
+    """
+    dockerfile = _dockerfile_text()
+
+    assert "docker-ce-cli" not in dockerfile
+    assert "apt-get install" not in dockerfile
 
 
 def test_dockerignore_excludes_craft_and_git_but_not_source_files() -> None:

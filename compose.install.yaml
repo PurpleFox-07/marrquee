@@ -14,9 +14,9 @@ services:
       # container, and must stay 7788.
       - "7788:7788"
     volumes:
-      # Lets Marrquee see whether Docker is running and read its version.
-      # In this version Marrquee only looks - nothing here can start, stop
-      # or change a container.
+      # Lets Marrquee see whether Docker is running, and lets it start the
+      # apps you choose - through the compose file it writes for you -
+      # once you deploy.
       - /var/run/docker.sock:/var/run/docker.sock
       # Where Marrquee keeps the choices you make and the settings it
       # generates. This survives restarts and reinstalls.

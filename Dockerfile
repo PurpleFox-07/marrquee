@@ -39,6 +39,29 @@ COPY . /app
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev --no-editable
 
+# The pinned, checksum-verified `docker-compose` standalone binary - one
+# tiny stage per architecture, selected below by buildx's automatic
+# TARGETARCH build arg. BuildKit's own `ADD <url>` fetches and verifies the
+# checksum itself, so no stage ever needs curl or ca-certificates just to
+# pull one file down. Bumping the pinned version means updating the URL and
+# the checksum together, in both stages below.
+#
+# docker-compose is the recommended route's own installed artefact (the
+# `docker-compose-plugin` package ships this exact binary under the CLI
+# plugin directory) - shipping only it, and no `docker` CLI, costs roughly
+# +32 MB (amd64) / +30 MB (arm64) rather than the ~80 MB a full CLI install
+# would add. Whether it needs no `docker` CLI to bring services up is
+# proved on real Docker by CI's compose-binary smoke, not assumed here.
+FROM scratch AS compose-amd64
+ADD --chmod=755 --checksum=sha256:db1889184726840f75c4f9c001048430d4f25b3be3cb084d3ddd762bc0aed576 \
+    https://github.com/docker/compose/releases/download/v5.5.1/docker-compose-linux-x86_64 /docker-compose
+
+FROM scratch AS compose-arm64
+ADD --chmod=755 --checksum=sha256:732e3a84c1a0f67256ce80bc2598a24546b10ca05f9faa97efceb1171ece2ef7 \
+    https://github.com/docker/compose/releases/download/v5.5.1/docker-compose-linux-aarch64 /docker-compose
+
+FROM compose-${TARGETARCH} AS compose
+
 FROM python:3.12-slim-bookworm
 
 # No USER directive: this container's whole job is reading the host's
@@ -47,6 +70,7 @@ FROM python:3.12-slim-bookworm
 # as root removes that per-install failure mode without adding new exposure,
 # since mounting the socket at all is already root-equivalent access.
 COPY --from=builder /app/.venv /app/.venv
+COPY --from=compose /docker-compose /usr/local/bin/docker-compose
 ENV PATH="/app/.venv/bin:$PATH" \
     MARRQUEE_CONFIG_DIR=/config \
     MARRQUEE_DOCKER_SOCKET=/var/run/docker.sock \

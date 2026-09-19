@@ -101,6 +101,42 @@ jobs:
         if: always()
         run: docker rm -f marrquee-smoke-amd64
 
+      # This is the answer to the one question reading the code can't settle:
+      # does the pinned docker-compose binary bring services up with no
+      # `docker` CLI in the image? A separate, ephemeral container proves it
+      # against the runner's real socket, independent of the alive-page smoke
+      # above.
+      - name: Prove the pinned compose binary runs without a docker CLI
+        run: docker run --rm --entrypoint /usr/local/bin/docker-compose marrquee:smoke-amd64 version
+
+      - name: Write a throwaway compose file for the compose-binary smoke
+        run: |
+          cat > compose-smoke.yaml <<'EOF'
+          services:
+            smoke:
+              image: alpine:3.20
+              container_name: marrquee-compose-smoke
+              command: ["sleep", "300"]
+          EOF
+
+      - name: Bring the throwaway service up through the image's compose binary
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD/compose-smoke.yaml:/tmp/compose-smoke.yaml:ro" \
+            --entrypoint /usr/local/bin/docker-compose \
+            marrquee:smoke-amd64 \
+            -p compose-smoke -f /tmp/compose-smoke.yaml up -d
+
+      - name: Assert the compose-binary smoke's service is running
+        run: |
+          docker ps --filter "name=marrquee-compose-smoke" --format '{{.Names}}' \
+            | grep -q marrquee-compose-smoke
+
+      - name: Remove the compose-binary smoke's throwaway container
+        if: always()
+        run: docker rm -f marrquee-compose-smoke || true
+
       - name: Build the arm64 image for the smoke test
         uses: docker/build-push-action@v7
         with:
@@ -189,3 +225,181 @@ jobs:
           echo "$output"
           echo "$output" | grep -q "linux/amd64"
           echo "$output" | grep -q "linux/arm64"
+
+  # This is the acceptance vehicle for every "unverifiable by reading"
+  # condition the deploy engine carries: real Docker, real arr images, a
+  # real deploy driven the exact way the owner's own first NAS commands
+  # will drive it. It pulls three external images and can go red for
+  # reasons that have nothing to do with this repository's own code (a
+  # registry hiccup, a slow image pull) - so, deliberately, it `needs: test`
+  # alone and is never in `image`'s `needs:`, and `image` is never in this
+  # job's `needs:` either. A red run here is loud (this job still fails, and
+  # the whole workflow shows red) but it never holds back `:latest`.
+  stack-smoke:
+    name: Real-Docker stack smoke (three arr apps, real deploy)
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build the amd64 image for the stack smoke
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: marrquee:stack-smoke
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # A fresh, empty folder on the runner's own disk - never inside the
+      # repository checkout - so a fresh-start refusal can never fire here.
+      - name: Create a fresh storage root under the runner's temp directory
+        run: mkdir -p "$RUNNER_TEMP/marrquee-smoke/media"
+
+      # Started the same way `compose.install.yaml` starts it: the socket,
+      # the port, and the `/:/host` mount that lets Marrquee see (and build
+      # folders inside) the storage root created just above.
+      - name: Start the built image the way the install file does
+        run: |
+          docker run -d --name marrquee-stack-smoke \
+            -p 7788:7788 \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v /:/host \
+            marrquee:stack-smoke
+
+      - name: Wait for Marrquee to answer /healthz
+        run: |
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:7788/healthz; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::marrquee never answered /healthz within 60s"
+          docker logs marrquee-stack-smoke
+          exit 1
+
+      # The API only ever sees a HOST path - Marrquee translates it to
+      # `<host_mount>/<that path>` internally, and the generated compose
+      # file carries this exact host path back out again.
+      - name: Install all three apps against the runner's own temp folder
+        run: |
+          curl -fsS -X POST http://127.0.0.1:7788/api/install \
+            -H "Content-Type: application/json" \
+            -d "{\"path\":\"${RUNNER_TEMP}/marrquee-smoke/media\",\"app_ids\":[\"prowlarr\",\"sonarr\",\"radarr\"]}"
+
+      - name: Start the deploy
+        run: curl -fsS -X POST http://127.0.0.1:7788/api/deploy
+
+      # Generous on purpose: this is the first time all three images are
+      # ever pulled, on a shared runner with no cache for them.
+      - name: Poll GET /api/deploy until it reaches finale (8+ minute budget)
+        run: |
+          for _ in $(seq 1 260); do
+            phase=$(curl -fsS http://127.0.0.1:7788/api/deploy | jq -r '.phase')
+            echo "deploy phase: $phase"
+            if [ "$phase" = "finale" ]; then
+              exit 0
+            fi
+            if [ "$phase" = "error" ]; then
+              echo "::error::the deploy reached error"
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "::error::the deploy never reached finale in time"
+          exit 1
+
+      - name: Assert all three containers are running
+        run: |
+          for name in prowlarr sonarr radarr; do
+            docker ps --filter "name=^${name}$" --format '{{.Names}}' | grep -qx "$name"
+          done
+
+      # This is the regression this whole job exists to catch: every app
+      # container, and Marrquee's own, must share the `marrquee` network -
+      # not just have a network of that name sitting unused alongside them.
+      - name: Assert the marrquee network lists all three apps and Marrquee itself
+        run: |
+          members=$(docker network inspect marrquee --format '{{range .Containers}}{{.Name}} {{end}}')
+          echo "marrquee network members: $members"
+          for name in prowlarr sonarr radarr marrquee-stack-smoke; do
+            echo "$members" | grep -qw "$name"
+          done
+
+      # write_compose chowns this file to the drive's own owner (not root)
+      # specifically so it can be read - by the owner on their NAS, and by
+      # this very step here. Asserted on its own, before the step that reads
+      # it, so a regression here is named instead of surfacing as a
+      # mysterious 401 two steps later.
+      - name: Assert the compose file is readable by the current user
+        run: |
+          compose_file="$RUNNER_TEMP/marrquee-smoke/media/marrquee/compose.yaml"
+          if [ ! -r "$compose_file" ]; then
+            echo "::error::$compose_file is not readable by $(whoami) - write_compose's chown regressed"
+            ls -l "$compose_file" || true
+            exit 1
+          fi
+
+      # The API never exposes an app's key - it is read here straight off
+      # the generated compose file on the runner's own disk, the same file
+      # the owner is told to open and read in the README. Never echoed.
+      - name: Assert each app answers system/status with the key from its own compose file
+        run: |
+          compose_file="$RUNNER_TEMP/marrquee-smoke/media/marrquee/compose.yaml"
+          prowlarr_key=$(grep -E '^\s*PROWLARR__AUTH__APIKEY:' "$compose_file" | sed -E 's/.*: *"([^"]+)".*/\1/')
+          sonarr_key=$(grep -E '^\s*SONARR__AUTH__APIKEY:' "$compose_file" | sed -E 's/.*: *"([^"]+)".*/\1/')
+          radarr_key=$(grep -E '^\s*RADARR__AUTH__APIKEY:' "$compose_file" | sed -E 's/.*: *"([^"]+)".*/\1/')
+          if [ -z "$prowlarr_key" ]; then
+            echo "::error::could not read Prowlarr's API key out of the compose file"
+            exit 1
+          fi
+          if [ -z "$sonarr_key" ]; then
+            echo "::error::could not read Sonarr's API key out of the compose file"
+            exit 1
+          fi
+          if [ -z "$radarr_key" ]; then
+            echo "::error::could not read Radarr's API key out of the compose file"
+            exit 1
+          fi
+          curl -fsS -H "X-Api-Key: ${prowlarr_key}" http://127.0.0.1:9696/api/v1/system/status
+          curl -fsS -H "X-Api-Key: ${sonarr_key}" http://127.0.0.1:8989/api/v3/system/status
+          curl -fsS -H "X-Api-Key: ${radarr_key}" http://127.0.0.1:7878/api/v3/system/status
+
+      - name: Assert the expected folders exist inside the chosen root
+        run: |
+          root="$RUNNER_TEMP/marrquee-smoke/media"
+          test -d "$root/data/torrents/tv"
+          test -d "$root/data/torrents/movies"
+          test -d "$root/data/media/tv"
+          test -d "$root/data/media/movies"
+          test -f "$root/marrquee/compose.yaml"
+          test -f "$root/marrquee/marrquee-root.json"
+
+      # The one place technical detail is allowed to show up, and exactly
+      # where a first-time developer needs it: a red run here is debuggable
+      # from the workflow's own log, not just "it failed".
+      - name: Dump diagnostics and Marrquee's own logs on failure
+        if: failure()
+        run: |
+          echo "---- GET /api/deploy/diagnostics ----"
+          curl -fsS http://127.0.0.1:7788/api/deploy/diagnostics || true
+          echo "---- docker logs marrquee-stack-smoke ----"
+          docker logs marrquee-stack-smoke || true
+
+      - name: Clean up every container, network and temp folder this job made
+        if: always()
+        run: |
+          docker rm -f prowlarr sonarr radarr marrquee-stack-smoke 2>/dev/null || true
+          docker network rm marrquee 2>/dev/null || true
+          # Some of what's under here (a container's own /config contents)
+          # can be created by the Docker daemon as root, which would block a
+          # plain `rm -rf` run as the unprivileged runner user - GitHub-hosted
+          # runners carry passwordless sudo for exactly this, and `|| true`
+          # means a leftover temp folder never turns a green run red.
+          sudo rm -rf "$RUNNER_TEMP/marrquee-smoke" || true

@@ -7,6 +7,8 @@ never touches a real filesystem path or Docker socket.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -14,8 +16,11 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from marrquee.config import Settings
+from marrquee.deploy import DeployManager, HttpReadinessProbe, ReadinessProbe
 from marrquee.docker_client import DockerEngine, SocketDockerEngine
 from marrquee.routes.alive import router as alive_router
+from marrquee.routes.api import router as api_router
+from marrquee.wiring import NoWiringYet, WiringRunner
 
 # Resolved from the installed package, not the repository: the runtime image
 # copies only the built venv (no `src/` tree survives), so a path built from
@@ -25,24 +30,52 @@ _TEMPLATES_DIR = _PACKAGE_DIR / "templates"
 _STATIC_DIR = _PACKAGE_DIR / "static"
 
 
-def create_app(settings: Settings | None = None, engine: DockerEngine | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    engine: DockerEngine | None = None,
+    *,
+    manager: DeployManager | None = None,
+    probe: ReadinessProbe | None = None,
+    wiring: WiringRunner | None = None,
+) -> FastAPI:
     """Build the Marrquee app.
 
     `settings=None` reads the real environment; `engine=None` talks to the
-    real Docker socket named by those settings. Tests pass both explicitly,
-    so the test suite never touches a real environment variable or socket.
+    real Docker socket those settings name, through the pinned compose
+    binary those same settings point at. `manager=None` builds one
+    `DeployManager` from `settings` and `engine` - a test that only needs to
+    control readiness or wiring passes `probe=`/`wiring=` instead of
+    building and injecting a whole manager itself.
+
+    On startup, the built app re-enters any deploy that was still running
+    when Marrquee last stopped - every step downstream is idempotent, so
+    this is always a repeat, never a rollback.
     """
     if settings is None:
         settings = Settings.from_env()
     if engine is None:
-        engine = SocketDockerEngine(settings.docker_socket)
+        engine = SocketDockerEngine(settings.docker_socket, compose_binary=settings.compose_binary)
+    if manager is None:
+        manager = DeployManager(
+            settings,
+            engine,
+            probe=probe if probe is not None else HttpReadinessProbe(),
+            wiring=wiring if wiring is not None else NoWiringYet(),
+        )
 
-    app = FastAPI(title="Marrquee")
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        await manager.resume_if_interrupted()
+        yield
+
+    app = FastAPI(title="Marrquee", lifespan=lifespan)
     app.state.settings = settings
     app.state.docker_engine = engine
+    app.state.deploy = manager
     app.state.templates = Jinja2Templates(directory=_TEMPLATES_DIR)
 
     app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
     app.include_router(alive_router)
+    app.include_router(api_router)
 
     return app

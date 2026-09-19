@@ -76,9 +76,8 @@ What each line does:
   something else already uses 7788, change only the **first** number -
   the second one is fixed inside the container.
 - `-v /var/run/docker.sock:/var/run/docker.sock` - lets Marrquee see
-  whether Docker is running and read its version. In this version
-  Marrquee only looks; nothing here can start, stop or change a
-  container.
+  whether Docker is running, and lets it start the apps you choose -
+  through the compose file it writes for you - once you deploy.
 - `-v marrquee-config:/config` - a place for Marrquee to keep the
   choices you make. It survives restarts and reinstalls.
 - `-v /:/host` - this lets Marrquee see your drives, so it can check
@@ -106,6 +105,81 @@ a green "Talking to Docker" line with a version number underneath it.
 If a line on that page is red instead of green, the page itself
 explains what to do in plain language - fix what it describes, then
 select **Check again**.
+
+## Try the deploy engine (before there's a wizard screen)
+
+The setup wizard - the screen where you pick your apps and point at your
+big drive - is a later piece of this project. The part underneath it,
+the deploy engine that actually builds your folders and starts your
+apps, already works today, and you can drive it yourself with a
+handful of pasted commands. Nothing below needs any programming
+knowledge - it's the same "paste this, read what it says" pattern as
+the install step above.
+
+1. **Update Marrquee on the NAS, if you installed it before this
+   feature existed.** Open the **Docker** app -> **Project**, select
+   `marrquee`, and paste the current contents of
+   [`compose.install.yaml`](./compose.install.yaml) over the old ones.
+   The only new line is `- /:/host`, which is what lets Marrquee see
+   your drives. Click **Deploy** again. (If the Project screen refuses
+   that line, use Option A above instead - it has the same line in
+   it.) If you installed fresh using the instructions above, this step
+   is already done - skip ahead.
+2. **Check it came back.** In a browser go to
+   `http://<your NAS's address>:7788`. You should still see the purple
+   page with a green "Talking to Docker" line.
+3. **Tell it what to build.** SSH into the NAS and paste this,
+   replacing the path with your big drive's folder (on most NAS boxes
+   it starts with `/volume1`):
+
+   ```bash
+   curl -X POST http://<your NAS's address>:7788/api/install \
+     -H "Content-Type: application/json" \
+     -d '{"path":"/volume1/media","app_ids":["prowlarr","sonarr","radarr"]}'
+   ```
+
+   A good answer looks like `{"saved":true}`. If it answers with a
+   refusal instead, read it - it is written in plain words and tells
+   you exactly what to change. Nothing has been created on your drive
+   yet either way.
+4. **Press the button.** Paste:
+
+   ```bash
+   curl -X POST http://<your NAS's address>:7788/api/deploy
+   ```
+
+   A good answer is a block of JSON with `"phase":"running"` in it.
+5. **Watch it.** Paste this a few times over the next couple of
+   minutes:
+
+   ```bash
+   curl http://<your NAS's address>:7788/api/deploy
+   ```
+
+   You'll see each app move from `"waiting"` to `"starting"` to
+   `"done"`, in the `apps` list. The first run downloads three apps, so
+   it can take a few minutes. If one app's `note` says it's taking
+   longer than usual, that's normal and it isn't broken - only
+   `"phase":"error"` means something needs your attention. A finished
+   deploy answers with `"phase":"finale"` and every app `"done"`.
+6. **Look at what it built.** In the NAS's **Files** app, open the
+   folder you typed. You should see a `data` folder (with `media` and
+   `torrents` inside) and a `marrquee` folder containing
+   `compose.yaml`. Open `compose.yaml` - it's meant to be readable.
+   That file is the actual description of your media server, and it's
+   the file that created every container. It contains your apps'
+   secret keys, so it's only readable by you (the owner of this
+   folder) - don't paste its contents anywhere public.
+7. **Open an app.** In a browser go to `http://<your NAS's
+   address>:8989`. Sonarr should open straight up with no login. Same
+   for `:7878` (Radarr) and `:9696` (Prowlarr).
+8. **If something goes wrong.** Paste these two commands and send both
+   of their outputs to whoever is helping you:
+
+   ```bash
+   curl http://<your NAS's address>:7788/api/deploy/diagnostics
+   docker logs marrquee --tail 200
+   ```
 
 ## Developing Marrquee
 

@@ -15,12 +15,23 @@ from fastapi.testclient import TestClient
 
 from marrquee import __version__
 from marrquee.config import Settings
-from marrquee.docker_client import DockerFailure, DockerStatus, FakeDockerEngine
+from marrquee.docker_client import (
+    ComposeResult,
+    ContainerSnapshot,
+    DockerFailure,
+    DockerStatus,
+    FakeDockerEngine,
+)
 from marrquee.main import create_app
 
 
 class _CountingDockerEngine:
-    """Records how many times `status()` was awaited, to prove nothing caches it."""
+    """Records how many times `status()` was awaited, to prove nothing caches it.
+
+    The other DockerEngine operations are never exercised by the alive page -
+    they exist here only so this stays a structurally valid DockerEngine
+    after Chunk 4 widened the protocol.
+    """
 
     def __init__(self, status: DockerStatus) -> None:
         self._status = status
@@ -30,11 +41,50 @@ class _CountingDockerEngine:
         self.call_count += 1
         return self._status
 
+    async def inspect(self, name: str) -> ContainerSnapshot:
+        raise NotImplementedError("the alive page never inspects a container")
+
+    async def image_present(self, reference: str) -> bool:
+        raise NotImplementedError("the alive page never checks for an image")
+
+    async def connect_network(self, network: str, container: str) -> bool:
+        raise NotImplementedError("the alive page never joins a network")
+
+    async def logs(self, name: str, tail: int = 50) -> str:
+        raise NotImplementedError("the alive page never fetches logs")
+
+    async def compose_up(self, project: str, compose_file: Path, service: str) -> ComposeResult:
+        raise NotImplementedError("the alive page never runs compose")
+
+    async def self_container_id(self) -> str | None:
+        raise NotImplementedError("the alive page never looks up its own container")
+
 
 class _ExplodingDockerEngine:
-    """A DockerEngine whose `status()` always raises - proves a caller never awaits it."""
+    """A DockerEngine whose every method always raises.
+
+    Proves a caller never awaits any of them.
+    """
 
     async def status(self) -> DockerStatus:
+        raise RuntimeError("healthz must never call the Docker engine")
+
+    async def inspect(self, name: str) -> ContainerSnapshot:
+        raise RuntimeError("healthz must never call the Docker engine")
+
+    async def image_present(self, reference: str) -> bool:
+        raise RuntimeError("healthz must never call the Docker engine")
+
+    async def connect_network(self, network: str, container: str) -> bool:
+        raise RuntimeError("healthz must never call the Docker engine")
+
+    async def logs(self, name: str, tail: int = 50) -> str:
+        raise RuntimeError("healthz must never call the Docker engine")
+
+    async def compose_up(self, project: str, compose_file: Path, service: str) -> ComposeResult:
+        raise RuntimeError("healthz must never call the Docker engine")
+
+    async def self_container_id(self) -> str | None:
         raise RuntimeError("healthz must never call the Docker engine")
 
 
