@@ -21,6 +21,7 @@ from marrquee.docker_client import (
     DockerFailure,
     DockerStatus,
     FakeDockerEngine,
+    NetworkConnectResult,
     SocketDockerEngine,
 )
 
@@ -248,9 +249,9 @@ async def test_connect_network_returns_true_on_a_plain_200(docker_stub):
     stub.respond_with("HTTP/1.1 200 OK", b"")
     engine = SocketDockerEngine(socket_path=socket_path)
 
-    connected = await engine.connect_network("marrquee", "abc123")
+    result = await engine.connect_network("marrquee", "abc123")
 
-    assert connected is True
+    assert result == NetworkConnectResult(ok=True, detail=None)
     assert stub.request_lines[0] == "POST /networks/marrquee/connect HTTP/1.1"
 
 
@@ -262,7 +263,9 @@ async def test_connect_network_treats_already_connected_as_success(docker_stub):
     )
     engine = SocketDockerEngine(socket_path=socket_path)
 
-    assert await engine.connect_network("marrquee", "abc123") is True
+    result = await engine.connect_network("marrquee", "abc123")
+
+    assert result.ok is True
 
 
 async def test_connect_network_treats_a_409_already_exists_as_success(docker_stub):
@@ -272,7 +275,9 @@ async def test_connect_network_treats_a_409_already_exists_as_success(docker_stu
     )
     engine = SocketDockerEngine(socket_path=socket_path)
 
-    assert await engine.connect_network("marrquee", "abc123") is True
+    result = await engine.connect_network("marrquee", "abc123")
+
+    assert result.ok is True
 
 
 async def test_connect_network_reports_a_genuine_failure_as_false(docker_stub):
@@ -282,7 +287,41 @@ async def test_connect_network_reports_a_genuine_failure_as_false(docker_stub):
     )
     engine = SocketDockerEngine(socket_path=socket_path)
 
-    assert await engine.connect_network("marrquee", "abc123") is False
+    result = await engine.connect_network("marrquee", "abc123")
+
+    assert result.ok is False
+
+
+async def test_connect_network_failure_detail_names_the_status_and_dockers_own_message(
+    docker_stub,
+):
+    """This is what turned a real deploy's failure into a mysterious "docker
+    unreachable" instead of a debuggable one - the whole reason a bare bool
+    was widened to carry `detail`.
+    """
+    stub, socket_path = docker_stub
+    stub.respond_with_json(
+        {"message": "network marrquee not found"}, status_line="HTTP/1.1 404 Not Found"
+    )
+    engine = SocketDockerEngine(socket_path=socket_path)
+
+    result = await engine.connect_network("marrquee", "abc123")
+
+    assert result.detail is not None
+    assert "404" in result.detail
+    assert "network marrquee not found" in result.detail
+
+
+async def test_connect_network_failure_detail_survives_a_non_json_error_body(docker_stub):
+    stub, socket_path = docker_stub
+    stub.respond_with("HTTP/1.1 500 Internal Server Error", b"not json at all")
+    engine = SocketDockerEngine(socket_path=socket_path)
+
+    result = await engine.connect_network("marrquee", "abc123")
+
+    assert result.ok is False
+    assert result.detail is not None
+    assert "500" in result.detail
 
 
 # --- logs() -----------------------------------------------------------
@@ -358,7 +397,46 @@ async def test_compose_up_runs_the_pinned_binary_against_our_socket(
     env = recorded["env"]
     assert isinstance(env, dict)
     assert env["DOCKER_HOST"] == "unix:///var/run/docker.sock"
+    # docker-compose resolves its own config directory from HOME (falling
+    # back to the OS user's home directory only if that lookup itself
+    # succeeds) - untested territory on every possible base image, so both
+    # are passed through explicitly rather than left to that fallback chain.
+    assert "HOME" in env
+    assert "PATH" in env
     assert result.ok is True
+
+
+async def test_compose_up_never_leaves_home_or_path_empty_even_if_the_parent_lacks_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The subprocess env is built from scratch on purpose (it never
+    inherits the parent process's environment, which could carry unrelated
+    settings) - but that must never mean HOME/PATH end up missing entirely
+    just because the parent process happened not to have them either.
+    """
+    recorded: dict[str, object] = {}
+
+    class _FakeProcess:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"", b""
+
+    async def fake_create_subprocess_exec(*args: str, **kwargs: object) -> _FakeProcess:
+        recorded["env"] = kwargs.get("env")
+        return _FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.delenv("HOME", raising=False)
+    monkeypatch.delenv("PATH", raising=False)
+    engine = SocketDockerEngine(socket_path=Path("/var/run/docker.sock"))
+
+    await engine.compose_up("marrquee", Path("/host/vol/marrquee/compose.yaml"), "sonarr")
+
+    env = recorded["env"]
+    assert isinstance(env, dict)
+    assert env["HOME"]
+    assert env["PATH"]
 
 
 async def test_compose_up_reports_a_non_zero_exit_as_ok_false_with_the_output_captured(
@@ -375,6 +453,17 @@ async def test_compose_up_reports_a_non_zero_exit_as_ok_false_with_the_output_ca
     assert result.exit_code == 3
     assert "starting stack" in result.output
     assert "something went wrong" in result.output
+
+
+def test_compose_timeout_default_is_generous_enough_for_a_first_ever_image_pull() -> None:
+    """`compose_up` blocks for the whole of its own image pull - a
+    ~200-300MB linuxserver image, over a NAS's own (often slow) internet
+    connection, the first time it is ever deployed. 5 minutes was tight
+    enough to plausibly mistake a slow-but-working pull for a hang.
+    """
+    engine = SocketDockerEngine(socket_path=Path("/var/run/docker.sock"))
+
+    assert engine._compose_timeout >= 900.0
 
 
 async def test_compose_up_times_out_rather_than_hanging_forever(tmp_path: Path) -> None:
@@ -493,6 +582,63 @@ async def test_the_fake_satisfies_the_widened_protocol_and_records_its_calls() -
         "compose_up",
         "self_container_id",
     ]
+
+
+async def test_the_fake_refuses_to_connect_to_a_network_that_does_not_exist_yet() -> None:
+    """The regression this whole shape exists to catch: on a fresh host,
+    nothing has ever created the stack's network - only a successful
+    `compose up` does that. An always-succeeding fake could never have
+    caught the real deploy engine trying to join it too early.
+    """
+    fake = FakeDockerEngine(DockerStatus(connected=True))
+
+    result = await fake.connect_network("marrquee", "abc")
+
+    assert result.ok is False
+
+
+async def test_a_successful_compose_up_brings_the_network_into_existence() -> None:
+    fake = FakeDockerEngine(
+        DockerStatus(connected=True),
+        compose_results={"prowlarr": ComposeResult(ok=True, exit_code=0, output="")},
+    )
+
+    await fake.compose_up("marrquee", Path("/tmp/compose.yaml"), "prowlarr")
+    result = await fake.connect_network("marrquee", "abc")
+
+    assert result.ok is True
+
+
+async def test_a_failed_compose_up_does_not_create_the_network() -> None:
+    fake = FakeDockerEngine(
+        DockerStatus(connected=True),
+        compose_results={"prowlarr": ComposeResult(ok=False, exit_code=1, output="boom")},
+    )
+
+    await fake.compose_up("marrquee", Path("/tmp/compose.yaml"), "prowlarr")
+    result = await fake.connect_network("marrquee", "abc")
+
+    assert result.ok is False
+
+
+async def test_network_exists_can_be_pre_seeded_for_a_resume_scenario() -> None:
+    fake = FakeDockerEngine(DockerStatus(connected=True), network_exists=True)
+
+    result = await fake.connect_network("marrquee", "abc")
+
+    assert result.ok is True
+
+
+async def test_network_connects_override_forces_a_fixed_answer_regardless_of_history() -> None:
+    """An explicit override for tests that don't care about network
+    sequencing at all - like the structural protocol test above, which
+    calls `connect_network` before `compose_up` on purpose.
+    """
+    always_fails = FakeDockerEngine(DockerStatus(connected=True), network_connects=False)
+
+    result = await always_fails.connect_network("marrquee", "abc")
+
+    assert result.ok is False
 
 
 async def test_the_fake_reports_unscripted_containers_and_images_as_absent() -> None:

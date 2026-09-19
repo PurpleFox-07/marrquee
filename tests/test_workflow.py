@@ -305,6 +305,32 @@ def test_stack_smoke_polls_for_finale_with_a_bounded_loop() -> None:
     assert "while true" not in step["run"]
 
 
+def test_stack_smoke_puts_the_failure_code_and_headline_in_a_public_annotation() -> None:
+    """The public annotations API is readable without a login; the job log
+    is not - this is what cost real time diagnosing the first-ever red run,
+    so the snapshot's own (already plain-language, secret-free) `code` and
+    `headline` land in the `::error::` itself instead of only the log.
+    """
+    run = _step_named(_stack_smoke_job(), "poll", "finale")["run"]
+
+    assert ".failure.code" in run
+    assert ".headline" in run
+    assert "::error::" in run
+
+
+def test_stack_smoke_annotation_escapes_percent_cr_lf_and_double_colon() -> None:
+    """GitHub's workflow-command escaping for annotation text, applied
+    before the message ever reaches `::error::` - and `::` is also
+    collapsed so the text can never be mistaken for a second command.
+    """
+    run = _step_named(_stack_smoke_job(), "poll", "finale")["run"]
+
+    assert "%25" in run  # escapes a literal '%'
+    assert "%0D" in run  # escapes a literal carriage return
+    assert "%0A" in run  # escapes a literal newline
+    assert "': :'" in run  # collapses a literal '::' in the message body
+
+
 def test_stack_smoke_asserts_the_marrquee_network_lists_every_app_and_marrquee_itself() -> None:
     """The exact regression this job exists to catch: a network of the right
     name existing is not the same as every container actually being on it.
@@ -376,6 +402,25 @@ def test_stack_smoke_dumps_diagnostics_and_logs_only_on_failure() -> None:
     assert step.get("if") == "failure()"
     assert "/api/deploy/diagnostics" in step["run"]
     assert "docker logs marrquee-stack-smoke" in step["run"]
+
+
+def test_stack_smoke_also_puts_diagnostics_in_a_public_annotation_truncated_and_escaped() -> None:
+    """Same reasoning as the polling step's annotation: the public
+    annotations API needs no login, the job log does. Truncated to ~1500
+    characters and escaped the same way, since this text is `_redact_secrets`
+    output rather than curated plain-language copy.
+    """
+    run = _step_named(_stack_smoke_job(), "dump diagnostics")["run"]
+
+    assert "[:1500]" in run
+    assert "::error::" in run
+    assert "%25" in run
+    assert "%0D" in run
+    assert "%0A" in run
+    assert "': :'" in run
+    # The plain log dump stays too - the annotation is additional, not a
+    # replacement for it.
+    assert 'echo "$diagnostics"' in run
 
 
 def test_stack_smoke_always_cleans_up_containers_network_and_temp_files() -> None:

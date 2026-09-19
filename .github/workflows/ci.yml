@@ -298,16 +298,27 @@ jobs:
 
       # Generous on purpose: this is the first time all three images are
       # ever pulled, on a shared runner with no cache for them.
+      #
+      # On failure, the snapshot's own `code` and `headline` land straight
+      # in a `::error::` annotation - GitHub's public annotations API is
+      # readable without a login, unlike the job log itself, and both
+      # fields are already plain-language and secret-free by the API's own
+      # contract (see routes/api.py - only /api/deploy/diagnostics ever
+      # carries technical detail).
       - name: Poll GET /api/deploy until it reaches finale (8+ minute budget)
         run: |
           for _ in $(seq 1 260); do
-            phase=$(curl -fsS http://127.0.0.1:7788/api/deploy | jq -r '.phase')
+            body=$(curl -fsS http://127.0.0.1:7788/api/deploy)
+            phase=$(echo "$body" | jq -r '.phase')
             echo "deploy phase: $phase"
             if [ "$phase" = "finale" ]; then
               exit 0
             fi
             if [ "$phase" = "error" ]; then
-              echo "::error::the deploy reached error"
+              code=$(echo "$body" | jq -r '.failure.code // "unknown"')
+              headline=$(echo "$body" | jq -r '.headline // "the deploy reported an error"')
+              MESSAGE="the deploy reached error (${code}): ${headline}" \
+                python3 -c "import os; text = os.environ['MESSAGE'].replace('%', '%25').replace(chr(13), '%0D').replace(chr(10), '%0A').replace('::', ': :'); print('::error::' + text)"
               exit 1
             fi
             sleep 2
@@ -383,12 +394,22 @@ jobs:
 
       # The one place technical detail is allowed to show up, and exactly
       # where a first-time developer needs it: a red run here is debuggable
-      # from the workflow's own log, not just "it failed".
+      # from the workflow's own log, not just "it failed". The same text
+      # also lands in a `::error::` annotation (truncated, and defensively
+      # escaped - it is already redacted by `_redact_secrets`, but the
+      # annotation itself must never be able to inject a further workflow
+      # command), because the public annotations API is readable without a
+      # login and the job log is not.
       - name: Dump diagnostics and Marrquee's own logs on failure
         if: failure()
         run: |
           echo "---- GET /api/deploy/diagnostics ----"
-          curl -fsS http://127.0.0.1:7788/api/deploy/diagnostics || true
+          diagnostics=$(curl -fsS http://127.0.0.1:7788/api/deploy/diagnostics || true)
+          echo "$diagnostics"
+          if [ -n "$diagnostics" ]; then
+            DIAGNOSTICS="$diagnostics" \
+              python3 -c "import os; text = os.environ['DIAGNOSTICS'][:1500].replace('%', '%25').replace(chr(13), '%0D').replace(chr(10), '%0A').replace('::', ': :'); print('::error::Marrquee diagnostics (first 1500 chars): ' + text)"
+          fi
           echo "---- docker logs marrquee-stack-smoke ----"
           docker logs marrquee-stack-smoke || true
 

@@ -36,6 +36,7 @@ from marrquee.docker_client import (
     ContainerSnapshot,
     DockerStatus,
     FakeDockerEngine,
+    NetworkConnectResult,
 )
 from marrquee.state import InstallState, save_state, write_json_atomic
 from marrquee.wiring import WiringStep
@@ -94,6 +95,11 @@ class _StatefulEngine:
     genuinely fresh daemon - and only becomes `running` once its own
     `compose_up` succeeds, which is what lets the very same instance drive
     a happy path (compose_up creates it) and a rerun (it's already there).
+
+    The stack's network is honest too: it does not exist until the first
+    successful `compose_up`, exactly like a real Docker daemon - a fake
+    that always let `connect_network` succeed could never have caught the
+    real deploy engine trying to join it before anything ever created it.
     """
 
     def __init__(
@@ -103,6 +109,7 @@ class _StatefulEngine:
         images: set[str] | None = None,
         compose_results: dict[str, ComposeResult] | None = None,
         self_container_id: str | None = "marrquee",
+        network_exists: bool = False,
     ) -> None:
         self._images = (
             images if images is not None else {get_app(app_id).image for app_id in app_ids}
@@ -110,6 +117,7 @@ class _StatefulEngine:
         self._compose_results = compose_results or {}
         self._self_container_id = self_container_id
         self._containers: dict[str, ContainerSnapshot] = {}
+        self._network_exists = network_exists
         self.calls: list[tuple[str, tuple[object, ...]]] = []
 
     async def status(self) -> DockerStatus:
@@ -129,9 +137,11 @@ class _StatefulEngine:
         self.calls.append(("image_present", (reference,)))
         return reference in self._images
 
-    async def connect_network(self, network: str, container: str) -> bool:
+    async def connect_network(self, network: str, container: str) -> NetworkConnectResult:
         self.calls.append(("connect_network", (network, container)))
-        return True
+        if not self._network_exists:
+            return NetworkConnectResult(ok=False, detail=f"network {network!r} does not exist yet")
+        return NetworkConnectResult(ok=True, detail=None)
 
     async def logs(self, name: str, tail: int = 50) -> str:
         self.calls.append(("logs", (name, tail)))
@@ -142,6 +152,7 @@ class _StatefulEngine:
         result = self._compose_results.get(service, ComposeResult(ok=True, exit_code=0, output=""))
         if result.ok:
             self._containers[service] = _running_container(service)
+            self._network_exists = True
         return result
 
     async def self_container_id(self) -> str | None:
@@ -260,6 +271,43 @@ async def test_each_app_walks_waiting_starting_done_in_catalog_order(tmp_path: P
     assert sonarr_states[0] == "waiting"
     assert "starting" in sonarr_states
     assert sonarr_states[-1] == "done"
+
+
+async def test_the_network_does_not_exist_until_the_first_compose_up(tmp_path: Path) -> None:
+    """On a real fresh host, nothing has ever run `compose up` for this
+    stack, so the `marrquee` network does not exist yet - only compose's own
+    first `up` creates it. Joining it any earlier always fails (404, before
+    any container is ever created) - this is exactly what happened the
+    first time this engine ever ran against real Docker. `_StatefulEngine`
+    (unlike an always-succeeding fake) models that honestly, which is the
+    only way this class of ordering bug is even testable.
+    """
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+    app_ids = ("prowlarr", "sonarr")
+    install = _install_state(app_ids, root)
+    save_state(settings.config_dir, install)
+
+    engine = _happy_engine(app_ids)  # network_exists defaults to False - a fresh host
+    probe = FakeReadinessProbe(default=True)
+    clock = _FakeClock()
+    manager = DeployManager(settings, engine, probe=probe, clock=clock.time, sleep=clock.sleep)
+
+    manager.start()
+    history = await _run_to_terminal(manager)
+
+    assert history[-1].phase == "finale"
+
+    # The network cannot exist before compose creates it, so a
+    # `connect_network` call can only ever succeed once at least one
+    # `compose_up` has already happened. Reaching `finale` at all already
+    # proves this held (an engine honestly reporting "network does not
+    # exist yet" would have failed the deploy with `docker_unreachable`
+    # otherwise) - checked explicitly here too, for a failure message that
+    # names the actual mechanism instead of just the symptom.
+    call_names = [name for name, _args in engine.calls]
+    assert call_names.index("compose_up") < call_names.index("connect_network")
+    assert len(probe.calls) >= 1  # readiness was actually exercised, not skipped
 
 
 async def test_headline_changes_per_app_during_the_run(tmp_path: Path) -> None:

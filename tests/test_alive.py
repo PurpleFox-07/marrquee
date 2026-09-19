@@ -21,6 +21,7 @@ from marrquee.docker_client import (
     DockerFailure,
     DockerStatus,
     FakeDockerEngine,
+    NetworkConnectResult,
 )
 from marrquee.main import create_app
 
@@ -47,7 +48,7 @@ class _CountingDockerEngine:
     async def image_present(self, reference: str) -> bool:
         raise NotImplementedError("the alive page never checks for an image")
 
-    async def connect_network(self, network: str, container: str) -> bool:
+    async def connect_network(self, network: str, container: str) -> NetworkConnectResult:
         raise NotImplementedError("the alive page never joins a network")
 
     async def logs(self, name: str, tail: int = 50) -> str:
@@ -75,7 +76,7 @@ class _ExplodingDockerEngine:
     async def image_present(self, reference: str) -> bool:
         raise RuntimeError("healthz must never call the Docker engine")
 
-    async def connect_network(self, network: str, container: str) -> bool:
+    async def connect_network(self, network: str, container: str) -> NetworkConnectResult:
         raise RuntimeError("healthz must never call the Docker engine")
 
     async def logs(self, name: str, tail: int = 50) -> str:

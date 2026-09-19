@@ -12,6 +12,7 @@ test below.
 from __future__ import annotations
 
 import asyncio
+import os
 import socket
 import struct
 from collections.abc import Iterable, Mapping
@@ -28,7 +29,15 @@ ContainerState = Literal["created", "running", "restarting", "exited", "paused",
 
 _DEFAULT_COMPOSE_BINARY = Path("/usr/local/bin/docker-compose")
 _DEFAULT_TIMEOUT = 2.0
-_DEFAULT_COMPOSE_TIMEOUT = 300.0
+# `compose_up` for one app blocks for the whole of its own image pull - a
+# ~200-300 MB linuxserver image, on a NAS's own (often slow, upstream-
+# limited) internet connection, the first time it has ever been deployed.
+# 300s (5 minutes) was tight enough to plausibly mistake a genuinely slow
+# but working pull for a hang; 900s (15 minutes) is generous the same way
+# `DeployManager.NEVER_READY_AFTER_SECONDS` is generous about a cold
+# database migration - a real problem should still look like one well
+# before this fires.
+_DEFAULT_COMPOSE_TIMEOUT = 900.0
 
 
 class DockerFailure(StrEnum):
@@ -96,6 +105,22 @@ class ComposeResult:
     output: str
 
 
+@dataclass(frozen=True)
+class NetworkConnectResult:
+    """The outcome of asking Docker to join our own container to a network.
+
+    A bare bool can't say *why* a join failed - and "why" is exactly what
+    turned one real deploy's failure into an undebuggable "docker
+    unreachable" instead of "the network doesn't exist yet". `detail`
+    carries the status code and Docker's own message, for logs and the
+    diagnostics file only - same contract as every other `detail`-shaped
+    field in this codebase.
+    """
+
+    ok: bool
+    detail: str | None
+
+
 class DockerEngine(Protocol):
     """Access to Docker: the original read-only status check, plus the
     read and write operations the deploy engine needs to start and watch
@@ -105,7 +130,7 @@ class DockerEngine(Protocol):
     async def status(self) -> DockerStatus: ...
     async def inspect(self, name: str) -> ContainerSnapshot: ...
     async def image_present(self, reference: str) -> bool: ...
-    async def connect_network(self, network: str, container: str) -> bool: ...
+    async def connect_network(self, network: str, container: str) -> NetworkConnectResult: ...
     async def logs(self, name: str, tail: int = 50) -> str: ...
     async def compose_up(self, project: str, compose_file: Path, service: str) -> ComposeResult: ...
     async def self_container_id(self) -> str | None: ...
@@ -219,23 +244,26 @@ class SocketDockerEngine:
             return False
         return response.status_code == 200
 
-    async def connect_network(self, network: str, container: str) -> bool:
+    async def connect_network(self, network: str, container: str) -> NetworkConnectResult:
         try:
             async with self._client() as client:
                 response = await client.post(
                     f"/networks/{network}/connect", json={"Container": container}
                 )
-        except (httpx.TimeoutException, httpx.ConnectError):
-            return False
+        except (httpx.TimeoutException, httpx.ConnectError) as error:
+            return NetworkConnectResult(ok=False, detail=str(error))
 
         if response.status_code == 200:
-            return True
+            return NetworkConnectResult(ok=True, detail=None)
         # The Engine API's own docs say "a network cannot be re-attached to
         # a running container" - already-connected is an error response, so
         # idempotence has to be recognised here rather than assumed away.
-        if response.status_code in (403, 409):
-            return _reports_already_connected(response)
-        return False
+        if response.status_code in (403, 409) and _reports_already_connected(response):
+            return NetworkConnectResult(ok=True, detail=None)
+        return NetworkConnectResult(
+            ok=False,
+            detail=f"HTTP {response.status_code}: {_docker_error_message(response)}",
+        )
 
     async def logs(self, name: str, tail: int = 50) -> str:
         query = f"stdout=1&stderr=1&tail={tail}"
@@ -262,10 +290,20 @@ class SocketDockerEngine:
             "--no-recreate",
             service,
         )
-        # Deliberately minimal: only what docker-compose needs to find our
-        # socket. The parent process's environment (which may carry
-        # unrelated settings) is never inherited into this subprocess.
-        env = {"DOCKER_HOST": f"unix://{self._socket_path}"}
+        # Deliberately minimal - built from scratch rather than inheriting
+        # the parent process's whole environment (which may carry unrelated
+        # settings) - but HOME and PATH are not optional extras. Docker's
+        # own CLI config loader falls back to resolving the running user's
+        # home directory from `/etc/passwd` when HOME is unset, and that
+        # fallback chain succeeding is untested territory on every possible
+        # base image; passing both through explicitly (with a safe default
+        # if the parent process somehow lacks them too) removes the doubt
+        # entirely rather than hoping the fallback works.
+        env = {
+            "DOCKER_HOST": f"unix://{self._socket_path}",
+            "HOME": os.environ.get("HOME", "/root"),
+            "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        }
 
         try:
             process = await asyncio.create_subprocess_exec(
@@ -396,6 +434,22 @@ def _parse_inspect_payload(name: str, payload: object) -> ContainerSnapshot:
     )
 
 
+def _docker_error_message(response: httpx.Response) -> str:
+    """Docker's own `message` field from an error body, or the raw response
+    text when the body isn't the JSON shape Docker normally sends.
+
+    This is Docker's own wording about a network or container's state - it
+    never carries anything Marrquee itself set (an API key, a path), so it
+    is safe to put straight into a `Failure.technical` field.
+    """
+    try:
+        payload = response.json()
+    except ValueError:
+        return response.text
+    message = payload.get("message") if isinstance(payload, dict) else None
+    return message if isinstance(message, str) else response.text
+
+
 def _reports_already_connected(response: httpx.Response) -> bool:
     """Does this network-connect error mean "already connected" rather than
     a genuine failure?
@@ -405,14 +459,7 @@ def _reports_already_connected(response: httpx.Response) -> bool:
     here, from the error message, instead of assumed from the status code
     alone.
     """
-    try:
-        payload = response.json()
-    except ValueError:
-        return False
-    message = payload.get("message") if isinstance(payload, dict) else None
-    if not isinstance(message, str):
-        return False
-    lowered = message.lower()
+    lowered = _docker_error_message(response).lower()
     return "already" in lowered and "exist" in lowered
 
 
@@ -462,14 +509,22 @@ class FakeDockerEngine:
         containers: Mapping[str, ContainerSnapshot] | None = None,
         images: Iterable[str] | None = None,
         compose_results: Mapping[str, ComposeResult] | None = None,
-        network_connects: bool = True,
+        network_connects: bool | None = None,
+        network_exists: bool = False,
         self_container_id: str | None = "fake-marrquee-container",
     ) -> None:
         self._status = status
         self._containers = dict(containers) if containers is not None else {}
         self._images = frozenset(images) if images is not None else frozenset()
         self._compose_results = dict(compose_results) if compose_results is not None else {}
-        self._network_connects = network_connects
+        # `None` (the default) models a real Docker daemon honestly: the
+        # stack's network is created by compose's own first successful `up`,
+        # not by anything before it - `network_exists` starts False (a
+        # fresh host) unless a test explicitly pre-seeds it (a resume
+        # scenario). `network_connects` is an explicit override for tests
+        # that don't care about that sequencing at all.
+        self._network_connects_override = network_connects
+        self._network_exists = network_exists
         self._self_container_id = self_container_id
         self.calls: list[tuple[str, tuple[object, ...]]] = []
 
@@ -490,9 +545,15 @@ class FakeDockerEngine:
         self.calls.append(("image_present", (reference,)))
         return reference in self._images
 
-    async def connect_network(self, network: str, container: str) -> bool:
+    async def connect_network(self, network: str, container: str) -> NetworkConnectResult:
         self.calls.append(("connect_network", (network, container)))
-        return self._network_connects
+        if self._network_connects_override is not None:
+            return NetworkConnectResult(ok=self._network_connects_override, detail=None)
+        if self._network_exists:
+            return NetworkConnectResult(ok=True, detail=None)
+        return NetworkConnectResult(
+            ok=False, detail=f"network {network!r} does not exist yet (no successful compose up)"
+        )
 
     async def logs(self, name: str, tail: int = 50) -> str:
         self.calls.append(("logs", (name, tail)))
@@ -500,7 +561,13 @@ class FakeDockerEngine:
 
     async def compose_up(self, project: str, compose_file: Path, service: str) -> ComposeResult:
         self.calls.append(("compose_up", (project, str(compose_file), service)))
-        return self._compose_results.get(service, ComposeResult(ok=True, exit_code=0, output=""))
+        result = self._compose_results.get(service, ComposeResult(ok=True, exit_code=0, output=""))
+        if result.ok:
+            # Real compose creates the stack's network as a side effect of
+            # its first successful `up` - whichever service happens to be
+            # first - not before, and not conditional on which one it is.
+            self._network_exists = True
+        return result
 
     async def self_container_id(self) -> str | None:
         self.calls.append(("self_container_id", ()))

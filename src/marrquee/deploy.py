@@ -288,7 +288,9 @@ class DeployManager:
         """Re-enter a deploy that was still going when this process last stopped.
 
         Every step the run takes is idempotent (folders, marker, compose
-        file, `compose up --no-recreate`, network connect), so re-running
+        file, `compose up --no-recreate`, network connect - joined again per
+        app, which also self-heals a Marrquee container recreated by this
+        very restart, no longer being on the network at all), so re-running
         the whole sequence is a repeat, not a rollback - reporting `error`
         here instead would tell the owner their deploy failed while their
         containers are visibly fine.
@@ -473,28 +475,32 @@ class DeployManager:
         plan = build_stack_plan(install)
         compose_path = write_compose(self._settings, plan)
 
-        # The compose-spec guarantees a network's `name:` is used literally,
-        # so `plan.network` (the same name the compose file was just written
-        # with) is a fixed target here rather than a second guess at it.
+        # Marrquee has no label on the stack's own compose project, so this
+        # fallback chain is the only way to identify its own container -
+        # checked once, up front, since a missing id means nothing could
+        # ever join the network later either, regardless of anything else.
         self_id = await self._engine.self_container_id()
-        connected = self_id is not None and await self._engine.connect_network(
-            plan.network, self_id
-        )
-        if not connected:
+        if self_id is None:
             await self._fail(
                 run_id,
                 started_at,
                 progresses,
                 install,
-                _docker_unreachable_failure(
-                    f"could not join the {plan.network!r} network (self_id={self_id!r})"
-                ),
+                _docker_unreachable_failure("could not identify Marrquee's own container"),
             )
             return
 
         for index, app in enumerate(catalog_apps):
             failure = await self._bring_up_app(
-                app, install, compose_path, progresses, index, run_id, started_at
+                app,
+                install,
+                compose_path,
+                progresses,
+                index,
+                run_id,
+                started_at,
+                plan.network,
+                self_id,
             )
             if failure is not None:
                 await self._fail(run_id, started_at, progresses, install, failure)
@@ -571,6 +577,8 @@ class DeployManager:
         index: int,
         run_id: str,
         started_at: str,
+        network: str,
+        self_id: str,
     ) -> Failure | None:
         api_key = install.api_keys.get(app.id)
         if api_key is None:
@@ -597,6 +605,20 @@ class DeployManager:
         result = await self._engine.compose_up(self._settings.stack_project, compose_path, app.id)
         if not result.ok:
             return _compose_failure(app, downloading, result)
+
+        # Compose creates the stack's network as a side effect of its own
+        # first successful `up` - on a fresh host, nothing exists before
+        # that, so this can never run any earlier. Idempotent (an
+        # already-connected container counts as success) and repeated for
+        # every app rather than once, so a Marrquee container recreated
+        # mid-deploy (a restart) rejoins the network here instead of
+        # silently staying off it.
+        connect_result = await self._engine.connect_network(network, self_id)
+        if not connect_result.ok:
+            return _docker_unreachable_failure(
+                connect_result.detail
+                or f"could not join the {network!r} network (self_id={self_id!r})"
+            )
 
         start = self._clock()
         reassured = False
