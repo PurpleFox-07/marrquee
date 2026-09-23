@@ -163,12 +163,14 @@ Terminal or an SSH session.
    github.com and click the **Actions** tab. Wait until the newest run
    shows a green tick. That means the new Marrquee was built, tested
    and published. A red X means stop and tell me.
-2. **Update Marrquee on the NAS.** Open the Ugreen **Docker** app and
-   go to **Project**. Next to `marrquee` you should see a mark saying
-   an update is available. Choose to update it. The NAS downloads the
-   newest Marrquee and restarts it, which takes a minute. **If you
-   don't see an update option, stop here and tell me what that screen
-   shows.** Do not use a command line.
+2. **Update Marrquee on the NAS.** Open the Ugreen **Docker** app, go
+   to **Project**, open `marrquee` and go to its compose configuration.
+   Choose **Redeploy**. The NAS downloads the newest Marrquee and
+   restarts it, which takes a minute. Your apps (Prowlarr, Sonarr,
+   Radarr) keep running - Marrquee keeps them in a separate group so a
+   redeploy of Marrquee never touches them. **If you don't see
+   Redeploy, stop here and tell me what that screen shows.** Do not use
+   a command line.
 3. **Check it's healthy.** Go to
    `http://<your NAS's address>:7788/diagnostics`. You should see a
    green "Talking to Docker" line. Further down there is a new **Last
