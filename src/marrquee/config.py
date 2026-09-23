@@ -34,7 +34,7 @@ class Settings:
     # to happen.
     host_mount: Path = Path("/host")
     compose_binary: Path = Path("/usr/local/bin/docker-compose")
-    stack_project: str = "marrquee"
+    stack_project: str = "marrquee-apps"  # never "marrquee" - see compose._STACK_PROJECT
 
     @staticmethod
     def from_env(env: Mapping[str, str] | None = None) -> Settings:

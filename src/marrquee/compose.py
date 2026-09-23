@@ -34,7 +34,11 @@ logger = logging.getLogger(__name__)
 # name mirrors it for the same reason: both need to stay the same on every
 # deploy, regardless of anything else, so they are fixed constants rather
 # than something `build_stack_plan` derives per call.
-_STACK_PROJECT = "marrquee"
+# Deliberately NOT "marrquee": that is the name owners give the NAS Docker
+# app project that runs Marrquee itself, and a NAS "Redeploy" of that
+# project removes any other container carrying the same project label -
+# which would take Prowlarr, Sonarr and Radarr down with it.
+_STACK_PROJECT = "marrquee-apps"
 _NETWORK_NAME = "marrquee"
 
 _CONFIG_MOUNT_SUFFIX = ":/config"

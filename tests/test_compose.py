@@ -368,3 +368,25 @@ def test_write_compose_swallows_a_chown_failure_and_still_returns_a_valid_file(
 
     assert written_path.is_file()
     assert "chown" in caplog.text.lower()
+
+
+# --- the app stack never shares a compose project with Marrquee itself -----
+#
+# The owner's NAS Docker app runs Marrquee as a compose project the owner
+# names - and "marrquee" is the obvious name. If the app stack used that
+# same project name, the NAS app's own "Redeploy" would treat Prowlarr,
+# Sonarr and Radarr as leftovers of Marrquee's project and remove them
+# (found on the owner's Ugreen NAS, 2026-09-23).
+
+
+def test_the_app_stack_project_is_not_the_name_owners_give_marrquee_itself() -> None:
+    plan = compose.build_stack_plan(_fixture_state())
+
+    assert plan.project != "marrquee"
+    assert plan.project == "marrquee-apps"
+
+
+def test_the_deploy_engine_and_the_stack_plan_agree_on_the_project_name() -> None:
+    plan = compose.build_stack_plan(_fixture_state())
+
+    assert Settings().stack_project == plan.project

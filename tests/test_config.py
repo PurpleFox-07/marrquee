@@ -19,7 +19,7 @@ def test_settings_defaults_are_the_documented_ones() -> None:
     assert settings.port == 7788
     assert settings.host_mount == Path("/host")
     assert settings.compose_binary == Path("/usr/local/bin/docker-compose")
-    assert settings.stack_project == "marrquee"
+    assert settings.stack_project == "marrquee-apps"
 
 
 def test_settings_from_env_overrides_each_field() -> None:
@@ -53,7 +53,7 @@ def test_settings_from_env_keeps_every_predecessor_default_when_only_new_vars_ar
     assert settings.port == 7788
     assert settings.host_mount == Path("/mnt/host")
     assert settings.compose_binary == Path("/usr/local/bin/docker-compose")
-    assert settings.stack_project == "marrquee"
+    assert settings.stack_project == "marrquee-apps"
 
 
 def test_settings_from_env_none_reads_os_environ(monkeypatch: pytest.MonkeyPatch) -> None:
