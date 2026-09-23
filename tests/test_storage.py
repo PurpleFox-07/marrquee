@@ -313,8 +313,28 @@ def test_check_fresh_start_refuses_when_a_planned_media_folder_escapes_the_root(
     outside.mkdir()
     (container_root / "movies").symlink_to(outside)
 
-    with pytest.raises(storage.PathEscapesRoot):
-        storage.check_fresh_start(settings, root, ("radarr",))
+    check = storage.check_fresh_start(settings, root, ("radarr",))
+
+    assert check.ok is False
+    assert check.reason == "already_has_files"
+    assert check.occupied == ("data/media/movies",)
+
+
+def test_check_fresh_start_refuses_when_its_own_folder_escapes_the_root(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(host_mount=tmp_path)
+    root = PurePosixPath("/volume1/media")
+    container_root = tmp_path / "volume1" / "media"
+    container_root.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (container_root / "marrquee").symlink_to(outside)
+
+    check = storage.check_fresh_start(settings, root, ("radarr",))
+
+    assert check.ok is False
+    assert check.reason == "already_has_files"
 
 
 # --- write_marker ------------------------------------------------------------

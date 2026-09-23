@@ -167,6 +167,25 @@ def test_install_refuses_a_populated_target_with_409_and_saves_nothing(tmp_path:
     assert load_state(settings.config_dir) is None
 
 
+def test_install_refuses_a_target_whose_media_folder_links_outside_with_409_not_500(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+    media = settings.host_mount / "volume1" / "media" / "data" / "media"
+    media.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (media / "tv").symlink_to(outside)
+    client = _client(settings, _idle_manager(settings))
+
+    response = client.post("/api/install", json={"path": str(root), "app_ids": ["sonarr"]})
+
+    assert response.status_code == 409
+    assert response.json()["detail"]
+    assert load_state(settings.config_dir) is None
+
+
 def test_install_refuses_an_empty_app_list_with_400(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     root = _fresh_root(settings)

@@ -341,17 +341,30 @@ def check_fresh_start(
     Keyed to our own marker rather than to emptiness: a re-deploy has to
     work without ever mistaking an owner's existing library for a fresh
     target, or a fresh target for one to adopt.
+
+    A planned folder that turns out to be a link pointing outside the root
+    is refused as occupied rather than raised: it is something already
+    there that Marrquee didn't make, and a refusal is what lets the install
+    save and the deploy re-check answer with a sentence instead of a crash.
     """
     container_root = to_host_view(settings, str(root))
 
-    if _marker_path(container_root).is_file():
+    try:
+        marker = _marker_path(container_root)
+    except PathEscapesRoot:
+        return FreshnessCheck(ok=False, reason="already_has_files", occupied=("marrquee",))
+    if marker.is_file():
         return FreshnessCheck(ok=True)
 
     occupied: list[str] = []
     for relative in plan_folders(app_ids):
         if not str(relative).startswith("data/media/"):
             continue
-        candidate = _safe_join(container_root, relative)
+        try:
+            candidate = _safe_join(container_root, relative)
+        except PathEscapesRoot:
+            occupied.append(str(relative))
+            continue
         if candidate.is_dir() and any(candidate.iterdir()):
             occupied.append(str(relative))
 
