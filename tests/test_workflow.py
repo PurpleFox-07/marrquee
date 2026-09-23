@@ -276,7 +276,8 @@ def test_stack_smoke_starts_the_image_with_the_socket_and_the_host_mount() -> No
     step = _step_named(_stack_smoke_job(), "start", "built image", "install file")
 
     assert _SOCKET_MOUNT in step["run"]
-    assert "-v /:/host" in step["run"]
+    assert '-v "${RUNNER_TEMP}:/host${RUNNER_TEMP}"' in step["run"]
+    assert "-v /:/host" not in step["run"]
     port = Settings().port
     assert f"-p {port}:{port}" in step["run"]
 

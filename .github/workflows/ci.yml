@@ -261,15 +261,19 @@ jobs:
       - name: Create a fresh storage root under the runner's temp directory
         run: mkdir -p "$RUNNER_TEMP/marrquee-smoke/media"
 
-      # Started the same way `compose.install.yaml` starts it: the socket,
-      # the port, and the `/:/host` mount that lets Marrquee see (and build
-      # folders inside) the storage root created just above.
+      # Started the same way `compose.install.yaml` starts it, but mirroring
+      # its partial-mount shape rather than a whole-drive one: the socket,
+      # the port, and the runner's own temp root mounted at `/host` plus
+      # that same path. That's the exact "host path X lands at /host/X"
+      # mapping the NAS now uses, so this proves it against a mount that
+      # only covers part of the host, not `/:/host`, while still reaching
+      # the storage root created just above.
       - name: Start the built image the way the install file does
         run: |
           docker run -d --name marrquee-stack-smoke \
             -p 7788:7788 \
             -v /var/run/docker.sock:/var/run/docker.sock \
-            -v /:/host \
+            -v "${RUNNER_TEMP}:/host${RUNNER_TEMP}" \
             marrquee:stack-smoke
 
       - name: Wait for Marrquee to answer /healthz

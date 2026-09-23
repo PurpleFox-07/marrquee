@@ -19,12 +19,14 @@ services:
       # once you deploy.
       - /var/run/docker.sock:/var/run/docker.sock
       # Where Marrquee keeps the choices you make and the settings it
-      # generates. This survives restarts and reinstalls.
-      - marrquee-config:/config
-      # This lets Marrquee see your drives, so it can check the folder you
-      # type and build the media folders inside it. Marrquee only ever
-      # writes inside the one folder you choose.
-      - /:/host
-
-volumes:
-  marrquee-config:
+      # generates - a "config" folder that sits right next to this project
+      # in your NAS's Files app. This survives restarts and reinstalls.
+      - ./config:/config
+      # On Ugreen and Synology-style NAS boxes, every shared folder lives
+      # under /volume1 - if a second drive pool shows up as /volume2 on
+      # yours, add a second line here: "/volume2:/host/volume2". Marrquee
+      # can only see and build inside what is mounted here, and only ever
+      # writes inside the one folder you type. (The NAS's Docker app no
+      # longer accepts mounting the whole NAS as one line, so this is
+      # mounted folder by folder instead.)
+      - /volume1:/host/volume1

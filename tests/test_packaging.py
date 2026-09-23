@@ -27,9 +27,14 @@ _README_PATH = _REPO_ROOT / "README.md"
 
 _IMAGE_NAME = "ghcr.io/purplefox-07/marrquee:latest"
 _SOCKET_MOUNT = "/var/run/docker.sock:/var/run/docker.sock"
-_CONFIG_MOUNT = "marrquee-config:/config"
-_HOST_MOUNT = "/:/host"
-_EXPECTED_MOUNTS = {_SOCKET_MOUNT, _CONFIG_MOUNT, _HOST_MOUNT}
+_HOST_MOUNT = "/volume1:/host/volume1"
+# The compose file mounts the config folder as a relative bind - valid in a
+# compose file, resolved against wherever it lives - while `docker run`
+# needs an absolute (or `$(pwd)`-built) host path instead, so the two forms
+# of this one mount are pinned separately rather than shared.
+_COMPOSE_CONFIG_MOUNT = "./config:/config"
+_README_CONFIG_MOUNT = '"$(pwd)/config:/config"'
+_COMPOSE_MOUNTS = {_SOCKET_MOUNT, _COMPOSE_CONFIG_MOUNT, _HOST_MOUNT}
 
 # Pinned docker-compose release this Dockerfile ships - kept here as the
 # single source the test checks the Dockerfile against, so a version bump
@@ -122,14 +127,28 @@ def test_compose_publishes_the_port_settings_actually_uses() -> None:
     assert _compose_service()["ports"] == [f"{port}:{port}"]
 
 
-def test_compose_mounts_the_docker_socket_the_settings_volume_and_the_host_root() -> None:
-    """Exactly three mounts: the socket, the config volume, and the host root.
+def test_compose_mounts_the_docker_socket_the_config_folder_and_the_shared_folder_root() -> None:
+    """Exactly three mounts: the socket, the config folder, and the shared-folder root.
 
-    The host-root mount lets Marrquee see the owner's drives so it can check
-    a typed path and build folders inside it, without the install command
-    ever needing to change later.
+    The shared-folder mount lets Marrquee see the owner's shared folders so
+    it can check a typed path and build folders inside it, without the
+    install command ever needing to change later. It is a plain host-folder
+    bind, not a whole-NAS mount - the NAS's Docker app refuses that.
     """
-    assert set(_compose_volumes()) == _EXPECTED_MOUNTS
+    assert set(_compose_volumes()) == _COMPOSE_MOUNTS
+
+
+def test_compose_has_no_full_host_root_mount_and_no_top_level_named_volume() -> None:
+    """Both are things the NAS's Docker app now refuses outright.
+
+    A top-level named volume and a `/:/host` bind both make the Project
+    screen reject the whole file with "Invalid configuration file" - so
+    settings live in a plain folder bind instead, and the shared-folder
+    mount is scoped to a real path rather than the NAS's root.
+    """
+    text = _COMPOSE_PATH.read_text()
+    assert "/:/host" not in text
+    assert "volumes" not in _compose_doc()
 
 
 def test_compose_names_the_published_image_and_a_restart_policy() -> None:
@@ -146,19 +165,23 @@ def test_compose_declares_no_obsolete_version_key() -> None:
 def test_readme_docker_run_line_matches_the_compose_file() -> None:
     """Checked in both directions, so the two install paths cannot drift.
 
-    Every mount the compose file wires in must appear in the README's
-    `docker run` line, and the README must not carry a mount the compose
-    file doesn't.
+    The socket and shared-folder mounts must appear in the README's
+    `docker run` line exactly as they do in the compose file. The config
+    mount is the one exception: `docker run` needs an absolute host path,
+    so it carries a `$(pwd)`-built form of the same mount instead of the
+    compose file's relative `./config`.
     """
     block = _docker_run_block(_readme_text())
     port = Settings().port
 
     assert _IMAGE_NAME in block
     assert f"-p {port}:{port}" in block
+    assert f"-v {_SOCKET_MOUNT}" in block
+    assert f"-v {_HOST_MOUNT}" in block
+    assert f"-v {_README_CONFIG_MOUNT}" in block
+    assert "/:/host" not in block
 
-    readme_mounts = {mount for mount in _EXPECTED_MOUNTS if f"-v {mount}" in block}
-    assert readme_mounts == _EXPECTED_MOUNTS
-    assert set(_compose_volumes()) == _EXPECTED_MOUNTS
+    assert set(_compose_volumes()) == _COMPOSE_MOUNTS
 
 
 def test_dockerfile_exposes_the_port_settings_uses_and_has_no_user_directive() -> None:

@@ -1,7 +1,8 @@
 """Tests for the storage module: the only code allowed to touch the owner's drive.
 
-The owner gave Marrquee a full read-write view of their NAS (`/:/host`), so
-this module's safety properties are the only thing standing between a bug
+The owner gave Marrquee a read-write view of their NAS's shared-folder
+root(s) (for example `/volume1` mounted at `/host/volume1`), so this
+module's safety properties are the only thing standing between a bug
 here and the owner's data. These tests lean hard on that: every refusal
 path is proven to write nothing, folder creation is proven to touch only
 what it created, and the module's own source is scanned to prove it cannot
@@ -594,5 +595,5 @@ def test_storage_py_has_no_deletion_calls() -> None:
 
 
 def test_the_install_file_and_readme_both_carry_the_host_mount() -> None:
-    assert "- /:/host" in _COMPOSE_PATH.read_text()
-    assert "-v /:/host" in _README_PATH.read_text()
+    assert "- /volume1:/host/volume1" in _COMPOSE_PATH.read_text()
+    assert "-v /volume1:/host/volume1" in _README_PATH.read_text()

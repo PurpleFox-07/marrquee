@@ -1,8 +1,9 @@
 """The only module allowed to touch the host filesystem the owner mounted in.
 
-The owner gave Marrquee a full read-write view of their NAS (`/:/host`) so
-that a typed path can be checked and its folders built without spawning a
-helper container per keystroke. That capability is only safe because this
+The owner gave Marrquee a read-write view of their NAS's shared-folder
+root(s) (for example `/volume1` mounted at `/host/volume1`) so that a typed
+path can be checked and its folders built without spawning a helper
+container per keystroke. That capability is only safe because this
 one module enforces the promise the rest of the product makes: Marrquee
 only ever `mkdir`s and `chown`s folders it created itself, and it is
 structurally incapable of deleting, moving or renaming anything - proven by

@@ -54,6 +54,20 @@ exact same thing, and both pull the published image,
 `ghcr.io/purplefox-07/marrquee:latest`, from GitHub Container Registry
 (once it has been published - see **First-time setup** above).
 
+Settings now live in a `config` folder next to wherever you installed
+from, instead of inside Docker itself, so you can see them in the NAS's
+Files app.
+
+**Already installed Marrquee before?** Ugreen's Docker app was updated
+in September 2026 and now refuses the old `-v /:/host` line. If you
+installed before then, paste the current [`compose.install.yaml`](./compose.install.yaml)
+over your old one (see step 1 under **Try the deploy engine** below),
+or reinstall using Option A below with today's mounts.
+If you installed using the old `marrquee-config` Docker volume, nothing
+carries over from it automatically - but there's nothing to lose yet,
+since this early version of Marrquee didn't save anything worth keeping
+there.
+
 ### Option A: one command
 
 If your NAS lets you run a single Docker command (for example over
@@ -65,8 +79,8 @@ docker run -d \
   --restart unless-stopped \
   -p 7788:7788 \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  -v marrquee-config:/config \
-  -v /:/host \
+  -v "$(pwd)/config:/config" \
+  -v /volume1:/host/volume1 \
   ghcr.io/purplefox-07/marrquee:latest
 ```
 
@@ -78,11 +92,16 @@ What each line does:
 - `-v /var/run/docker.sock:/var/run/docker.sock` - lets Marrquee see
   whether Docker is running, and lets it start the apps you choose -
   through the compose file it writes for you - once you deploy.
-- `-v marrquee-config:/config` - a place for Marrquee to keep the
-  choices you make. It survives restarts and reinstalls.
-- `-v /:/host` - this lets Marrquee see your drives, so it can check
-  the folder you type and build the media folders inside it. Marrquee
-  only ever writes inside the one folder you choose.
+- `-v "$(pwd)/config:/config"` - a folder next to wherever you run this
+  command, for Marrquee to keep the choices you make. It survives
+  restarts and reinstalls. Run the command from a folder you'll
+  remember (or replace `$(pwd)/config` with a full path of your own,
+  such as `/volume1/docker/marrquee/config`).
+- `-v /volume1:/host/volume1` - this lets Marrquee see the shared
+  folders under `/volume1`, so it can check the folder you type and
+  build the media folders inside it. Marrquee only ever writes inside
+  the one folder you choose. If your NAS also has a `/volume2`, add
+  `-v /volume2:/host/volume2` too.
 
 ### Option B: paste a file
 
@@ -120,11 +139,12 @@ the install step above.
    feature existed.** Open the **Docker** app -> **Project**, select
    `marrquee`, and paste the current contents of
    [`compose.install.yaml`](./compose.install.yaml) over the old ones.
-   The only new line is `- /:/host`, which is what lets Marrquee see
-   your drives. Click **Deploy** again. (If the Project screen refuses
-   that line, use Option A above instead - it has the same line in
-   it.) If you installed fresh using the instructions above, this step
-   is already done - skip ahead.
+   The new lines mount a `config` folder next to the project, and your
+   NAS's shared folders (`/volume1`, and `/volume2` too if you have
+   one) at `/host/volume1` and `/host/volume2` - together, that's what
+   lets Marrquee see your files. Click **Deploy** again. If you
+   installed fresh using the instructions above, this step is already
+   done - skip ahead.
 2. **Check it came back.** In a browser go to
    `http://<your NAS's address>:7788`. You should still see the purple
    page with a green "Talking to Docker" line.

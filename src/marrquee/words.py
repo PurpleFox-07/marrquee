@@ -207,9 +207,9 @@ COMPOSE_FILE_HEADER_COMMENT = (
     "read it. Every folder here is a real folder on your drive."
 )
 HOST_MOUNT_COMMENT = (
-    "This lets Marrquee see your drives, so it can check the folder you type "
-    "and build the media folders inside it. Marrquee only ever writes inside "
-    "the one folder you choose."
+    "This lets Marrquee see your shared folders, so it can check the folder "
+    "you type and build the media folders inside it. Marrquee only ever "
+    "writes inside the one folder you choose."
 )
 DATA_MOUNT_COMMENT = (
     "Every app that touches media shares this one /data folder. That's what "
