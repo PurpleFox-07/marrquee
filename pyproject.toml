@@ -12,6 +12,8 @@ dependencies = [
     "uvicorn",
     "jinja2",
     "httpx",
+    "python-multipart>=0.0.32",
+    "tzdata>=2026.4",
 ]
 
 [dependency-groups]

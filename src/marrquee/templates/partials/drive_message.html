@@ -1,0 +1,8 @@
+<span class="drive-message__glyph" aria-hidden="true">{{ message.glyph }}</span>
+<p class="drive-message__text">{{ message.text }}</p>
+{% if message.guidance %}
+<p class="drive-message__guidance">{{ message.guidance }}</p>
+{% endif %}
+{% if message.suggestion %}
+<button type="submit" name="use_suggestion" value="{{ message.suggestion }}" class="suggestion-button">{{ words.wizard_use_suggestion(message.suggestion) }}</button>
+{% endif %}

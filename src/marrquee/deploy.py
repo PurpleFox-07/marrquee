@@ -69,6 +69,7 @@ from marrquee.words import (
     failure_port_in_use,
     refusal_name_clash,
     refusal_not_a_folder,
+    refusal_not_shared,
     refusal_not_writable,
     refusal_path_missing,
     refusal_populated_target,
@@ -777,6 +778,7 @@ _STORAGE_REFUSAL_WORDS: dict[str, Callable[[str], str]] = {
     "missing": refusal_path_missing,
     "not_a_folder": refusal_not_a_folder,
     "not_writable": refusal_not_writable,
+    "not_shared": refusal_not_shared,
 }
 
 

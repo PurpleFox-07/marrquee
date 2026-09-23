@@ -59,6 +59,10 @@ class DockerStatus:
     `detail` carries the raw technical string (an exception message, an HTTP
     status code) for logs only. The template contract forbids rendering it -
     the copy the owner sees comes from `failure` alone, never from `detail`.
+
+    `platform_name`, `os_type` and `kernel_version` come from the same
+    `/version` reply - no extra request - and exist only so `detect_host_kind`
+    can tell a Docker Desktop host apart from a real NAS or Linux box.
     """
 
     connected: bool
@@ -66,6 +70,9 @@ class DockerStatus:
     api_version: str | None = None
     failure: DockerFailure | None = None
     detail: str | None = None
+    platform_name: str | None = None
+    os_type: str | None = None
+    kernel_version: str | None = None
 
 
 @dataclass(frozen=True)
@@ -375,11 +382,42 @@ def _parse_version_response(response: httpx.Response) -> DockerStatus:
         )
 
     api_version = payload.get("ApiVersion") if isinstance(payload, dict) else None
+    platform_block = payload.get("Platform") if isinstance(payload, dict) else None
+    platform_name = platform_block.get("Name") if isinstance(platform_block, dict) else None
+    os_type = payload.get("Os") if isinstance(payload, dict) else None
+    kernel_version = payload.get("KernelVersion") if isinstance(payload, dict) else None
     return DockerStatus(
         connected=True,
         version=version,
         api_version=api_version if isinstance(api_version, str) else None,
+        platform_name=platform_name if isinstance(platform_name, str) else None,
+        os_type=os_type if isinstance(os_type, str) else None,
+        kernel_version=kernel_version if isinstance(kernel_version, str) else None,
     )
+
+
+HostKind = Literal["nas_or_linux", "docker_desktop", "unknown"]
+
+
+def detect_host_kind(status: DockerStatus) -> HostKind:
+    """Guess whether Docker is running on Docker Desktop or a real NAS/Linux
+    box, from fields already in the `/version` reply `status()` fetched -
+    no second request needed.
+
+    Matching is positive-only: anything unrecognised comes back "unknown"
+    rather than a guess, so a NAS shape Marrquee doesn't recognise yet never
+    earns a false "this isn't supported" warning.
+    """
+    if not status.connected:
+        return "unknown"
+
+    platform_name = (status.platform_name or "").lower()
+    kernel_version = (status.kernel_version or "").lower()
+    if platform_name.startswith("docker desktop") or "linuxkit" in kernel_version:
+        return "docker_desktop"
+    if status.os_type == "linux":
+        return "nas_or_linux"
+    return "unknown"
 
 
 # Go's zero-value `time.Time`, formatted the way Docker's JSON encoder

@@ -1,0 +1,367 @@
+/* Styles for the setup wizard's screens (pick your apps, where's your big
+ * drive). Scoped under .wizard so a wizard-only rule never leaks onto the
+ * alive page, which keeps using app.css alone.
+ *
+ * Every colour, spacing, type, radius, shadow and motion value here is a
+ * CSS custom property from tokens.css - never a literal. The only literals
+ * allowed are structural values with no matching token: 1px (hairline
+ * border), 2px (focus-ring width/offset), 250px (the app-card grid's
+ * minimum column width) and translateY(-4px) (a drive result's entrance
+ * motion, added alongside that screen).
+ */
+
+.wizard .actions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--space-4);
+  margin-top: var(--space-12);
+}
+
+@media (max-width: 640px) {
+  .wizard .actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}
+
+/* --- Step pills ------------------------------------------------------------ */
+
+.step-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-bottom: var(--space-8);
+}
+
+.step-pill {
+  display: inline-block;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-full);
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  background: transparent;
+}
+
+.step-pill--current {
+  color: var(--text-accent);
+  background: var(--primary-light);
+  border-color: var(--border-accent);
+}
+
+.step-pill--done {
+  color: var(--success);
+  border-color: var(--success-light);
+}
+
+/* --- Platform warning -------------------------------------------------------- */
+
+.warning-banner {
+  display: flex;
+  gap: var(--space-3);
+  align-items: flex-start;
+  background: var(--warning-light);
+  border: 1px solid var(--warning);
+  border-radius: var(--radius-lg);
+  padding: var(--space-4);
+  margin-bottom: var(--space-8);
+  color: var(--text-primary);
+}
+
+.warning-banner__glyph {
+  color: var(--warning);
+}
+
+.warning-banner p {
+  margin: 0;
+}
+
+/* --- Refusal banner: a message the owner must fix before continuing -------- */
+
+.refusal-banner {
+  display: flex;
+  gap: var(--space-3);
+  align-items: flex-start;
+  background: var(--error-light);
+  border: 1px solid var(--error);
+  border-radius: var(--radius-lg);
+  padding: var(--space-4);
+  margin-bottom: var(--space-8);
+  color: var(--text-primary);
+}
+
+.refusal-banner__glyph {
+  color: var(--error);
+}
+
+.refusal-banner p {
+  margin: 0;
+}
+
+/* --- App picker cards -------------------------------------------------------- */
+
+.app-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+  gap: var(--space-4);
+}
+
+@media (max-width: 640px) {
+  .app-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.app-card {
+  display: block;
+  cursor: pointer;
+}
+
+/* Hidden with opacity, never `display: none` - that would drop the real
+ * checkbox from the tab order along with its click target. */
+.app-card input {
+  position: absolute;
+  opacity: 0;
+}
+
+.app-card__face {
+  display: block;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-xl);
+  padding: var(--space-6);
+  transition:
+    background var(--transition-fast),
+    border-color var(--transition-fast);
+}
+
+.app-card:hover .app-card__face {
+  background: var(--surface-hover);
+}
+
+.app-card input:checked ~ .app-card__face {
+  background: var(--primary-light);
+  border-color: var(--border-accent);
+}
+
+.app-card input:focus-visible ~ .app-card__face {
+  outline: 2px solid var(--spotlight);
+  outline-offset: 2px;
+}
+
+.app-card__top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: var(--space-2);
+}
+
+.app-card-name {
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+  color: var(--text-primary);
+}
+
+.app-card-desc {
+  display: block;
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text-secondary);
+}
+
+.app-tick {
+  width: var(--space-6);
+  height: var(--space-6);
+  display: grid;
+  place-items: center;
+  border-radius: var(--radius-full);
+  border: 2px solid var(--border-strong);
+  font-size: var(--text-sm);
+  color: transparent;
+}
+
+.app-card input:checked ~ .app-card__face .app-tick {
+  border-color: transparent;
+  color: var(--text-primary);
+  background: linear-gradient(to bottom right, var(--primary), var(--accent));
+}
+
+/* --- Panels: the folder box and the time zone box share one look ----------- */
+
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-xl);
+  padding: var(--space-6);
+}
+
+.timezone-panel {
+  margin-top: var(--space-4);
+}
+
+.field-label {
+  display: block;
+  margin-bottom: var(--space-2);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  color: var(--text-primary);
+}
+
+.field-hint {
+  margin: var(--space-2) 0 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text-secondary);
+}
+
+/* --- The typed path: monospace, because it is a file path, not prose ------- */
+
+.path-input {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text-primary);
+  background: var(--background);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  padding: var(--space-3) var(--space-4);
+}
+
+.path-input::placeholder {
+  color: var(--text-secondary);
+}
+
+.path-input:focus-visible {
+  outline: 2px solid var(--spotlight);
+  outline-offset: 2px;
+}
+
+/* --- The live check result: a glyph plus words, never colour alone --------- */
+
+.drive-message {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-top: var(--space-4);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text-secondary);
+  transition:
+    opacity var(--transition-fast),
+    transform var(--transition-fast);
+  opacity: 0;
+  transform: translateY(-4px);
+}
+
+.drive-message[data-tone] {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.drive-message[data-tone="ok"] {
+  color: var(--success);
+}
+
+.drive-message[data-tone="problem"] {
+  color: var(--error);
+}
+
+.drive-message__text,
+.drive-message__guidance {
+  margin: 0;
+}
+
+.suggestion-button {
+  align-self: flex-start;
+  font: inherit;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  color: var(--text-accent);
+  background: transparent;
+  border: 1px solid var(--border-accent);
+  border-radius: var(--radius-full);
+  padding: var(--space-3) var(--space-4);
+  cursor: pointer;
+}
+
+.suggestion-button:focus-visible {
+  outline: 2px solid var(--spotlight);
+  outline-offset: 2px;
+}
+
+/* --- Time zone select: place names, so the sans stack, not the mono one ---- */
+
+.timezone-select {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  font-family: var(--font-sans);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text-primary);
+  background: var(--background);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  padding: var(--space-3) var(--space-4);
+}
+
+.timezone-select:focus-visible {
+  outline: 2px solid var(--spotlight);
+  outline-offset: 2px;
+}
+
+/* --- The always-visible reassurance that nothing existing is touched ------- */
+
+.freshstart-note {
+  margin: var(--space-6) 0 0;
+  background: var(--primary-light);
+  border: 1px solid var(--border-accent);
+  border-radius: var(--radius-lg);
+  padding: var(--space-4);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+}
+
+.freshstart-note p {
+  margin: 0;
+}
+
+/* --- Back: a plain bordered pill, so it reads as one set with Continue ----- */
+
+.btn-ghost {
+  display: inline-block;
+  font: inherit;
+  font-size: var(--text-base);
+  font-weight: var(--weight-semibold);
+  color: var(--text-primary);
+  text-decoration: none;
+  text-align: center;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full);
+  padding: var(--space-4) var(--space-8);
+}
+
+.btn-ghost:focus-visible {
+  outline: 2px solid var(--spotlight);
+  outline-offset: 2px;
+}
+
+/* Matches app.css's own block - the two files never assume the other has
+ * already switched motion off. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition: none !important;
+    animation: none !important;
+  }
+}

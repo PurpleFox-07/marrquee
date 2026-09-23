@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+
+{% block title %}{{ words.WIZARD_TITLE_DRIVE }}{% endblock %}
+
+{% block head %}
+<link rel="stylesheet" href="{{ url_for('static', path='css/wizard.css') }}">
+<script defer src="{{ url_for('static', path='js/wizard.js') }}"></script>
+{% endblock %}
+
+{% block content %}
+<div class="wrap wizard">
+  <p class="eyebrow">{{ words.WIZARD_EYEBROW }}</p>
+  {% include "partials/steps.html" %}
+
+  <h1>{{ words.WIZARD_DRIVE_HEADLINE[0] }}<span class="accent">{{ words.WIZARD_DRIVE_HEADLINE[1] }}</span>{{ words.WIZARD_DRIVE_HEADLINE[2] }}</h1>
+  <p class="lede">{{ words.WIZARD_DRIVE_LEDE }}</p>
+
+  {% include "partials/platform_warning.html" %}
+
+  {% if refusal %}
+  <div class="refusal-banner" role="alert">
+    <span class="refusal-banner__glyph" aria-hidden="true">&#10007;</span>
+    <p>{{ refusal }}</p>
+  </div>
+  {% endif %}
+
+  <form method="post" action="/setup/drive" data-drive-form>
+    <input type="hidden" name="apps" value="{{ apps_csv }}">
+
+    <div class="panel">
+      <label class="field-label" for="path">{{ words.WIZARD_PATH_LABEL }}</label>
+      <input
+        class="path-input"
+        type="text"
+        id="path"
+        name="path"
+        value="{{ path }}"
+        placeholder="{{ words.WIZARD_PATH_PLACEHOLDER }}"
+        aria-describedby="path-hint"
+      >
+      <p class="field-hint" id="path-hint">{{ hint }}</p>
+      <div
+        id="drive-result"
+        class="drive-message"
+        role="status"
+        aria-live="polite"
+        data-checking-text="{{ words.WIZARD_CHECKING }}"
+        {%- if message %} data-tone="{{ message.tone }}"{% endif %}
+      >
+        {% if message %}
+        {% include "partials/drive_message.html" %}
+        {% endif %}
+      </div>
+    </div>
+
+    <div class="panel timezone-panel">
+      <label class="field-label" for="timezone">{{ words.WIZARD_TIMEZONE_LABEL }}</label>
+      <select
+        class="timezone-select"
+        id="timezone"
+        name="timezone"
+        data-timezone-source="{{ timezone_source }}"
+        data-timezone-aliases='{{ timezone_aliases_json }}'
+        aria-describedby="timezone-hint"
+      >
+        {% for group in timezone_groups %}
+        <optgroup label="{{ group.label }}">
+          {% for value, label in group.options %}
+          <option value="{{ value }}"{% if value == timezone_value %} selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </optgroup>
+        {% endfor %}
+      </select>
+      <p class="field-hint" id="timezone-hint">{{ words.WIZARD_TIMEZONE_HINT }}</p>
+    </div>
+
+    <div class="freshstart-note">
+      <p>{{ words.WIZARD_FRESH_START_NOTE }}</p>
+    </div>
+
+    <div class="actions">
+      <a class="btn-ghost" href="/setup/apps?apps={{ apps_csv }}">{{ words.WIZARD_BACK }}</a>
+      <button type="submit" class="btn-primary">{{ words.WIZARD_CONTINUE_TO_DEPLOY }}</button>
+    </div>
+  </form>
+</div>
+{% endblock %}

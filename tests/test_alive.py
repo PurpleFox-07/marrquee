@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from marrquee import __version__
+from marrquee import __version__, words
 from marrquee.config import Settings
 from marrquee.docker_client import (
     ComposeResult,
@@ -120,7 +120,7 @@ def test_healthz_never_calls_the_engine(settings: Settings) -> None:
 def test_the_page_renders_connected_with_the_daemon_version(settings: Settings) -> None:
     client = _client(settings, DockerStatus(connected=True, version="27.3.1", api_version="1.47"))
 
-    response = client.get("/")
+    response = client.get("/diagnostics")
 
     assert response.status_code == 200
     assert "Talking to Docker" in response.text
@@ -141,7 +141,7 @@ def test_the_page_renders_each_docker_failure_with_its_own_title(
 ) -> None:
     client = _client(settings, DockerStatus(connected=False, failure=failure))
 
-    response = client.get("/")
+    response = client.get("/diagnostics")
 
     assert response.status_code == 200
     assert expected_title in response.text
@@ -157,7 +157,7 @@ def test_the_page_never_shows_raw_technical_detail(settings: Settings) -> None:
         ),
     )
 
-    response = client.get("/")
+    response = client.get("/diagnostics")
 
     assert "Errno" not in response.text
     assert "Permission denied:" not in response.text
@@ -172,7 +172,7 @@ def test_the_page_reports_a_settings_folder_it_cannot_write_to(tmp_path: Path) -
 
     try:
         client = _client(settings, DockerStatus(connected=True, version="27.3.1"))
-        response = client.get("/")
+        response = client.get("/diagnostics")
     finally:
         locked.chmod(0o755)
 
@@ -185,7 +185,7 @@ def test_the_page_reports_a_settings_folder_it_just_created(tmp_path: Path) -> N
     settings = Settings(config_dir=target)
 
     client = _client(settings, DockerStatus(connected=True, version="27.3.1"))
-    response = client.get("/")
+    response = client.get("/diagnostics")
 
     assert response.status_code == 200
     assert "Settings folder ready" in response.text
@@ -197,8 +197,8 @@ def test_both_checks_rerun_on_every_request(settings: Settings) -> None:
     app = create_app(settings=settings, engine=engine)
     client = TestClient(app)
 
-    client.get("/")
-    client.get("/")
+    client.get("/diagnostics")
+    client.get("/diagnostics")
 
     assert engine.call_count == 2
 
@@ -206,27 +206,27 @@ def test_both_checks_rerun_on_every_request(settings: Settings) -> None:
 def test_tokens_css_is_linked_before_app_css(settings: Settings) -> None:
     client = _client(settings, DockerStatus(connected=True, version="27.3.1"))
 
-    response = client.get("/")
+    response = client.get("/diagnostics")
 
     tokens_index = response.text.index("tokens.css")
     app_index = response.text.index("app.css")
     assert tokens_index < app_index
 
 
-def test_the_check_again_control_is_a_link_to_root_styled_as_the_pill_button(
+def test_the_check_again_control_is_a_link_to_diagnostics_styled_as_the_pill_button(
     settings: Settings,
 ) -> None:
     client = _client(settings, DockerStatus(connected=True, version="27.3.1"))
 
-    response = client.get("/")
+    response = client.get("/diagnostics")
 
-    assert '<a class="btn-primary" href="/">Check again</a>' in response.text
+    assert '<a class="btn-primary" href="/diagnostics">Check again</a>' in response.text
 
 
 def test_the_page_declares_lang_viewport_and_color_scheme(settings: Settings) -> None:
     client = _client(settings, DockerStatus(connected=True, version="27.3.1"))
 
-    response = client.get("/")
+    response = client.get("/diagnostics")
 
     assert '<html lang="en">' in response.text
     assert 'name="viewport" content="width=device-width, initial-scale=1"' in response.text
@@ -236,10 +236,30 @@ def test_the_page_declares_lang_viewport_and_color_scheme(settings: Settings) ->
 def test_status_icons_are_aria_hidden_and_state_is_in_the_title_text(settings: Settings) -> None:
     client = _client(settings, DockerStatus(connected=True, version="27.3.1"))
 
-    response = client.get("/")
+    response = client.get("/diagnostics")
 
     # Two status rows on the page, each with a decorative, aria-hidden icon -
     # the wording of the title carries the state, not the icon's colour.
     assert response.text.count('aria-hidden="true"') == 2
     assert "Talking to Docker" in response.text
     assert "Settings folder ready" in response.text
+
+
+def test_the_page_carries_the_diagnostics_lede_not_the_old_wizard_teaser(
+    settings: Settings,
+) -> None:
+    client = _client(settings, DockerStatus(connected=True, version="27.3.1"))
+
+    response = client.get("/diagnostics")
+
+    assert words.DIAGNOSTICS_LEDE in response.text
+    assert "Next comes the setup wizard" not in response.text
+
+
+def test_the_page_no_longer_answers_at_root(settings: Settings) -> None:
+    client = _client(settings, DockerStatus(connected=True, version="27.3.1"))
+
+    response = client.get("/", follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] != "/diagnostics"

@@ -149,6 +149,31 @@ def test_install_apps_refuses_a_populated_target_and_saves_nothing(tmp_path: Pat
     assert load_state(settings.config_dir) is None
 
 
+def test_install_apps_saves_an_explicit_timezone_when_given_one(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+
+    result = install_apps(settings, str(root), ["sonarr"], timezone="Europe/London")
+
+    assert result.ok
+    assert result.state is not None
+    assert result.state.timezone == "Europe/London"
+
+
+def test_install_apps_keeps_todays_behaviour_when_no_timezone_is_given(tmp_path: Path) -> None:
+    """`timezone=None` (today's only caller, `/api/install`) must derive the
+    zone exactly as it did before this keyword existed.
+    """
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+
+    result = install_apps(settings, str(root), ["sonarr"])
+
+    assert result.ok
+    assert result.state is not None
+    assert result.state.timezone == "Etc/UTC"
+
+
 def test_install_apps_can_be_reposted_against_the_same_still_fresh_root(tmp_path: Path) -> None:
     """`install_apps` itself never builds folders or writes the marker - that
     is the deploy engine's job - so a repeat call before any deploy has run

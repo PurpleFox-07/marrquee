@@ -95,7 +95,7 @@ jobs:
           exit 1
 
       - name: Assert the amd64 image is talking to the runner's real Docker daemon
-        run: curl -fsS http://127.0.0.1:7788/ | grep -q "Talking to Docker"
+        run: curl -fsS http://127.0.0.1:7788/diagnostics | grep -q "Talking to Docker"
 
       - name: Stop the amd64 smoke container
         if: always()

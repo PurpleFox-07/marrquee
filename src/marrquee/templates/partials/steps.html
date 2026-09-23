@@ -1,0 +1,11 @@
+<nav class="step-pills" aria-label="Setup progress">
+  {% for step in steps %}
+  {% if step.number < current_step %}
+  <span class="step-pill step-pill--done"><span aria-hidden="true">&#10003;</span> {{ step.label }}</span>
+  {% elif step.number == current_step %}
+  <span class="step-pill step-pill--current" aria-current="step">{{ step.number }} &middot; {{ step.label }}</span>
+  {% else %}
+  <span class="step-pill">{{ step.number }} &middot; {{ step.label }}</span>
+  {% endif %}
+  {% endfor %}
+</nav>

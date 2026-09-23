@@ -23,6 +23,7 @@ from marrquee.docker_client import (
     FakeDockerEngine,
     NetworkConnectResult,
     SocketDockerEngine,
+    detect_host_kind,
 )
 
 
@@ -108,6 +109,68 @@ async def test_a_200_with_no_version_key_reports_bad_response(docker_stub):
 
     assert status.connected is False
     assert status.failure == DockerFailure.BAD_RESPONSE
+
+
+async def test_a_docker_desktop_version_reply_is_detected_as_docker_desktop(docker_stub):
+    """FIRST TEST for this chunk - pins the mapping against a Desktop-shaped
+    `/version` body, since there is no real Docker Desktop on this machine
+    to check it against.
+    """
+    stub, socket_path = docker_stub
+    stub.respond_with_json(
+        {
+            "Version": "27.3.1",
+            "ApiVersion": "1.47",
+            "Platform": {"Name": "Docker Desktop 4.34.0 (165256)"},
+            "Os": "linux",
+            "KernelVersion": "6.10.11-linuxkit",
+        }
+    )
+    engine = SocketDockerEngine(socket_path=socket_path)
+
+    status = await engine.status()
+
+    assert status.platform_name == "Docker Desktop 4.34.0 (165256)"
+    assert status.os_type == "linux"
+    assert status.kernel_version == "6.10.11-linuxkit"
+    assert detect_host_kind(status) == "docker_desktop"
+
+
+async def test_a_linux_engine_version_reply_is_detected_as_nas_or_linux(docker_stub):
+    stub, socket_path = docker_stub
+    stub.respond_with_json(
+        {
+            "Version": "27.3.1",
+            "ApiVersion": "1.47",
+            "Platform": {"Name": "Docker Engine - Community"},
+            "Os": "linux",
+            "KernelVersion": "6.8.0-45-generic",
+        }
+    )
+    engine = SocketDockerEngine(socket_path=socket_path)
+
+    status = await engine.status()
+
+    assert detect_host_kind(status) == "nas_or_linux"
+
+
+async def test_a_reply_without_platform_os_or_kernel_parses_to_none_and_is_unknown(docker_stub):
+    stub, socket_path = docker_stub
+    stub.respond_with_json({"Version": "27.3.1", "ApiVersion": "1.47"})
+    engine = SocketDockerEngine(socket_path=socket_path)
+
+    status = await engine.status()
+
+    assert status.platform_name is None
+    assert status.os_type is None
+    assert status.kernel_version is None
+    assert detect_host_kind(status) == "unknown"
+
+
+def test_a_disconnected_status_is_unknown() -> None:
+    status = DockerStatus(connected=False, failure=DockerFailure.SOCKET_MISSING)
+
+    assert detect_host_kind(status) == "unknown"
 
 
 async def test_the_fake_returns_whatever_status_it_was_given() -> None:

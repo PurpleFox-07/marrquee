@@ -244,6 +244,30 @@ def test_readme_tells_the_owner_to_make_the_package_public() -> None:
     assert "danger zone" in readme or "change visibility" in readme
 
 
+def test_amd64_smoke_step_checks_diagnostics_not_root() -> None:
+    step = _step_named(_image_job(), "talking to", "docker daemon")
+
+    assert "127.0.0.1:7788/diagnostics" in step["run"]
+    assert "127.0.0.1:7788/ |" not in step["run"]
+
+
+def test_readme_sends_the_owner_to_the_wizard_and_names_diagnostics() -> None:
+    readme = _README_PATH.read_text()
+
+    assert "What do you want on your media server" in readme
+    assert "/diagnostics" in readme
+
+
+def test_readme_labels_the_curl_walk_as_a_temporary_developer_test() -> None:
+    readme = _README_PATH.read_text()
+
+    section = readme[readme.index("## Try the deploy engine") :]
+    assert "temporary" in section.lower()
+    assert "developer" in section.lower()
+    assert "/api/install" not in section
+    assert "use the two wizard screens" in section.lower()
+
+
 # --- stack-smoke: the real-Docker proof, and the guarantee it never gates ----
 
 

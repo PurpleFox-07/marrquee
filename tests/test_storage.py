@@ -130,6 +130,128 @@ def test_a_missing_path_suggests_the_closest_siblings(tmp_path: Path) -> None:
     assert "media" in result.suggestions
 
 
+def test_a_pathologically_long_segment_is_refused_not_raised(tmp_path: Path) -> None:
+    """A single path segment long enough that the OS itself refuses to stat
+    it (`OSError: File name too long`) must come back as an ordinary
+    refusal - the checker's whole contract is that it never raises, and a
+    typed path is exactly the kind of input the wizard cannot pre-validate
+    the length of before asking the filesystem.
+    """
+    settings = Settings(host_mount=tmp_path)
+
+    result = storage.check_storage_root(settings, "/" + "a" * 4000)
+
+    assert result.ok is False
+    assert result.reason in ("missing", "not_shared")
+    assert result.suggestions == ()
+    assert result.suggested_path is None
+
+
+# --- not_shared: a folder Marrquee simply cannot see, not a typo ------------
+
+
+def test_a_path_whose_first_folder_isnt_mounted_is_not_shared_not_missing(tmp_path: Path) -> None:
+    settings = Settings(host_mount=tmp_path)
+    (tmp_path / "volume1").mkdir()
+
+    result = storage.check_storage_root(settings, "/mnt/storage")
+
+    assert result.ok is False
+    assert result.reason == "not_shared"
+
+
+def test_a_second_pool_that_isnt_mounted_is_not_shared_and_suggests_the_existing_twin(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(host_mount=tmp_path)
+    (tmp_path / "volume1" / "media").mkdir(parents=True)
+
+    result = storage.check_storage_root(settings, "/volume2/media")
+
+    assert result.ok is False
+    assert result.reason == "not_shared"
+    assert result.suggested_path == PurePosixPath("/volume1/media")
+
+
+def test_a_typo_inside_a_mounted_folder_stays_missing_and_suggests_one_full_path(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(host_mount=tmp_path)
+    (tmp_path / "volume1" / "movies").mkdir(parents=True)
+
+    result = storage.check_storage_root(settings, "/volume1/movis")
+
+    assert result.ok is False
+    assert result.reason == "missing"
+    assert result.suggested_path == PurePosixPath("/volume1/movies")
+
+
+def test_suggested_path_falls_back_to_the_matching_folder_when_the_swap_isnt_a_folder(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(host_mount=tmp_path)
+    (tmp_path / "volume1" / "movies").mkdir(parents=True)
+
+    result = storage.check_storage_root(settings, "/volume1/movis/subfolder")
+
+    assert result.ok is False
+    assert result.reason == "missing"
+    # /volume1/movies/subfolder doesn't exist, so the suggestion falls back
+    # to the existing folder the name was matched against.
+    assert result.suggested_path == PurePosixPath("/volume1/movies")
+
+
+def test_suggested_path_is_none_when_nothing_is_close(tmp_path: Path) -> None:
+    settings = Settings(host_mount=tmp_path)
+    (tmp_path / "volume1").mkdir()
+
+    result = storage.check_storage_root(settings, "/mnt/storage")
+
+    assert result.suggestions == ()
+    assert result.suggested_path is None
+
+
+def test_a_typo_in_the_existing_test_stays_missing(tmp_path: Path) -> None:
+    """`/vol1/mdia` has `vol1` mounted, so it stays a spelling problem, not a visibility one."""
+    settings = Settings(host_mount=tmp_path)
+    (tmp_path / "vol1" / "media").mkdir(parents=True)
+
+    result = storage.check_storage_root(settings, "/vol1/mdia")
+
+    assert result.reason == "missing"
+
+
+# --- shared_roots: what the field hint tells the owner Marrquee can see ----
+
+
+def test_shared_roots_lists_mounted_top_level_folders_and_skips_system_names(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(host_mount=tmp_path)
+    (tmp_path / "volume1").mkdir()
+    (tmp_path / "etc").mkdir()
+
+    assert storage.shared_roots(settings) == (PurePosixPath("/volume1"),)
+
+
+def test_shared_roots_is_empty_not_an_error_when_the_mount_is_missing(tmp_path: Path) -> None:
+    settings = Settings(host_mount=tmp_path / "does-not-exist")
+
+    assert storage.shared_roots(settings) == ()
+
+
+def test_shared_roots_skips_files_and_sorts_the_result(tmp_path: Path) -> None:
+    settings = Settings(host_mount=tmp_path)
+    (tmp_path / "volume2").mkdir()
+    (tmp_path / "volume1").mkdir()
+    (tmp_path / "notes.txt").write_text("not a folder")
+
+    assert storage.shared_roots(settings) == (
+        PurePosixPath("/volume1"),
+        PurePosixPath("/volume2"),
+    )
+
+
 def test_a_file_typed_as_the_root_is_refused_as_not_a_folder(tmp_path: Path) -> None:
     settings = Settings(host_mount=tmp_path)
     (tmp_path / "volume1").mkdir()
@@ -579,6 +701,43 @@ def test_derive_ids_falls_back_to_utc_when_no_timezone_file_exists(tmp_path: Pat
     ids = storage.derive_ids(settings, root)
 
     assert ids.timezone == "Etc/UTC"
+
+
+# --- host_timezone --------------------------------------------------------------
+
+
+def test_host_timezone_reads_and_trims_the_hosts_timezone_file(tmp_path: Path) -> None:
+    settings = Settings(host_mount=tmp_path)
+    (tmp_path / "etc").mkdir()
+    (tmp_path / "etc" / "timezone").write_text("America/Chicago\n")
+
+    assert storage.host_timezone(settings) == "America/Chicago"
+
+
+def test_host_timezone_falls_back_to_utc_when_the_file_is_missing(tmp_path: Path) -> None:
+    settings = Settings(host_mount=tmp_path)
+
+    assert storage.host_timezone(settings) == "Etc/UTC"
+
+
+def test_host_timezone_falls_back_to_utc_when_the_file_is_empty(tmp_path: Path) -> None:
+    settings = Settings(host_mount=tmp_path)
+    (tmp_path / "etc").mkdir()
+    (tmp_path / "etc" / "timezone").write_text("   \n")
+
+    assert storage.host_timezone(settings) == "Etc/UTC"
+
+
+def test_derive_ids_returns_exactly_what_host_timezone_returns(tmp_path: Path) -> None:
+    settings = Settings(host_mount=tmp_path)
+    root = PurePosixPath("/volume1/media")
+    (tmp_path / "volume1" / "media").mkdir(parents=True)
+    (tmp_path / "etc").mkdir()
+    (tmp_path / "etc" / "timezone").write_text("Europe/London\n")
+
+    ids = storage.derive_ids(settings, root)
+
+    assert ids.timezone == storage.host_timezone(settings)
 
 
 # --- storage.py cannot delete anything ---------------------------------------

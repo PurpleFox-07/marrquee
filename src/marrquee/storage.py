@@ -71,7 +71,13 @@ ChownFn = Callable[[Path, int, int], None]
 ChmodFn = Callable[[Path, int], None]
 
 StorageCheckReason = Literal[
-    "empty", "not_absolute", "system_path", "missing", "not_a_folder", "not_writable"
+    "empty",
+    "not_absolute",
+    "system_path",
+    "not_shared",
+    "missing",
+    "not_a_folder",
+    "not_writable",
 ]
 
 
@@ -100,6 +106,7 @@ class StorageCheck:
     reason: StorageCheckReason | None
     suggestions: tuple[str, ...]
     detail: str | None
+    suggested_path: PurePosixPath | None = None
 
 
 @dataclass(frozen=True)
@@ -185,22 +192,98 @@ def _is_system_path(candidate: PurePosixPath) -> bool:
     return False
 
 
-def _missing_child_suggestions(container_path: Path, container_root: Path) -> tuple[str, ...]:
-    """Up to three names, in the deepest existing ancestor, close to what's missing."""
+def _probe_exists(path: Path) -> bool:
+    """Whether `path` exists, treating any `OSError` the OS itself raises
+    while trying to find out (a segment too long to stat, a filesystem that
+    refuses to answer) the same as "not there".
+
+    A typed path is exactly the kind of input this module cannot pre-check
+    the length or shape of before asking the filesystem, so every probe
+    below goes through a helper like this one rather than calling `Path`'s
+    methods directly - the checker's whole contract is that it never raises.
+    """
+    try:
+        return path.exists()
+    except OSError:
+        return False
+
+
+def _probe_is_dir(path: Path) -> bool:
+    """`Path.is_dir`, with the same "any OSError means no" rule as `_probe_exists`."""
+    try:
+        return path.is_dir()
+    except OSError:
+        return False
+
+
+def _probe_child_names(path: Path) -> tuple[str, ...]:
+    """`path`'s real children's names, or none at all if listing them fails."""
+    try:
+        return tuple(child.name for child in path.iterdir())
+    except OSError:
+        return ()
+
+
+def _closest_existing_ancestor(
+    container_path: Path, container_root: Path
+) -> tuple[Path, str | None]:
+    """The deepest real folder on the way to `container_path`, and the name
+    that's missing right past it (or `None` when nothing is missing at all).
+
+    Climbing all the way to `container_root` before giving up is what tells
+    "Marrquee can't see this drive at all" (the climb reaches the mount
+    itself) apart from "this folder is a typo inside a drive it can see"
+    (the climb stops partway down) - the one fact `not_shared` and `missing`
+    each need.
+    """
     ancestor = container_path
-    while ancestor != container_root and not ancestor.exists():
+    while ancestor != container_root and not _probe_exists(ancestor):
         ancestor = ancestor.parent
 
-    if not ancestor.is_dir():
-        return ()
+    if not _probe_is_dir(ancestor):
+        return ancestor, None
 
     remaining = container_path.relative_to(ancestor).parts
     if not remaining:
-        return ()
+        return ancestor, None
+    return ancestor, remaining[0]
 
-    target_name = remaining[0]
-    children = [child.name for child in ancestor.iterdir()]
-    return tuple(difflib.get_close_matches(target_name, children, n=3))
+
+def _missing_child_suggestions(ancestor: Path, target_name: str | None) -> tuple[str, ...]:
+    """Up to three of `ancestor`'s real children whose name is close to `target_name`."""
+    if target_name is None:
+        return ()
+    return tuple(difflib.get_close_matches(target_name, _probe_child_names(ancestor), n=3))
+
+
+def _suggested_path(
+    host_path: PurePosixPath,
+    ancestor: Path,
+    container_root: Path,
+    target_name: str | None,
+    suggestions: tuple[str, ...],
+) -> PurePosixPath | None:
+    """An existing, full host folder close to what was typed, or `None`.
+
+    Swaps the missing segment for the closest match in place, so a typo
+    deep inside an otherwise-real path still points at a real folder;
+    falls back to the matched folder itself when that swapped path doesn't
+    exist (nothing further down was ever there to swap). Never touches the
+    filesystem for anything other than an existence check, so nothing
+    outside this module has to.
+    """
+    if target_name is None or not suggestions:
+        return None
+
+    ancestor_host_path = PurePosixPath("/", *ancestor.relative_to(container_root).parts)
+    rest = host_path.relative_to(ancestor_host_path).parts[1:]
+    best_match = suggestions[0]
+
+    swapped = ancestor_host_path.joinpath(best_match, *rest)
+    swapped_container_path = ancestor.joinpath(best_match, *rest)
+    if _probe_is_dir(swapped_container_path):
+        return swapped
+    return ancestor_host_path / best_match
 
 
 def check_storage_root(settings: Settings, typed: str) -> StorageCheck:
@@ -224,11 +307,22 @@ def check_storage_root(settings: Settings, typed: str) -> StorageCheck:
 
     container_path = to_host_view(settings, normalized)
 
-    if not container_path.exists():
-        suggestions = _missing_child_suggestions(container_path, settings.host_mount)
-        return _refusal("missing", host_path=host_path, suggestions=suggestions)
+    if not _probe_exists(container_path):
+        ancestor, target_name = _closest_existing_ancestor(container_path, settings.host_mount)
+        suggestions = _missing_child_suggestions(ancestor, target_name)
+        suggested_path = _suggested_path(
+            host_path, ancestor, settings.host_mount, target_name, suggestions
+        )
+        # The climb reached the mount itself without finding anything real:
+        # not even the first folder of the typed path is one Marrquee's
+        # install file mounts in. That's a different problem from a typo
+        # inside a drive it can see, and it gets its own reason and wording.
+        reason: StorageCheckReason = "not_shared" if ancestor == settings.host_mount else "missing"
+        return _refusal(
+            reason, host_path=host_path, suggestions=suggestions, suggested_path=suggested_path
+        )
 
-    if not container_path.is_dir():
+    if not _probe_is_dir(container_path):
         return _refusal("not_a_folder", host_path=host_path, exists=True)
 
     # A folder that exists and passed the lexical system-path check above
@@ -265,6 +359,26 @@ def check_storage_root(settings: Settings, typed: str) -> StorageCheck:
     )
 
 
+def shared_roots(settings: Settings) -> tuple[PurePosixPath, ...]:
+    """The top-level folders Marrquee can actually see under the host mount.
+
+    This is what the field hint and a `not_shared` refusal name instead of
+    guessing - since the install file mounts only the drives the owner
+    listed, pointing at a folder outside this list would send them looking
+    somewhere Marrquee could never find it. Never raises: a mount that
+    isn't there yet just has nothing to offer.
+    """
+    try:
+        entries = list(settings.host_mount.iterdir())
+    except OSError:
+        return ()
+
+    names = sorted(
+        entry.name for entry in entries if entry.is_dir() and f"/{entry.name}" not in REFUSED_ROOTS
+    )
+    return tuple(PurePosixPath("/", name) for name in names)
+
+
 def _refusal(
     reason: StorageCheckReason,
     *,
@@ -273,6 +387,7 @@ def _refusal(
     is_dir: bool = False,
     suggestions: tuple[str, ...] = (),
     detail: str | None = None,
+    suggested_path: PurePosixPath | None = None,
 ) -> StorageCheck:
     return StorageCheck(
         ok=False,
@@ -285,6 +400,7 @@ def _refusal(
         reason=reason,
         suggestions=suggestions,
         detail=detail,
+        suggested_path=suggested_path,
     )
 
 
@@ -483,6 +599,24 @@ def build_folders(
     return FolderReport(created=tuple(created))
 
 
+def host_timezone(settings: Settings) -> str:
+    """The host's own time zone name, or the fallback - never raises.
+
+    Reads `<host_mount>/etc/timezone`, a file the install only mounts when
+    the owner's whole NAS is shared in - now that the install file mounts
+    just the chosen drive(s), it is almost never there, which is exactly why
+    the wizard now asks instead of trusting this alone. Split out of
+    `derive_ids` so the drive screen can offer the same answer as a pre-fill
+    without deriving PUID/PGID for a root that hasn't been chosen yet.
+    """
+    timezone_path = settings.host_mount / "etc" / "timezone"
+    try:
+        timezone = timezone_path.read_text().strip()
+    except OSError:
+        return _FALLBACK_TIMEZONE
+    return timezone or _FALLBACK_TIMEZONE
+
+
 def derive_ids(settings: Settings, root: PurePosixPath) -> DerivedIds:
     """PUID/PGID from the chosen root's own owner, a fixed UMASK, and the host's TZ.
 
@@ -500,10 +634,4 @@ def derive_ids(settings: Settings, root: PurePosixPath) -> DerivedIds:
     if puid == 0:
         puid = pgid = _FALLBACK_ID
 
-    timezone_path = settings.host_mount / "etc" / "timezone"
-    try:
-        timezone = timezone_path.read_text().strip() or _FALLBACK_TIMEZONE
-    except OSError:
-        timezone = _FALLBACK_TIMEZONE
-
-    return DerivedIds(puid=puid, pgid=pgid, umask=_DEFAULT_UMASK, timezone=timezone)
+    return DerivedIds(puid=puid, pgid=pgid, umask=_DEFAULT_UMASK, timezone=host_timezone(settings))

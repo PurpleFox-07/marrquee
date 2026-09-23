@@ -48,13 +48,19 @@ class InstallResult:
     state: InstallState | None
 
 
-def install_apps(settings: Settings, path: str, app_ids: list[str]) -> InstallResult:
+def install_apps(
+    settings: Settings, path: str, app_ids: list[str], *, timezone: str | None = None
+) -> InstallResult:
     """Validate, then save, the owner's chosen apps and storage root.
 
     Re-saving keeps whatever API key an app already has instead of
     generating a new one - regenerating would silently invalidate anything
     already wired to the old key, in a way that looks like a Story 3 bug
     rather than a Story 2 one.
+
+    `timezone=None` (`/api/install` today, and every caller before the
+    drive screen existed) derives the zone exactly as it always has; the
+    drive screen passes the owner's own choice instead of a guess.
     """
     if not app_ids:
         return InstallResult(
@@ -101,7 +107,7 @@ def install_apps(settings: Settings, path: str, app_ids: list[str]) -> InstallRe
         puid=derived.puid,
         pgid=derived.pgid,
         umask=derived.umask,
-        timezone=derived.timezone,
+        timezone=timezone if timezone is not None else derived.timezone,
         created=created,
     )
     save_state(settings.config_dir, state)

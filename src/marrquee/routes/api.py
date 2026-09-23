@@ -1,14 +1,16 @@
 """The JSON/SSE seam every later screen builds on.
 
-Stories 4, 5 and 6 talk to the deploy engine, the catalog and storage
-checking only through these routes - never by importing `deploy.py` or
-`storage.py` directly. Every response here is built from a small FastAPI
-(pydantic) model rather than handed the engine's own dataclasses directly,
-so "no technical string reaches a screen" is a fact about the schema, not a
-habit a future change could forget: `Failure.technical`,
-`StorageCheck.detail`, `ContainerSnapshot.detail` and `ComposeResult.output`
-have no field on any model below except `/api/deploy/diagnostics`, which
-exists specifically to carry them.
+A screen never composes its own technical string: it receives only the
+shapes this module builds, or words a server-side page already rendered. A
+no-JavaScript page may call `storage.py` or `install.py` functions directly
+to build that rendering, but it renders only their plain-language result,
+never a raw field like `StorageCheck.detail`. Every response here is built
+from a small FastAPI (pydantic) model rather than handed the engine's own
+dataclasses directly, so "no technical string reaches a screen" is a fact
+about the schema, not a habit a future change could forget:
+`Failure.technical`, `StorageCheck.detail`, `ContainerSnapshot.detail` and
+`ComposeResult.output` have no field on any model below except
+`/api/deploy/diagnostics`, which exists specifically to carry them.
 """
 
 from __future__ import annotations

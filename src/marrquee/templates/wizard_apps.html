@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+
+{% block title %}{{ words.WIZARD_TITLE_APPS }}{% endblock %}
+
+{% block head %}
+<link rel="stylesheet" href="{{ url_for('static', path='css/wizard.css') }}">
+{% endblock %}
+
+{% block content %}
+<div class="wrap wizard">
+  <p class="eyebrow">{{ words.WIZARD_EYEBROW }}</p>
+  {% include "partials/steps.html" %}
+
+  <h1>{{ words.WIZARD_APPS_HEADLINE[0] }}<span class="accent">{{ words.WIZARD_APPS_HEADLINE[1] }}</span>{{ words.WIZARD_APPS_HEADLINE[2] }}</h1>
+  <p class="lede">{{ words.WIZARD_APPS_LEDE }}</p>
+
+  {% include "partials/platform_warning.html" %}
+
+  {% if refusal %}
+  <div class="refusal-banner" role="alert">
+    <span class="refusal-banner__glyph" aria-hidden="true">&#10007;</span>
+    <p>{{ refusal }}</p>
+  </div>
+  {% endif %}
+
+  <form method="post" action="/setup/apps">
+    <div class="app-grid">
+      {% for app in apps %}
+      <label class="app-card">
+        <input type="checkbox" name="apps" value="{{ app.id }}"{% if app.id in selected %} checked{% endif %}>
+        <span class="app-card__face">
+          <span class="app-card__top">
+            <span class="app-card-name">{{ app.name }}</span>
+            <span class="app-tick" aria-hidden="true">&#10003;</span>
+          </span>
+          <span class="app-card-desc">{{ app.description }}</span>
+        </span>
+      </label>
+      {% endfor %}
+    </div>
+
+    <div class="actions">
+      <button type="submit" class="btn-primary">{{ words.WIZARD_CONTINUE }}</button>
+    </div>
+  </form>
+</div>
+{% endblock %}

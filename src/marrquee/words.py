@@ -16,8 +16,10 @@ from __future__ import annotations
 
 # Imported privately (aliased) so this module's own namespace stays "every
 # public name here is a sentence a reader should review" - a bare `Callable`
-# import would otherwise show up as a public name with nothing to say.
+# or `Sequence` import would otherwise show up as a public name with nothing
+# to say.
 from collections.abc import Callable as _Callable
+from collections.abc import Sequence as _Sequence
 
 # =============================================================================
 # Deploy Engine: app progress, deploy phases, storage refusals, failures
@@ -83,14 +85,38 @@ def refusal_populated_target(path: str) -> str:
     )
 
 
-# Deliberately no argument: the wizard never lets this box submit empty, so
-# this only fires from a live check-as-you-type call made before a single
-# character has landed - "did you mean" wording would make no sense here.
+# Deliberately no argument: an empty path has nothing to name, so "did you
+# mean" wording would make no sense here. No control on the wizard is ever
+# disabled, so this can fire either from a live check-as-you-type call made
+# before a single character has landed, or from a submitted, still-empty box.
 REFUSAL_PATH_EMPTY = "Type the folder for your big drive to check it."
 
 
 def refusal_path_missing(path: str) -> str:
     return f"I can't find {path} on this machine. Check the spelling - did you mean one of these?"
+
+
+def refusal_not_shared(path: str, shared: _Sequence[str] = ()) -> str:
+    """`path`'s first folder isn't one Marrquee's install file mounts in.
+
+    This is a different problem from `refusal_path_missing`: nothing is
+    misspelled, Marrquee simply has no view of that drive at all. Naming the
+    folders it *can* see (when there are a handful) turns "check the
+    spelling" - which would be wrong here - into "pick one of these
+    instead".
+    """
+    if 1 <= len(shared) <= 3:
+        roots = ", ".join(shared)
+        return (
+            f"Marrquee can't see {path} - it can only see folders inside {roots}. "
+            "Pick a folder in there. If this folder is on another drive, that "
+            "drive needs its own line in Marrquee's install file first - the "
+            "project page shows how."
+        )
+    return (
+        f"Marrquee can't see {path} on this machine. Pick a folder inside one of "
+        "your NAS's shared folders - on most NAS boxes they start with /volume1."
+    )
 
 
 def refusal_not_a_folder(path: str) -> str:
@@ -142,6 +168,7 @@ _STORAGE_CHECK_MESSAGES: dict[str, _Callable[[str], str]] = {
     "missing": refusal_path_missing,
     "not_a_folder": refusal_not_a_folder,
     "not_writable": refusal_not_writable,
+    "not_shared": refusal_not_shared,
 }
 
 
@@ -264,14 +291,198 @@ _DEPLOY_ENGINE_WORDS: tuple[str, ...] = (
     "HOST_MOUNT_COMMENT",
     "DATA_MOUNT_COMMENT",
     "MARKER_WHAT_IS_THIS",
+    "refusal_not_shared",
 )
 
 # =============================================================================
 # end Deploy Engine section
 # =============================================================================
 
+# =============================================================================
+# Wizard screens: pick your apps, where's your big drive
+# =============================================================================
+
+# --- Chrome shared by both screens --------------------------------------------
+WIZARD_TITLE_APPS = "Choose your apps · Marrquee"
+WIZARD_TITLE_DRIVE = "Where's your big drive? · Marrquee"
+WIZARD_EYEBROW = "SETTING UP"
+WIZARD_STEP_APPS = "Your apps"
+WIZARD_STEP_DRIVE = "Your drive"
+WIZARD_STEP_DEPLOY = "Deploy"
+WIZARD_BACK = "Back"
+
+
+# --- Screen 1: pick your apps --------------------------------------------------
+# lead, gradient word(s), tail - the template renders
+# `lead<span class="accent">words</span>tail`.
+WIZARD_APPS_HEADLINE: tuple[str, str, str] = ("What do you want on your ", "media server", "?")
+WIZARD_APPS_LEDE = "Tick the apps you'd like. You can always come back and add more later."
+WIZARD_CONTINUE = "Continue"
+WIZARD_PICK_AT_LEAST_ONE = (
+    "Pick at least one app to carry on. Prowlarr is the one that finds "
+    "things, so most people keep it ticked."
+)
+WIZARD_PLATFORM_WARNING = (
+    "Marrquee looks like it's running on Docker Desktop. For now Marrquee is "
+    "only tested on a NAS or a Linux machine - you can carry on, but things "
+    "may not work as expected."
+)
+
+
+# --- Screen 2: where's your big drive ------------------------------------------
+WIZARD_DRIVE_HEADLINE: tuple[str, str, str] = ("Where's your ", "big drive", "?")
+WIZARD_DRIVE_LEDE = (
+    "Type the folder where your films and shows should live. Marrquee makes "
+    "its own folders inside it."
+)
+WIZARD_PATH_LABEL = "Folder on this machine"
+WIZARD_PATH_PLACEHOLDER = "/volume1/media"
+
+
+def wizard_path_hint(shared: _Sequence[str] = ()) -> str:
+    """Built from the folders Marrquee can actually see, never a guess.
+
+    The install file only mounts the drive(s) the owner listed, so naming
+    /mnt or /srv here (the old wording) would point someone at a folder
+    Marrquee could never find. When there's nothing to name, or too many
+    to list plainly, the field hint falls back to the one guess that's
+    right on most NAS boxes instead.
+    """
+    if 1 <= len(shared) <= 3:
+        roots = ", ".join(shared)
+        return (
+            f"Marrquee can see the shared folders inside {roots}. Your big "
+            f"drive's folder will be in there - for example {shared[0]}/media."
+        )
+    return "On most NAS boxes this starts with /volume1."
+
+
+WIZARD_FRESH_START_NOTE = (
+    "Marrquee only ever makes new, empty folders inside the one you choose. "
+    "It never moves, changes or deletes anything you already have. Already "
+    "have a library? Leave it exactly where it is - you can copy things into "
+    "the new folders later, or point your media server at the old folder as "
+    "well."
+)
+
+
+def wizard_folder_found(free: str) -> str:
+    return f"Folder found - {free} free"
+
+
+WIZARD_FOUND_ROOM_UNKNOWN = (
+    "Folder found. Marrquee will check how much room it has when you press Deploy."
+)
+WIZARD_NOT_WHOLE_PATH = "Type the whole folder path, starting with a /. For example /volume1/media."
+
+
+def wizard_did_you_mean(path: str) -> str:
+    return f"We couldn't find that folder. Did you mean {path}?"
+
+
+def wizard_use_suggestion(path: str) -> str:
+    return f"Use {path}"
+
+
+WIZARD_MISSING_NO_SUGGESTION = "We couldn't find that folder on this machine. Check the spelling."
+
+
+def wizard_other_drive_hint(top: str) -> str:
+    return (
+        f"If {top} is a separate drive, Marrquee can't see it yet - it needs "
+        "its own line in Marrquee's install file first. The project page "
+        "shows how."
+    )
+
+
+WIZARD_CHECKING = "Checking…"
+WIZARD_CONTINUE_TO_DEPLOY = "Continue to Deploy"
+
+
+def free_space_terabytes(tb: float) -> str:
+    return f"about {tb:.1f} TB"
+
+
+def free_space_gigabytes(gb: int) -> str:
+    return f"about {gb} GB"
+
+
+FREE_SPACE_UNDER_ONE_GB = "less than 1 GB"
+
+
+# --- Diagnostics page (formerly the alive page at "/") -------------------------
+DIAGNOSTICS_LEDE = (
+    "This page checks that Marrquee can reach Docker and save its settings. "
+    "If a line is red, it says what to do."
+)
+
+
+# --- Screen 2: time zone, under the folder panel --------------------------------
+WIZARD_TIMEZONE_LABEL = "Your time zone"
+WIZARD_TIMEZONE_HINT = "So your apps' schedules and logs show your local time."
+WIZARD_TIMEZONE_UTC = "UTC (the same everywhere)"
+
+# Each dropdown heading, keyed by the time zone database's own region name -
+# "Other" is not a database region; it is the one synthetic group that holds
+# only the UTC option. `wizard.timezone_groups` reads this dict to label the
+# group it builds for each region, in the same fixed order every time.
+TIMEZONE_REGION_LABELS: dict[str, str] = {
+    "Africa": "Africa",
+    "America": "Americas",
+    "Antarctica": "Antarctica",
+    "Asia": "Asia",
+    "Atlantic": "Atlantic",
+    "Australia": "Australia",
+    "Europe": "Europe",
+    "Indian": "Indian Ocean",
+    "Pacific": "Pacific",
+    "Other": "Other",
+}
+
+_WIZARD_WORDS: tuple[str, ...] = (
+    "WIZARD_TITLE_APPS",
+    "WIZARD_TITLE_DRIVE",
+    "WIZARD_EYEBROW",
+    "WIZARD_STEP_APPS",
+    "WIZARD_STEP_DRIVE",
+    "WIZARD_STEP_DEPLOY",
+    "WIZARD_BACK",
+    "WIZARD_APPS_HEADLINE",
+    "WIZARD_APPS_LEDE",
+    "WIZARD_CONTINUE",
+    "WIZARD_PICK_AT_LEAST_ONE",
+    "WIZARD_PLATFORM_WARNING",
+    "WIZARD_DRIVE_HEADLINE",
+    "WIZARD_DRIVE_LEDE",
+    "WIZARD_PATH_LABEL",
+    "WIZARD_PATH_PLACEHOLDER",
+    "wizard_path_hint",
+    "WIZARD_FRESH_START_NOTE",
+    "wizard_folder_found",
+    "WIZARD_FOUND_ROOM_UNKNOWN",
+    "WIZARD_NOT_WHOLE_PATH",
+    "wizard_did_you_mean",
+    "wizard_use_suggestion",
+    "WIZARD_MISSING_NO_SUGGESTION",
+    "wizard_other_drive_hint",
+    "WIZARD_CHECKING",
+    "WIZARD_CONTINUE_TO_DEPLOY",
+    "free_space_terabytes",
+    "free_space_gigabytes",
+    "FREE_SPACE_UNDER_ONE_GB",
+    "DIAGNOSTICS_LEDE",
+    "WIZARD_TIMEZONE_LABEL",
+    "WIZARD_TIMEZONE_HINT",
+    "WIZARD_TIMEZONE_UTC",
+    "TIMEZONE_REGION_LABELS",
+)
+
+# =============================================================================
+# end Wizard screens section
+# =============================================================================
+
 # The full review surface: every public name above, in one tuple. A later
 # feature area adds its own fenced section above this line, then extends
 # this tuple with its own `_..._WORDS` name - never editing an earlier
 # section's entries.
-WORDS_INVENTORY: tuple[str, ...] = (*_DEPLOY_ENGINE_WORDS,)
+WORDS_INVENTORY: tuple[str, ...] = (*_DEPLOY_ENGINE_WORDS, *_WIZARD_WORDS)

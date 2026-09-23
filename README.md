@@ -4,9 +4,10 @@
 
 Marrquee is a self-hosted web app that sets up and wires together the
 "arr" media apps (Sonarr, Radarr, Prowlarr, and friends) on your own
-NAS or Linux box. This is its first piece: an installable page that
-proves Marrquee is running and can talk to Docker. Later versions add
-the setup wizard that picks your apps and builds your folders.
+NAS or Linux box. Open it and you land on the setup wizard: pick your
+apps, point it at your big drive, and it takes it from there. A
+separate diagnostics page proves Marrquee is running and can talk to
+Docker. Later versions add the screen that actually starts your apps.
 
 ## What you need
 
@@ -118,22 +119,25 @@ Option A instead.
 ## After it's running
 
 Open a browser and go to `http://<your NAS's address>:7788`. You
-should see a purple page that says "Marrquee is running", followed by
-a green "Talking to Docker" line with a version number underneath it.
+should land on the setup wizard's first screen -
+"What do you want on your media server?" - with three apps already
+ticked.
 
-If a line on that page is red instead of green, the page itself
+Want to check Marrquee's own health instead - whether it can talk to
+Docker and save its settings? Go to
+`http://<your NAS's address>:7788/diagnostics`. A green "Talking to
+Docker" line means it's ready. If a line there is red, the page itself
 explains what to do in plain language - fix what it describes, then
 select **Check again**.
 
-## Try the deploy engine (before there's a wizard screen)
+## Try the deploy engine (a temporary developer test)
 
-The setup wizard - the screen where you pick your apps and point at your
-big drive - is a later piece of this project. The part underneath it,
-the deploy engine that actually builds your folders and starts your
-apps, already works today, and you can drive it yourself with a
-handful of pasted commands. Nothing below needs any programming
-knowledge - it's the same "paste this, read what it says" pattern as
-the install step above.
+The screen that actually starts your apps once you've deployed is a
+later piece of this project. The part underneath it, the deploy engine
+that builds your folders and starts your apps, already works today,
+and this section is a temporary developer test that drives it directly
+with a handful of pasted commands - not something you need for normal
+use. It goes away once that screen ships.
 
 1. **Update Marrquee on the NAS, if you installed it before this
    feature existed.** Open the **Docker** app -> **Project**, select
@@ -146,22 +150,12 @@ the install step above.
    installed fresh using the instructions above, this step is already
    done - skip ahead.
 2. **Check it came back.** In a browser go to
-   `http://<your NAS's address>:7788`. You should still see the purple
-   page with a green "Talking to Docker" line.
-3. **Tell it what to build.** SSH into the NAS and paste this,
-   replacing the path with your big drive's folder (on most NAS boxes
-   it starts with `/volume1`):
-
-   ```bash
-   curl -X POST http://<your NAS's address>:7788/api/install \
-     -H "Content-Type: application/json" \
-     -d '{"path":"/volume1/media","app_ids":["prowlarr","sonarr","radarr"]}'
-   ```
-
-   A good answer looks like `{"saved":true}`. If it answers with a
-   refusal instead, read it - it is written in plain words and tells
-   you exactly what to change. Nothing has been created on your drive
-   yet either way.
+   `http://<your NAS's address>:7788/diagnostics`. You should still
+   see a green "Talking to Docker" line.
+3. **Tell it what to build.** Use the two wizard screens instead of a
+   pasted command: open `http://<your NAS's address>:7788`, tick your
+   apps, type your big drive's folder, pick your time zone, and press
+   Continue. It saves the exact same settings a pasted command used to.
 4. **Press the button.** Paste:
 
    ```bash

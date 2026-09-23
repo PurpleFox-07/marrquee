@@ -13,7 +13,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, Response
 from fastapi.templating import Jinja2Templates
 
-from marrquee import __version__
+from marrquee import __version__, words
 from marrquee.config import ConfigDirStatus, Settings, ensure_config_dir
 from marrquee.docker_client import DockerEngine, DockerFailure, DockerStatus
 
@@ -106,12 +106,14 @@ async def healthz() -> dict[str, str]:
     return {"status": "ok", "app": "marrquee", "version": __version__}
 
 
-@router.get("/", response_class=HTMLResponse)
+@router.get("/diagnostics", response_class=HTMLResponse)
 async def alive(request: Request) -> Response:
-    """Render the alive page, re-running both checks on every request.
+    """Render the diagnostics page, re-running both checks on every request.
 
     Nothing here is cached, so "Check again" is a real re-check rather than a
-    page that could keep saying "broken" after the owner fixes it.
+    page that could keep saying "broken" after the owner fixes it. This page
+    used to answer at "/", before the setup wizard existed to take that
+    address instead.
     """
     settings: Settings = request.app.state.settings
     engine: DockerEngine = request.app.state.docker_engine
@@ -121,5 +123,5 @@ async def alive(request: Request) -> Response:
     config_status = ensure_config_dir(settings.config_dir)
 
     lines = [docker_status_line(docker_status), config_status_line(config_status)]
-    context = {"lines": lines, "version": __version__}
+    context = {"lines": lines, "version": __version__, "words": words}
     return templates.TemplateResponse(request, "alive.html", context)

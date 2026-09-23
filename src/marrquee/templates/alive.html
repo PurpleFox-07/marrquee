@@ -4,10 +4,7 @@
 <div class="wrap">
   <p class="eyebrow">MARRQUEE</p>
   <h1>Marrquee is <span class="accent">running</span>.</h1>
-  <p class="lede">
-    This is the first piece. Next comes the setup wizard that picks your
-    apps and builds your folders.
-  </p>
+  <p class="lede">{{ words.DIAGNOSTICS_LEDE }}</p>
 
   <div class="card">
     {% for line in lines %}
@@ -25,7 +22,7 @@
   </div>
 
   <div class="actions">
-    <a class="btn-primary" href="/">Check again</a>
+    <a class="btn-primary" href="/diagnostics">Check again</a>
   </div>
 
   <p class="footer">Version {{ version }}</p>
