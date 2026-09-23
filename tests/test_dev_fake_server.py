@@ -14,9 +14,10 @@ import asyncio
 from pathlib import Path
 
 import pytest
+from fastapi.testclient import TestClient
 
 from marrquee.deploy import DeploySnapshot, read_last_failure
-from tools.dev_fake_server import SCENES, build_app
+from tools.dev_fake_server import HUB_SCENES, SCENES, build_app
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _README_PATH = _REPO_ROOT / "README.md"
@@ -112,6 +113,56 @@ async def test_the_dev_server_writes_nothing_outside_its_temporary_directory(
 
     assert (config_dir / "install.json").exists()  # the demo really did write inside `root`
     assert set(tmp_path.iterdir()) == siblings_before | {root}
+
+
+# --- The Hub scenes: no deploy ever runs for these -------------------------
+
+
+def test_the_hub_scene_serves_the_hub_at_the_front_door(tmp_path: Path) -> None:
+    clock = _FakeClock()
+    app = build_app(scene="hub", root=tmp_path, clock=clock.time, sleep=clock.sleep)
+    client = TestClient(app)
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert "data-hub" in response.text
+    assert response.text.count('data-state="up"') == 3
+
+
+def test_the_hub_stopped_scene_shows_a_down_radarr_with_a_last_seen_line(
+    tmp_path: Path,
+) -> None:
+    clock = _FakeClock()
+    app = build_app(scene="hub-stopped", root=tmp_path, clock=clock.time, sleep=clock.sleep)
+    client = TestClient(app)
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert "Radarr stopped - last seen 2 hours ago." in response.text
+    assert response.text.count('data-state="up"') == 2
+    assert response.text.count('data-state="down"') == 1
+
+
+def test_the_hub_scenes_never_start_a_deploy(tmp_path: Path) -> None:
+    """The Hub scenes live in their own tuple, so the deploy-scene test
+    above (parametrised over `SCENES` alone) never has to know about them -
+    checked here from the other direction, that neither Hub scene name
+    leaks into the tuple that test iterates.
+    """
+    assert set(HUB_SCENES).isdisjoint(SCENES)
+
+
+def test_an_unknown_scene_is_refused_and_names_every_real_one(tmp_path: Path) -> None:
+    clock = _FakeClock()
+
+    with pytest.raises(ValueError) as exc_info:
+        build_app(scene="bogus", root=tmp_path, clock=clock.time, sleep=clock.sleep)
+
+    message = str(exc_info.value)
+    for scene in (*SCENES, *HUB_SCENES):
+        assert scene in message
 
 
 def test_tools_is_excluded_by_dockerignore_so_the_demo_cannot_ship() -> None:

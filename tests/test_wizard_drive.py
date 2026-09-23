@@ -513,29 +513,6 @@ def test_no_response_contains_storage_check_detail_nothing_disabled_glyph_hidden
     assert 'aria-hidden="true"' in response.text
 
 
-# --- GET /: the front door -----------------------------------------------
-
-
-def test_front_door_redirects_to_setup_apps_on_a_fresh_install(tmp_path: Path) -> None:
-    client = _client(_settings(tmp_path))
-
-    response = client.get("/", follow_redirects=False)
-
-    assert response.status_code == 303
-    assert response.headers["location"] == "/setup/apps"
-
-
-def test_front_door_redirects_to_deploy_once_something_is_installed(tmp_path: Path) -> None:
-    settings = _settings(tmp_path)
-    save_state(settings.config_dir, _install_state())
-    client = _client(settings)
-
-    response = client.get("/", follow_redirects=False)
-
-    assert response.status_code == 303
-    assert response.headers["location"] == "/deploy"
-
-
 # --- POST /setup/drive/check: the live, as-you-type verdict -----------------
 
 

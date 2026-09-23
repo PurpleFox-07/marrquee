@@ -225,6 +225,39 @@ def test_dockerfile_does_not_install_a_docker_cli() -> None:
     assert "apt-get install" not in dockerfile
 
 
+def test_readme_has_a_what_works_today_section_naming_all_three_apps() -> None:
+    readme = _readme_text()
+
+    assert "## What works today" in readme
+    section = readme[readme.index("## What works today") :]
+    section = section[: section.index("\n## ")]
+    assert "Prowlarr" in section
+    assert "Sonarr" in section
+    assert "Radarr" in section
+    assert "VPN" in section
+
+
+def test_readmes_user_path_points_at_diagnostics_and_never_at_the_json_api() -> None:
+    readme = _readme_text()
+    user_path = readme.split("## Developing Marrquee", 1)[0]
+
+    assert "/diagnostics" in user_path
+    assert "/api/" not in user_path
+
+
+def test_readme_owner_walk_step_9_no_longer_says_the_hub_loops_back() -> None:
+    readme = _readme_text()
+
+    assert "loops back" not in readme.lower()
+    assert "brings you back" not in readme.lower()
+    assert "9a." in readme
+    assert "9b." in readme
+    assert "9c." in readme
+    assert "9d." in readme
+    assert "Go to your Hub" in readme
+    assert "Status: Up" in readme
+
+
 def test_dockerignore_excludes_craft_and_git_but_not_source_files() -> None:
     ignored = _dockerignore_lines()
 

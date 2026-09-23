@@ -2,13 +2,22 @@
 
 [![CI](https://github.com/PurpleFox-07/marrquee/actions/workflows/ci.yml/badge.svg)](https://github.com/PurpleFox-07/marrquee/actions/workflows/ci.yml)
 
-Marrquee is a self-hosted web app that sets up and wires together the
-"arr" media apps (Sonarr, Radarr, Prowlarr, and friends) on your own
-NAS or Linux box. Open it and you land on the setup wizard: pick your
-apps, point it at your big drive, and it takes it from there. Then the
-Deploy screen starts your apps for you, one at a time, and connects
-them together - no typing, no command line. A separate diagnostics
-page proves Marrquee is running and can talk to Docker.
+The arr apps have always been for command-line people. Marrquee is
+the friendly way in: one install, a few plain questions, and a page
+where everything you set up is one click away.
+
+Open it and you land on the setup wizard: pick your apps, point it at
+your big drive, and it takes it from there. Then the Deploy screen
+starts your apps for you, one at a time, and connects them together -
+no typing, no command line. A separate diagnostics page proves
+Marrquee is running and can talk to Docker.
+
+## What works today
+
+Right now Marrquee sets up three apps - Prowlarr, Sonarr and Radarr -
+on a NAS or Linux machine that already runs Docker. There is no VPN
+and no downloader yet; those are next. Nothing here will ever touch a
+media library you already have.
 
 ## What you need
 
@@ -120,10 +129,17 @@ Option A instead.
 
 ## After it's running
 
-Open a browser and go to `http://<your NAS's address>:7788`. You
-should land on the setup wizard's first screen -
-"What do you want on your media server?" - with three apps already
-ticked.
+Open a browser and go to `http://<your NAS's address>:7788`.
+
+- **The first time**, you land on the setup wizard's first screen -
+  "What do you want on your media server?" - with three apps already
+  ticked. Follow it through: pick your apps, point it at your big
+  drive, check the time zone, then press **Deploy your media server**
+  on the Deploy screen and watch your apps come up.
+- **Once your apps are deployed**, opening
+  `http://<your NAS's address>:7788` takes you straight to your Hub:
+  one poster per app, each showing Status: Up or Status: Down. Click
+  a poster to open that app.
 
 Want to check Marrquee's own health instead - whether it can talk to
 Docker and save its settings? Go to
@@ -131,6 +147,12 @@ Docker and save its settings? Go to
 Docker" line means it's ready. If a line there is red, the page itself
 explains what to do in plain language - fix what it describes, then
 select **Check again**.
+
+## If something goes wrong
+
+Open `http://<your NAS's address>:7788/diagnostics`. If a deploy went
+wrong, the **Last problem** section there has a **Copy** button -
+press it and send what it copies.
 
 ## Update Marrquee and deploy from your browser
 
@@ -174,8 +196,21 @@ Terminal or an SSH session.
    then **Copy** in the Last problem section, and paste it to me. Also
    tell me whether Copy worked or whether it asked you to press
    Ctrl+C.
-9. **One expected oddity:** **Go to your Hub** brings you back to this
-   same finale for now. The Hub is the next piece being built.
+9. **Visit your Hub.**
+
+   - 9a. Press **Go to your Hub**. You should see three purple
+     posters, each saying **Status: Up** with a green dot.
+   - 9b. On your **phone**, on the same Wi-Fi, open
+     `http://<your NAS's address>:7788`. You should land straight on
+     the Hub. Tap **Sonarr** and it should open in a new tab. *If it
+     doesn't, write down exactly what the address bar says.*
+   - 9c. Restart Marrquee from the Ugreen **Docker** app, then open
+     the address again. You should still land on the Hub.
+   - 9d. In the Ugreen **Docker** app, **stop** the Radarr container.
+     Within about 15 seconds the Radarr poster should grey out and
+     say **Status: Down** with a red dot and "Radarr stopped - last
+     seen just now." Start it again, and it should go back to
+     **Status: Up** by itself.
 
 ## Developing Marrquee
 
@@ -198,11 +233,11 @@ uv run mypy
 uv run pytest
 ```
 
-### Watch the deploy screen on your Mac (developer preview)
+### Watch the Deploy screen and the Hub on your Mac (developer preview)
 
 This is a developer tool, not something an owner needs - it's for
 checking the Deploy screen's four beats (ready, running, wiring,
-finale) without a NAS or a real Docker daemon.
+finale) and the Hub without a NAS or a real Docker daemon.
 [`tools/dev_fake_server.py`](./tools/dev_fake_server.py) runs the real
 deploy engine, view model, templates and scripts against a scripted
 Docker engine, readiness probe and wiring runner, in a temporary
@@ -221,3 +256,13 @@ server**. `happy` plays a clean run (with one app pausing just long
 enough to show the reassurance note); `wiring-problem` reaches a green
 finale with a wiring note and something to see on `/diagnostics#last-problem`;
 `failure` shows the error frame with a stuck app.
+
+```bash
+uv run python tools/dev_fake_server.py --scene hub
+uv run python tools/dev_fake_server.py --scene hub-stopped
+```
+
+Then open <http://127.0.0.1:7788> - `hub` shows all three apps
+**Status: Up**; `hub-stopped` shows Radarr **Status: Down** with a
+"last seen" line. The Hub's posters won't open anything on your Mac -
+there are no real apps there. These screens are just for looking at.

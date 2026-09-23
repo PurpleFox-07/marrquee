@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+
+{% block title %}{{ words.HUB_TITLE }}{% endblock %}
+
+{% block head %}
+<link rel="stylesheet" href="{{ url_for('static', path='css/wizard.css') }}">
+<link rel="stylesheet" href="{{ url_for('static', path='css/poster.css') }}">
+<link rel="stylesheet" href="{{ url_for('static', path='css/hub.css') }}">
+<script defer src="{{ url_for('static', path='js/hub.js') }}"></script>
+{% endblock %}
+
+{% block content %}
+<main
+  class="wrap hub"
+  data-hub
+  data-any-down="{{ 'true' if view.any_down else 'false' }}"
+  data-docker-unreachable="{{ 'true' if view.docker_unreachable else 'false' }}"
+  data-stale="false"
+  data-poll-ms="{{ poll_ms }}"
+>
+  <p class="eyebrow">{{ words.HUB_EYEBROW }}</p>
+  <h1>{{ words.HUB_HEADLINE[0] }}<br><span class="accent">{{ words.HUB_HEADLINE[1] }}</span></h1>
+  <p class="lede">{{ words.HUB_LEDE }}</p>
+
+  <p class="visually-hidden" aria-live="polite" data-role="announce">{{ view.announce }}</p>
+
+  {% if view.proxied %}
+  <div class="warning-banner" role="status">
+    <span class="warning-banner__glyph" aria-hidden="true">&#9888;</span>
+    <p>{{ words.HUB_PROXY_BANNER }}</p>
+  </div>
+  {% endif %}
+
+  <div class="warning-banner" data-role="docker-banner" role="status">
+    <span class="warning-banner__glyph" aria-hidden="true">&#9888;</span>
+    <p>{{ words.HUB_DOCKER_BANNER }}</p>
+  </div>
+
+  {% if view.empty %}
+  <p data-role="empty-note">{{ words.HUB_NOTHING_SET_UP }}</p>
+  {% endif %}
+
+  <div class="hub-stage">
+    <ul class="poster-grid" data-role="poster-grid">
+      {% for tile in view.tiles %}
+      <li>
+        <a
+          class="poster hub-poster"
+          data-app="{{ tile.app_id }}"
+          data-state="{{ tile.state }}"
+          {% if tile.url %}href="{{ tile.url }}" aria-label="{{ tile.aria }}"{% endif %}
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          <div data-role="glyph" aria-hidden="true">{{ tile.glyph }}</div>
+          <div data-role="name">{{ tile.name }}</div>
+          <p data-role="desc">{{ tile.description }}</p>
+          <div class="hub-status">
+            <span class="hub-dot" aria-hidden="true"></span>
+            <span>{{ words.HUB_STATUS_LABEL }}</span>
+            <span data-role="chip">{{ tile.chip }}</span>
+          </div>
+          <p data-role="line">{{ tile.line }}</p>
+        </a>
+      </li>
+      {% endfor %}
+    </ul>
+  </div>
+
+  <div data-role="down-note">
+    <p>{{ words.HUB_DOWN_NOTE }}</p>
+  </div>
+
+  <p data-role="stale-note">{{ words.HUB_STALE_NOTE }}</p>
+
+  <noscript><p>{{ words.HUB_NOSCRIPT_NOTE }}</p></noscript>
+
+  <a class="hub-footer-link" href="/diagnostics">{{ words.HUB_DIAGNOSTICS_LINK }}</a>
+</main>
+{% endblock %}

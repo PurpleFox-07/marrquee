@@ -468,6 +468,48 @@ jobs:
           curl -fsS http://127.0.0.1:7788/api/deploy \
             | jq -e '[.wiring[].state] | length > 0 and all(. == "done")' > /dev/null
 
+      # The vehicle for the Pitch's one condition a Mac can't prove by
+      # reading: on a real daemon, a running container's Docker-reported
+      # state really does read as an Up poster with a working link. Run
+      # last, after every earlier step that still needs Radarr running.
+      - name: Assert the Hub shows every app Up and a link really opens
+        run: |
+          curl -fsS http://127.0.0.1:7788/ | grep -q 'data-hub'
+          status=$(curl -fsS http://127.0.0.1:7788/api/hub/status)
+          echo "$status" | jq -e '[.apps[].state] | length == 3 and all(. == "up")' > /dev/null
+
+          sonarr_url=$(echo "$status" | jq -r '.apps[] | select(.app_id == "sonarr") | .url')
+          if [ "$sonarr_url" != "http://127.0.0.1:8989/" ]; then
+            echo "::error::Sonarr's poster url was '${sonarr_url}', expected http://127.0.0.1:8989/"
+            exit 1
+          fi
+          code=$(curl -s -o /dev/null -w '%{http_code}' "$sonarr_url")
+          if [ "$code" = "000" ]; then
+            echo "::error::Sonarr's poster link did not answer at all (curl returned 000)"
+            exit 1
+          fi
+
+      # The other half of that same condition: a real `docker stop` really
+      # does turn into an honest "Down - last seen just now" within the
+      # Hub's own 15-second polling cadence, read here straight from the
+      # live check both the page and this step share.
+      - name: Stop Radarr and wait for the Hub to say Down
+        run: |
+          docker stop radarr
+          for _ in $(seq 1 15); do
+            status=$(curl -fsS http://127.0.0.1:7788/api/hub/status)
+            radarr=$(echo "$status" | jq -c '.apps[] | select(.app_id == "radarr")')
+            state=$(echo "$radarr" | jq -r '.state')
+            line=$(echo "$radarr" | jq -r '.line')
+            echo "radarr state: $state / line: $line"
+            if [ "$state" = "down" ] && echo "$line" | grep -q "last seen"; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::Radarr never read Down with a last-seen line within 30 seconds of docker stop"
+          exit 1
+
       # The one place technical detail is allowed to show up, and exactly
       # where a first-time developer needs it: a red run here is debuggable
       # from the workflow's own log, not just "it failed". The same text

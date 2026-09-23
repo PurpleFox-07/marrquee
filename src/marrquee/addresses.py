@@ -1,11 +1,12 @@
 """Where the owner's browser actually is - built from the request, never
 guessed.
 
-`AppProgress` and `HubTile` carry only a port (see their own docstrings for
-why): a snapshot or a health check is built with no browser request
-attached, so it can never know the address a phone on the same network
-would need. Every clickable link is built here instead, per request, from
-whichever address the browser used to reach Marrquee in the first place.
+`AppProgress` carries only a port (see its own docstring for why), and
+`AppHealth` carries no address at all: both are built server-side with no
+browser request attached, so neither can ever know the address a phone on
+the same network would need. Every clickable link is built here instead,
+per request, from whichever address the browser used to reach Marrquee in
+the first place.
 
 Standard library only, and nothing here imports from the rest of the
 project - this module is shared unchanged between the Deploy screen and the

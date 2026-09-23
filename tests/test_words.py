@@ -140,11 +140,38 @@ _EXPECTED_INVENTORY = (
     "COPY_BUTTON",
     "COPY_DONE",
     "COPY_BLOCKED",
+    "HUB_TITLE",
+    "HUB_EYEBROW",
+    "HUB_HEADLINE",
+    "HUB_LEDE",
+    "HUB_STATUS_LABEL",
+    "HUB_CHIP_UP",
+    "HUB_CHIP_STARTING",
+    "HUB_CHIP_DOWN",
+    "HUB_CHIP_UNKNOWN",
+    "hub_line_starting",
+    "hub_line_down_last_seen",
+    "hub_line_down",
+    "hub_line_gone",
+    "hub_line_unknown",
+    "hub_line_no_address",
+    "hub_open_app_aria",
+    "HUB_DOWN_NOTE",
+    "HUB_DOCKER_BANNER",
+    "HUB_PROXY_BANNER",
+    "HUB_STALE_NOTE",
+    "HUB_NOSCRIPT_NOTE",
+    "HUB_ALL_UP",
+    "hub_some_up",
+    "HUB_NOTHING_SET_UP",
+    "HUB_DIAGNOSTICS_LINK",
+    "relative_time",
 )
 
 _DEPLOY_ENGINE_WORD_COUNT = 40
 _WIZARD_WORD_COUNT = 35
 _WIRING_WORD_COUNT = 17
+_DEPLOY_SCREEN_WORD_COUNT = 28
 
 
 def test_words_inventory_is_pinned() -> None:
@@ -272,22 +299,43 @@ def test_storage_check_message_and_the_deploy_refusal_map_both_handle_not_shared
 def test_the_words_inventory_is_deploy_names_then_wizard_names_then_wiring_names() -> None:
     wizard_end = _DEPLOY_ENGINE_WORD_COUNT + _WIZARD_WORD_COUNT
     wiring_end = wizard_end + _WIRING_WORD_COUNT
+    deploy_screen_end = wiring_end + _DEPLOY_SCREEN_WORD_COUNT
 
     deploy_names = words.WORDS_INVENTORY[:_DEPLOY_ENGINE_WORD_COUNT]
     wizard_names = words.WORDS_INVENTORY[_DEPLOY_ENGINE_WORD_COUNT:wizard_end]
     wiring_names = words.WORDS_INVENTORY[wizard_end:wiring_end]
-    deploy_screen_names = words.WORDS_INVENTORY[wiring_end:]
+    deploy_screen_names = words.WORDS_INVENTORY[wiring_end:deploy_screen_end]
 
     assert deploy_names == _EXPECTED_INVENTORY[:_DEPLOY_ENGINE_WORD_COUNT]
     assert wizard_names == _EXPECTED_INVENTORY[_DEPLOY_ENGINE_WORD_COUNT:wizard_end]
     assert wiring_names == _EXPECTED_INVENTORY[wizard_end:wiring_end]
-    assert deploy_screen_names == _EXPECTED_INVENTORY[wiring_end:]
+    assert deploy_screen_names == _EXPECTED_INVENTORY[wiring_end:deploy_screen_end]
     assert "WIZARD_TITLE_APPS" not in deploy_names
     assert "refusal_not_shared" in deploy_names
     assert "wiring_line_app_sync" not in deploy_names
     assert "wiring_line_app_sync" not in wizard_names
     assert "DEPLOY_TITLE" not in wiring_names
     assert "wiring_finale_note" not in deploy_screen_names
+    assert "HUB_TITLE" not in deploy_screen_names
+
+
+def test_the_hub_names_are_the_last_section() -> None:
+    """The Hub section follows the Deploy screen section, and its own slice
+    is open-ended - it's the newest section, so nothing else follows it yet.
+    """
+    deploy_screen_end = (
+        _DEPLOY_ENGINE_WORD_COUNT
+        + _WIZARD_WORD_COUNT
+        + _WIRING_WORD_COUNT
+        + _DEPLOY_SCREEN_WORD_COUNT
+    )
+
+    hub_names = words.WORDS_INVENTORY[deploy_screen_end:]
+
+    assert hub_names == _EXPECTED_INVENTORY[deploy_screen_end:]
+    assert hub_names[0] == "HUB_TITLE"
+    assert hub_names[-1] == "relative_time"
+    assert "COPY_BLOCKED" not in hub_names
 
 
 def test_wizard_headline_tuples_carry_the_gradient_word_in_the_middle() -> None:
@@ -422,14 +470,18 @@ def _sentence_shaped_literals(source: str, filename: str) -> list[str]:
 
 
 def test_no_user_facing_sentence_lives_outside_words_py() -> None:
-    # Top-level modules plus `wiring/*.py` - not a recursive glob. A
-    # recursive scan would also fail on `routes/alive.py`, which is a
+    # Top-level modules plus `wiring/*.py` and `routes/*.py` - not a
+    # recursive glob. `routes/alive.py` is excluded by name: it's a
     # pre-existing, separately-flagged gap this test does not own.
-    scanned_paths = [*sorted(_SRC_DIR.glob("*.py")), *sorted((_SRC_DIR / "wiring").glob("*.py"))]
+    scanned_paths = [
+        *sorted(_SRC_DIR.glob("*.py")),
+        *sorted((_SRC_DIR / "wiring").glob("*.py")),
+        *sorted((_SRC_DIR / "routes").glob("*.py")),
+    ]
 
     offenders_by_file: dict[str, list[str]] = {}
     for path in scanned_paths:
-        if path.name == "words.py":
+        if path.name in ("words.py", "alive.py"):
             continue
         found = _sentence_shaped_literals(path.read_text(), filename=str(path))
         if found:
@@ -552,3 +604,80 @@ def test_last_problem_and_copy_words_match_content_direction() -> None:
     assert words.COPY_DONE == "Copied"
     assert "Ctrl+C" in words.COPY_BLOCKED
     assert "Cmd+C" in words.COPY_BLOCKED
+
+
+def test_hub_chrome_matches_content_direction() -> None:
+    assert words.HUB_TITLE == "Your media server · Marrquee"
+    assert words.HUB_EYEBROW == "Now playing"
+    lead, accent = words.HUB_HEADLINE
+    assert lead == "Your"
+    assert accent == "media server"
+    assert words.HUB_LEDE == "Everything you set up, one click away."
+    assert words.HUB_DIAGNOSTICS_LINK == "Check Marrquee's own health"
+
+
+def test_hub_status_chips_are_the_owners_up_down_wording() -> None:
+    assert words.HUB_STATUS_LABEL == "Status:"
+    assert words.HUB_CHIP_UP == "Up"
+    assert words.HUB_CHIP_STARTING == "Starting"
+    assert words.HUB_CHIP_DOWN == "Down"
+    assert words.HUB_CHIP_UNKNOWN == "Not sure"
+    chips = {
+        words.HUB_CHIP_UP,
+        words.HUB_CHIP_STARTING,
+        words.HUB_CHIP_DOWN,
+        words.HUB_CHIP_UNKNOWN,
+    }
+    assert len(chips) == 4
+
+
+def test_hub_line_functions_name_the_app_and_match_content_direction() -> None:
+    assert words.hub_line_starting("Sonarr") == "Sonarr is starting up."
+    assert (
+        words.hub_line_down_last_seen("Radarr", "2 hours ago")
+        == "Radarr stopped - last seen 2 hours ago."
+    )
+    assert words.hub_line_down("Radarr") == "Radarr isn't running right now."
+    assert words.hub_line_gone("Radarr") == "Radarr isn't on this machine any more."
+    assert words.hub_line_unknown("Sonarr") == "Marrquee couldn't check Sonarr just now."
+
+
+def test_hub_line_no_address_names_the_app_and_its_port() -> None:
+    message = words.hub_line_no_address("Sonarr", 8989)
+
+    assert "Sonarr" in message
+    assert "8989" in message
+
+
+def test_hub_open_app_aria_follows_the_owner_approved_shape() -> None:
+    assert words.hub_open_app_aria("Sonarr", "Up") == "Open Sonarr. Status: Up. Opens in a new tab."
+
+
+def test_hub_notes_and_banners_match_content_direction() -> None:
+    assert "NAS's own Docker app" in words.HUB_DOWN_NOTE
+    assert "can't reach Docker" in words.HUB_DOCKER_BANNER
+    assert "isn't your NAS's own" in words.HUB_PROXY_BANNER
+    assert "Reload this page" in words.HUB_STALE_NOTE
+    assert "JavaScript switched off" in words.HUB_NOSCRIPT_NOTE
+
+
+def test_hub_announce_words_use_the_owners_up_down_wording() -> None:
+    assert words.HUB_ALL_UP == "All your apps are up."
+    assert words.hub_some_up(2, 3) == "2 of 3 apps are up."
+    assert words.HUB_NOTHING_SET_UP == "No apps are set up yet."
+
+
+def test_relative_time_boundaries() -> None:
+    assert words.relative_time(0) == "just now"
+    assert words.relative_time(59) == "just now"
+    assert words.relative_time(60) == "a minute ago"
+    assert words.relative_time(119) == "a minute ago"
+    assert words.relative_time(120) == "2 minutes ago"
+    assert words.relative_time(3599) == "59 minutes ago"
+    assert words.relative_time(3600) == "an hour ago"
+    assert words.relative_time(7199) == "an hour ago"
+    assert words.relative_time(7200) == "2 hours ago"
+    assert words.relative_time(86399) == "23 hours ago"
+    assert words.relative_time(86400) == "yesterday"
+    assert words.relative_time(172799) == "yesterday"
+    assert words.relative_time(172800) == "2 days ago"

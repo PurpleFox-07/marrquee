@@ -721,6 +721,149 @@ _DEPLOY_SCREEN_WORDS: tuple[str, ...] = (
 # end Deploy screen section
 # =============================================================================
 
+# =============================================================================
+# Hub: the home page after a deploy
+# =============================================================================
+
+HUB_TITLE = "Your media server · Marrquee"
+HUB_EYEBROW = "Now playing"
+
+# lead, gradient word(s) - the template renders `lead<span
+# class="accent">words</span>`, the same pattern the Deploy headline uses.
+HUB_HEADLINE: tuple[str, str] = ("Your", "media server")
+
+HUB_LEDE = "Everything you set up, one click away."
+
+# --- Status row - the words next to every poster's dot -----------------------
+HUB_STATUS_LABEL = "Status:"
+HUB_CHIP_UP = "Up"
+HUB_CHIP_STARTING = "Starting"
+HUB_CHIP_DOWN = "Down"
+HUB_CHIP_UNKNOWN = "Not sure"
+
+
+# --- Poster line - one sentence per state, naming the app --------------------
+def hub_line_starting(name: str) -> str:
+    return f"{name} is starting up."
+
+
+def hub_line_down_last_seen(name: str, when: str) -> str:
+    return f"{name} stopped - last seen {when}."
+
+
+def hub_line_down(name: str) -> str:
+    return f"{name} isn't running right now."
+
+
+def hub_line_gone(name: str) -> str:
+    return f"{name} isn't on this machine any more."
+
+
+def hub_line_unknown(name: str) -> str:
+    return f"Marrquee couldn't check {name} just now."
+
+
+def hub_line_no_address(name: str, port: int) -> str:
+    return (
+        "Marrquee couldn't work out this machine's address, so it can't make "
+        f"a button for {name}. It's on port {port} of the same address you "
+        "used to open Marrquee."
+    )
+
+
+def hub_open_app_aria(name: str, chip: str) -> str:
+    return f"Open {name}. Status: {chip}. Opens in a new tab."
+
+
+# --- Notes and banners - always in the HTML, shown or hidden by attributes ---
+HUB_DOWN_NOTE = (
+    "Something not running? Start it again from your NAS's own Docker app - "
+    "Marrquee will show it here as soon as it's back."
+)
+HUB_DOCKER_BANNER = (
+    "Marrquee can't reach Docker right now, so it can't tell you which apps "
+    "are running. The buttons below still open your apps."
+)
+HUB_PROXY_BANNER = (
+    "You opened Marrquee at an address that isn't your NAS's own. These "
+    "buttons use that same address with each app's own port, which may not "
+    "work."
+)
+HUB_STALE_NOTE = "Marrquee couldn't check just now. Reload this page to see the latest."
+HUB_NOSCRIPT_NOTE = (
+    "Your browser has JavaScript switched off, so this page doesn't update "
+    "by itself. Reload it to see the latest."
+)
+
+# --- Live region - the one sentence a screen reader hears on every change ----
+HUB_ALL_UP = "All your apps are up."
+
+
+def hub_some_up(n: int, total: int) -> str:
+    return f"{n} of {total} apps are up."
+
+
+HUB_NOTHING_SET_UP = "No apps are set up yet."
+
+# --- Footer -------------------------------------------------------------------
+HUB_DIAGNOSTICS_LINK = "Check Marrquee's own health"
+
+
+def relative_time(seconds: float) -> str:
+    """How long ago `seconds` was, in the plain phrases a beginner expects.
+
+    Boundaries are the story's own: under a minute is "just now" rather than
+    "0 minutes ago", and a gap of a day or more rounds down to whole days
+    instead of ever showing an hour count past 24.
+    """
+    if seconds < 60:
+        return "just now"
+    if seconds < 120:
+        return "a minute ago"
+    if seconds < 3600:
+        return f"{int(seconds // 60)} minutes ago"
+    if seconds < 7200:
+        return "an hour ago"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)} hours ago"
+    if seconds < 172800:
+        return "yesterday"
+    return f"{int(seconds // 86400)} days ago"
+
+
+_HUB_WORDS: tuple[str, ...] = (
+    "HUB_TITLE",
+    "HUB_EYEBROW",
+    "HUB_HEADLINE",
+    "HUB_LEDE",
+    "HUB_STATUS_LABEL",
+    "HUB_CHIP_UP",
+    "HUB_CHIP_STARTING",
+    "HUB_CHIP_DOWN",
+    "HUB_CHIP_UNKNOWN",
+    "hub_line_starting",
+    "hub_line_down_last_seen",
+    "hub_line_down",
+    "hub_line_gone",
+    "hub_line_unknown",
+    "hub_line_no_address",
+    "hub_open_app_aria",
+    "HUB_DOWN_NOTE",
+    "HUB_DOCKER_BANNER",
+    "HUB_PROXY_BANNER",
+    "HUB_STALE_NOTE",
+    "HUB_NOSCRIPT_NOTE",
+    "HUB_ALL_UP",
+    "hub_some_up",
+    "HUB_NOTHING_SET_UP",
+    "HUB_DIAGNOSTICS_LINK",
+    "relative_time",
+)
+
+# =============================================================================
+# end Hub section
+# =============================================================================
+
 # The full review surface: every public name above, in one tuple. A later
 # feature area adds its own fenced section above this line, then extends
 # this tuple with its own `_..._WORDS` name - never editing an earlier
@@ -730,4 +873,5 @@ WORDS_INVENTORY: tuple[str, ...] = (
     *_WIZARD_WORDS,
     *_WIRING_WORDS,
     *_DEPLOY_SCREEN_WORDS,
+    *_HUB_WORDS,
 )

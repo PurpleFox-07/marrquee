@@ -1,4 +1,5 @@
-"""A Docker-less demo server for watching the Deploy screen without a NAS.
+"""A Docker-less demo server for watching the Deploy screen and the Hub
+without a NAS.
 
 Developer tool only. Nothing in `src/` imports this file, there is no
 environment variable or setting anywhere that turns on a fake engine in the
@@ -7,7 +8,7 @@ the image that ships - the only way to reach this code is to run it by
 hand from a checkout.
 
 It builds a real `DeployManager` against the real templates and scripts
-Chunks 2-6 wrote. Only three things are scripted: the Docker engine (no
+this project ships. Only three things are scripted: the Docker engine (no
 image is ever pulled and no container is ever started for real), the
 readiness probe (no HTTP request ever leaves this process) and the wiring
 runner (no arr app is ever called). Everything else - folder building, the
@@ -15,13 +16,24 @@ compose file, the view model, the page, the live event feed - is the real
 code, running against a fresh temporary directory that stands in for the
 NAS's `/config` and `/host` mounts.
 
-Run one of the three demo scenes:
+Run one of the three deploy-screen scenes:
 
     uv run python tools/dev_fake_server.py --scene happy
     uv run python tools/dev_fake_server.py --scene wiring-problem
     uv run python tools/dev_fake_server.py --scene failure
 
 Then open http://127.0.0.1:7788/deploy and press Deploy.
+
+Or one of the two Hub scenes, which skip the deploy entirely and seed a
+finished one straight onto disk:
+
+    uv run python tools/dev_fake_server.py --scene hub
+    uv run python tools/dev_fake_server.py --scene hub-stopped
+
+Then open http://127.0.0.1:7788 - `hub` shows all three apps Up, and
+`hub-stopped` shows Radarr Down with a two-hour-old "last seen" line. The
+Hub's posters won't open anything real on a Mac with no Docker; they're
+just for looking at.
 
 Every wait here goes through an injected `sleep`, the same shape
 `DeployManager` and `WiringEngine` already use for their own tests - which
@@ -34,18 +46,20 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import os
 import tempfile
 import time
 from collections.abc import Awaitable, Callable, Sequence
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI
 
-from marrquee.catalog import get_app
+from marrquee.catalog import apps_in_order, get_app
 from marrquee.config import Settings
-from marrquee.deploy import DeployManager, FakeReadinessProbe
+from marrquee.deploy import AppProgress, DeployManager, DeploySnapshot, FakeReadinessProbe
 from marrquee.docker_client import (
     ComposeResult,
     ContainerSnapshot,
@@ -53,10 +67,11 @@ from marrquee.docker_client import (
     FakeDockerEngine,
 )
 from marrquee.main import create_app
-from marrquee.state import InstallState, save_state
+from marrquee.state import InstallState, save_state, write_json_atomic
 from marrquee.wiring import WiringStep
 from marrquee.wiring.engine import plan_wiring
 from marrquee.words import (
+    STATUS_CHIP_DONE,
     WIRING_CHIP_DONE,
     WIRING_CHIP_ERROR,
     WIRING_CHIP_RUNNING,
@@ -64,6 +79,17 @@ from marrquee.words import (
 )
 
 SCENES = ("happy", "wiring-problem", "failure")
+
+# Kept in their own tuple, deliberately never merged into `SCENES` - the
+# existing `test_each_scene_reaches_its_ending_with_an_injected_clock` is
+# parametrised over `SCENES` alone, and a Hub scene starts no deploy at all
+# for it to watch reach an ending.
+HUB_SCENES = ("hub", "hub-stopped")
+
+# The `hub-stopped` scene's fake Radarr container reports this as its
+# `finished_at`, which the Hub's own view turns into "Radarr stopped - last
+# seen 2 hours ago." the same way it would for a real NAS.
+_HUB_DOWN_SINCE_HOURS = 2
 
 _APP_IDS: tuple[str, ...] = ("prowlarr", "sonarr", "radarr")
 _STORAGE_ROOT = "/volume1/media"
@@ -225,6 +251,64 @@ def _seed_install(settings: Settings) -> None:
     )
 
 
+def _seed_hub_deploy(settings: Settings) -> None:
+    """Write a `finale` `deploy.json` straight to disk.
+
+    `DeployManager` only reads this file once, at construction, so seeding
+    it before the manager is built is enough to make a Hub scene show the
+    front door with no deploy ever run.
+    """
+    apps = tuple(
+        AppProgress(
+            app_id=app.id,
+            name=app.name,
+            state="done",
+            chip=STATUS_CHIP_DONE,
+            line="Ready",
+            note=None,
+            port=app.port,
+        )
+        for app in apps_in_order(_APP_IDS)
+    )
+    snapshot = DeploySnapshot(
+        run_id="demo-hub",
+        phase="finale",
+        apps=apps,
+        headline="Now showing: your media server",
+        detail=None,
+        failure=None,
+        started_at="2026-09-23T00:00:00+00:00",
+        finished_at="2026-09-23T00:05:00+00:00",
+        wiring=(),
+    )
+    write_json_atomic(settings.config_dir / "deploy.json", dataclasses.asdict(snapshot))
+
+
+def _hub_containers(*, down_radarr: bool) -> dict[str, ContainerSnapshot]:
+    """A running container per app, or - for `hub-stopped` - Radarr reading
+    `exited` with a real `finished_at` from a couple of hours ago, the same
+    shape a real Docker reply would give the Hub's health check.
+    """
+    containers = {
+        app_id: ContainerSnapshot(
+            name=app_id, exists=True, state="running", exit_code=None, image=None, detail=None
+        )
+        for app_id in _APP_IDS
+    }
+    if down_radarr:
+        finished_at = (datetime.now(UTC) - timedelta(hours=_HUB_DOWN_SINCE_HOURS)).isoformat()
+        containers["radarr"] = ContainerSnapshot(
+            name="radarr",
+            exists=True,
+            state="exited",
+            exit_code=0,
+            image=None,
+            detail=None,
+            finished_at=finished_at,
+        )
+    return containers
+
+
 def build_app(
     *,
     scene: str,
@@ -244,13 +328,26 @@ def build_app(
     folder before deciding it's inside `root` - an unresolved `root` here
     would make that check see two different paths and refuse a perfectly
     real folder as unshared.
+
+    A Hub scene (`scene in HUB_SCENES`) skips the deploy engine entirely: it
+    seeds a finished deploy straight onto disk and a Docker engine that
+    already reports every container's state, so the front door shows the
+    Hub with nothing ever "run".
     """
-    if scene not in SCENES:
-        raise ValueError(f"unknown scene {scene!r} - choose one of {SCENES}")
+    if scene not in SCENES + HUB_SCENES:
+        raise ValueError(f"unknown scene {scene!r} - choose one of {SCENES + HUB_SCENES}")
 
     root = root.resolve()
     settings = Settings(config_dir=root / "config", host_mount=root / "host")
     _seed_install(settings)
+
+    if scene in HUB_SCENES:
+        _seed_hub_deploy(settings)
+        hub_engine = FakeDockerEngine(
+            DockerStatus(connected=True),
+            containers=_hub_containers(down_radarr=scene == "hub-stopped"),
+        )
+        return create_app(settings, hub_engine)
 
     engine = _DemoDockerEngine(DockerStatus(connected=True))
     manager = _DemoDeployManager(
@@ -269,7 +366,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     directory that is deleted again when the process stops.
     """
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--scene", choices=SCENES, default="happy")
+    parser.add_argument("--scene", choices=SCENES + HUB_SCENES, default="happy")
     args = parser.parse_args(argv)
 
     with tempfile.TemporaryDirectory(prefix="marrquee-dev-fake-server-") as tmp:

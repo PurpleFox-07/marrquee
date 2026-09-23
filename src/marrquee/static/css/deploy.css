@@ -153,11 +153,10 @@
     transform var(--transition-slow);
 }
 
-/* The waiting look is the default: dim, unlit art, no accent border. */
+/* The waiting look is the default: dim, unlit art, no accent border. The
+ * art itself (the gradient) is shared with the Hub and lives in
+ * poster.css - this file only ever dims or un-dims it. */
 .poster::before {
-  background:
-    linear-gradient(var(--scrim), var(--scrim)),
-    linear-gradient(155deg, var(--primary), var(--background));
   filter: grayscale(0.85) brightness(0.5);
   transition: filter var(--transition-slow);
 }

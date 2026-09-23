@@ -2,16 +2,19 @@
  * screen and, later, the Hub. Every colour, filter and per-state rule
  * (waiting/starting/done/error/linking) lives in the page's own stylesheet
  * instead - deploy.css here - so a page that reuses this file never
- * inherits state logic it doesn't have yet.
+ * inherits state logic it doesn't have yet. The one exception is the art
+ * layer's gradient below: it's the poster's identity, not a state, so both
+ * pages draw the same picture and each page's own sheet only ever dims it.
  *
  * Every colour, spacing, type, radius and shadow value here is a CSS
  * custom property from tokens.css - never a literal. The only literals
  * allowed are structural values with no matching token: 190px (the grid's
  * minimum column width), 640px / 420px (the same two breakpoints every
  * other stylesheet in this project uses), 2px (the tile's own border
- * width, transparent until a state gives it a colour) and 1px / -1px (the
- * off-screen clip `.visually-hidden` uses, the same technique the approved
- * mockup itself used).
+ * width, transparent until a state gives it a colour), 155deg (the art
+ * gradient's fixed angle) and 1px / -1px (the off-screen clip
+ * `.visually-hidden` uses, the same technique the approved mockup itself
+ * used).
  */
 
 .poster-grid {
@@ -48,6 +51,9 @@
   position: absolute;
   inset: 0;
   z-index: 0;
+  background:
+    linear-gradient(var(--scrim), var(--scrim)),
+    linear-gradient(155deg, var(--primary), var(--background));
 }
 
 .poster > * {

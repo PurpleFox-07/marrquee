@@ -531,6 +531,65 @@ def test_stack_smoke_wiring_and_second_deploy_steps_run_in_the_right_order() -> 
     assert wiring_index < second_deploy_index < reassert_index < dump_index
 
 
+def test_stack_smoke_hub_steps_run_last_after_the_second_deploy_reassert() -> None:
+    """Placed after everything that still needs Radarr running, and before
+    the failure-only diagnostics dump - stopping Radarr on purpose must
+    never make an earlier assertion read as a regression.
+    """
+    job = _stack_smoke_job()
+    names = [str(step.get("name", "")) for step in _steps(job)]
+
+    reassert_index = names.index(_step_named(job, "second deploy changed nothing")["name"])
+    hub_up_index = names.index(_step_named(job, "hub shows every app up")["name"])
+    stop_radarr_index = names.index(_step_named(job, "stop radarr")["name"])
+    dump_index = names.index(_step_named(job, "dump diagnostics")["name"])
+
+    assert reassert_index < hub_up_index < stop_radarr_index < dump_index
+
+
+def test_stack_smoke_hub_up_step_checks_the_page_the_status_endpoint_and_a_real_link() -> None:
+    """The Pitch's unverifiable-by-reading condition, first half: on real
+    Docker, the Hub really does read every app Up, and a poster's link
+    really does answer.
+    """
+    step = _step_named(_stack_smoke_job(), "hub shows every app up")
+    run = step["run"]
+
+    assert "data-hub" in run
+    assert "/api/hub/status" in run
+    assert 'all(. == "up")' in run
+    assert "8989" in run  # Sonarr's own port, read back from its poster url
+    assert "%{http_code}" in run
+    assert "000" in run  # curl's own "nothing answered at all" code
+
+
+def test_stack_smoke_stop_radarr_step_polls_for_down_with_a_last_seen_line() -> None:
+    """The condition's second half: a real `FinishedAt` really does become
+    an honest "Down - last seen ..." within the Hub's own polling budget.
+    """
+    step = _step_named(_stack_smoke_job(), "stop radarr")
+    run = step["run"]
+
+    assert "docker stop radarr" in run
+    assert "/api/hub/status" in run
+    assert '"down"' in run
+    assert "last seen" in run
+    assert "seq 1 15" in run  # bounded - never an unconditional `while true`
+    assert "while true" not in run
+    assert "::error::" in run
+
+
+def test_stack_smoke_hub_steps_never_appear_in_the_readmes_user_path() -> None:
+    """These prove real Docker only in CI - the owner rule ("no command-line
+    steps in the user path") never lets a curl walk near the README.
+    """
+    readme = _README_PATH.read_text()
+    user_path = readme.split("## Developing Marrquee", 1)[0]
+
+    assert "/api/hub/status" not in user_path
+    assert "docker stop radarr" not in user_path
+
+
 def test_stack_smoke_always_cleans_up_containers_network_and_temp_files() -> None:
     step = _step_named(_stack_smoke_job(), "clean up")
 

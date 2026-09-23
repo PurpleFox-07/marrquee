@@ -18,12 +18,14 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncGenerator
+from datetime import UTC, datetime
 from typing import Annotated, cast
 
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from marrquee.addresses import authority_from_headers, proxy_suspected
 from marrquee.catalog import CATALOG
 from marrquee.config import Settings
 from marrquee.deploy import (
@@ -35,6 +37,9 @@ from marrquee.deploy import (
     Failure,
     FailureCode,
 )
+from marrquee.docker_client import DockerEngine
+from marrquee.health import HubState, read_health
+from marrquee.hub import HubTile, hub_view
 from marrquee.install import install_apps
 from marrquee.state import load_state
 from marrquee.storage import StorageCheck, check_storage_root
@@ -149,6 +154,29 @@ class DeploySnapshotOut(BaseModel):
     wiring: list[WiringStepOut]
 
 
+class HubTileOut(BaseModel):
+    """One poster, exactly as the Hub page's live check redraws it.
+
+    Carries no `glyph`, `name` or `description` - those are catalog facts
+    that never change between checks, so the live layer never re-sends
+    them.
+    """
+
+    app_id: str
+    state: HubState
+    chip: str
+    line: str
+    url: str | None
+    aria: str | None
+
+
+class HubStatusOut(BaseModel):
+    apps: list[HubTileOut]
+    announce: str
+    any_down: bool
+    docker_unreachable: bool
+
+
 # --- Converting the engine's own dataclasses into the shapes above ----------
 
 
@@ -197,6 +225,17 @@ def _snapshot_out(snapshot: DeploySnapshot) -> DeploySnapshotOut:
     )
 
 
+def _hub_tile_out(tile: HubTile) -> HubTileOut:
+    return HubTileOut(
+        app_id=tile.app_id,
+        state=tile.state,
+        chip=tile.chip,
+        line=tile.line,
+        url=tile.url,
+        aria=tile.aria,
+    )
+
+
 def _storage_check_out(check: StorageCheck, path: str) -> StorageCheckOut:
     return StorageCheckOut(
         ok=check.ok,
@@ -223,6 +262,11 @@ def _settings(request: Request) -> Settings:
 def _manager(request: Request) -> DeployManager:
     manager: DeployManager = request.app.state.deploy
     return manager
+
+
+def _engine(request: Request) -> DockerEngine:
+    engine: DockerEngine = request.app.state.docker_engine
+    return engine
 
 
 # --- Routes -------------------------------------------------------------------
@@ -328,3 +372,27 @@ async def get_deploy_diagnostics(request: Request) -> Response:
     except OSError:
         return Response(status_code=204)
     return PlainTextResponse(content)
+
+
+@router.get("/hub/status")
+async def get_hub_status(request: Request) -> HubStatusOut:
+    """The same `hub_view` `GET /` draws, as JSON - so the page and this
+    live check can never word a poster differently. Always 200: an empty
+    `apps` list (no saved choices) and an all-`unknown` one (Docker
+    unreachable) are both honest, ordinary answers, not errors.
+    """
+    snapshot = _manager(request).snapshot()
+    app_ids = tuple(app.app_id for app in snapshot.apps)
+    view = hub_view(
+        app_ids,
+        await read_health(_engine(request), app_ids),
+        authority=authority_from_headers(request.headers),
+        proxied=proxy_suspected(request.headers),
+        now=datetime.now(UTC),
+    )
+    return HubStatusOut(
+        apps=[_hub_tile_out(tile) for tile in view.tiles],
+        announce=view.announce,
+        any_down=view.any_down,
+        docker_unreachable=view.docker_unreachable,
+    )

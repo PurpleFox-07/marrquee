@@ -268,18 +268,3 @@ async def post_setup_drive_check(body: DriveCheckRequest, request: Request) -> D
         suggestion=message.suggestion,
         guidance=message.guidance,
     )
-
-
-# --- The front door: land on the wizard, or on the deploy screen ------------
-
-
-@router.get("/")
-async def get_front_door(request: Request) -> Response:
-    """Nothing chosen yet sends a new owner straight to the first screen;
-    anything saved sends a returning owner on to deploy - the wizard's own
-    job is done either way.
-    """
-    settings: Settings = request.app.state.settings
-    if load_state(settings.config_dir) is None:
-        return RedirectResponse("/setup/apps", status_code=303)
-    return RedirectResponse("/deploy", status_code=303)
