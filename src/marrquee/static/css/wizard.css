@@ -334,26 +334,10 @@
   margin: 0;
 }
 
-/* --- Back: a plain bordered pill, so it reads as one set with Continue ----- */
-
-.btn-ghost {
-  display: inline-block;
-  font: inherit;
-  font-size: var(--text-base);
-  font-weight: var(--weight-semibold);
-  color: var(--text-primary);
-  text-decoration: none;
-  text-align: center;
-  background: transparent;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-full);
-  padding: var(--space-4) var(--space-8);
-}
-
-.btn-ghost:focus-visible {
-  outline: 2px solid var(--spotlight);
-  outline-offset: 2px;
-}
+/* The ghost-pill button rule moved to app.css, byte-for-byte, so another
+ * page can reuse it without a second copy of the rule drifting out of sync.
+ * app.css loads before this file on every page, so the Back button here
+ * renders exactly as before the move. */
 
 /* Matches app.css's own block - the two files never assume the other has
  * already switched motion off. */

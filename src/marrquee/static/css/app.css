@@ -153,6 +153,77 @@ h1 .accent {
   outline-offset: 2px;
 }
 
+/* A plain bordered pill - used for the wizard's Back link and the
+ * Diagnostics page's Copy button, so both read as a secondary action next
+ * to a solid primary one. */
+.btn-ghost {
+  display: inline-block;
+  font: inherit;
+  font-size: var(--text-base);
+  font-weight: var(--weight-semibold);
+  color: var(--text-primary);
+  text-decoration: none;
+  text-align: center;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full);
+  padding: var(--space-4) var(--space-8);
+}
+
+.btn-ghost:focus-visible {
+  outline: 2px solid var(--spotlight);
+  outline-offset: 2px;
+}
+
+/* --- Diagnostics: the "Last problem" section --------------------------- */
+
+.last-problem {
+  margin-top: var(--space-8);
+}
+
+.last-problem-text {
+  display: block;
+  width: 100%;
+  margin-top: var(--space-4);
+  padding: var(--space-3);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
+  color: var(--text-primary);
+  background: var(--scrim);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  resize: vertical;
+}
+
+.last-problem-text:focus-visible {
+  outline: 2px solid var(--spotlight);
+  outline-offset: 2px;
+}
+
+.last-problem-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  margin-top: var(--space-4);
+}
+
+[data-copy-status] {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+/* Decorative reinforcement only - the status text itself already says
+ * "Copied", so a screen reader loses nothing if it skips this glyph. */
+[data-copy-status="copied"] {
+  color: var(--success);
+}
+
+[data-copy-status="copied"]::before {
+  content: "✓ ";
+}
+
 .footer {
   margin-top: var(--space-12);
   font-size: var(--text-xs);

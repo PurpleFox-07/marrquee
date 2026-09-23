@@ -13,6 +13,7 @@ there is no browser runner in this suite.
 
 from __future__ import annotations
 
+import dataclasses
 import re
 from pathlib import Path
 
@@ -21,9 +22,10 @@ from fastapi.testclient import TestClient
 
 from marrquee import wizard, words
 from marrquee.config import Settings
+from marrquee.deploy import AppProgress, DeploySnapshot
 from marrquee.docker_client import DockerStatus, FakeDockerEngine
 from marrquee.main import create_app
-from marrquee.state import STATE_VERSION, InstallState, load_state, save_state
+from marrquee.state import STATE_VERSION, InstallState, load_state, save_state, write_json_atomic
 
 _WIZARD_JS_PATH = (
     Path(__file__).resolve().parents[1] / "src" / "marrquee" / "static" / "js" / "wizard.js"
@@ -291,6 +293,51 @@ def test_a_good_path_saves_through_install_apps_and_redirects_to_deploy(tmp_path
     assert saved.app_ids == ("prowlarr", "radarr")
     assert set(saved.api_keys) == {"prowlarr", "radarr"}
     assert saved.timezone == "America/Chicago"
+
+
+def test_continuing_after_a_finished_deploy_lands_on_the_deploy_button(tmp_path: Path) -> None:
+    """Finishing the wizard a second time (for example, after re-choosing
+    apps on a NAS that was already deployed once) must not leave the owner
+    staring at an old finale with no Deploy button to press.
+    """
+    settings = _settings(tmp_path)
+    _mount_volume1(settings, "fresh")
+    finished = DeploySnapshot(
+        run_id="a-finished-run-from-before-these-new-choices",
+        phase="finale",
+        apps=(
+            AppProgress(
+                app_id="prowlarr",
+                name="Prowlarr",
+                state="done",
+                chip="Ready",
+                line="Prowlarr is ready",
+                note=None,
+                port=9696,
+            ),
+        ),
+        headline="Now showing: your media server",
+        detail=None,
+        failure=None,
+        started_at="2026-09-19T00:00:00+00:00",
+        finished_at="2026-09-19T00:05:00+00:00",
+        wiring=(),
+    )
+    write_json_atomic(settings.config_dir / "deploy.json", dataclasses.asdict(finished))
+    status = DockerStatus(connected=True, version="27.3.1")
+    app = create_app(settings=settings, engine=FakeDockerEngine(status))
+    client = TestClient(app)
+    assert app.state.deploy.snapshot().phase == "finale"
+
+    response = client.post(
+        "/setup/drive",
+        data={"apps": "prowlarr", "path": "/volume1/fresh", "timezone": "America/Chicago"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/deploy"
+    assert app.state.deploy.snapshot().phase == "ready"
 
 
 def test_a_populated_folder_is_refused_at_200_with_storys_wording_and_nothing_saved(

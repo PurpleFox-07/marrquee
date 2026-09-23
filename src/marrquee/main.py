@@ -20,6 +20,7 @@ from marrquee.deploy import DeployManager, HttpReadinessProbe, ReadinessProbe
 from marrquee.docker_client import DockerEngine, SocketDockerEngine
 from marrquee.routes.alive import router as alive_router
 from marrquee.routes.api import router as api_router
+from marrquee.routes.deploy import router as deploy_router
 from marrquee.routes.wizard import router as wizard_router
 from marrquee.wiring import WiringRunner
 from marrquee.wiring.engine import WiringEngine
@@ -82,6 +83,7 @@ def create_app(
     app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
     app.include_router(alive_router)
     app.include_router(api_router)
+    app.include_router(deploy_router)
     app.include_router(wizard_router)
 
     return app

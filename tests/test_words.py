@@ -112,10 +112,39 @@ _EXPECTED_INVENTORY = (
     "wiring_failure_folder",
     "wiring_failure_prowlarr_too_old",
     "wiring_finale_note",
+    "DEPLOY_TITLE",
+    "DEPLOY_EYEBROW",
+    "DEPLOY_HEADLINE",
+    "DEPLOY_LEDE",
+    "bill_line",
+    "bill_one_app",
+    "DOWNLOADS_LABEL",
+    "DEPLOY_BUTTON",
+    "DEPLOY_MICROCOPY",
+    "RUN_SUB",
+    "WIRING_STEP_TEMPLATE",
+    "wiring_step_label",
+    "FINALE_BADGE",
+    "FINALE_HEADLINE",
+    "FINALE_SUB",
+    "FINALE_CTA",
+    "SHOWTIMES_TITLE",
+    "open_app_label",
+    "DEPLOY_TRY_AGAIN",
+    "DEPLOY_AGAIN",
+    "SEE_TECHNICAL_DETAILS",
+    "NOSCRIPT_REFRESH_NOTE",
+    "LAST_PROBLEM_TITLE",
+    "LAST_PROBLEM_INTRO",
+    "LAST_PROBLEM_EMPTY",
+    "COPY_BUTTON",
+    "COPY_DONE",
+    "COPY_BLOCKED",
 )
 
 _DEPLOY_ENGINE_WORD_COUNT = 40
 _WIZARD_WORD_COUNT = 35
+_WIRING_WORD_COUNT = 17
 
 
 def test_words_inventory_is_pinned() -> None:
@@ -242,18 +271,23 @@ def test_storage_check_message_and_the_deploy_refusal_map_both_handle_not_shared
 
 def test_the_words_inventory_is_deploy_names_then_wizard_names_then_wiring_names() -> None:
     wizard_end = _DEPLOY_ENGINE_WORD_COUNT + _WIZARD_WORD_COUNT
+    wiring_end = wizard_end + _WIRING_WORD_COUNT
 
     deploy_names = words.WORDS_INVENTORY[:_DEPLOY_ENGINE_WORD_COUNT]
     wizard_names = words.WORDS_INVENTORY[_DEPLOY_ENGINE_WORD_COUNT:wizard_end]
-    wiring_names = words.WORDS_INVENTORY[wizard_end:]
+    wiring_names = words.WORDS_INVENTORY[wizard_end:wiring_end]
+    deploy_screen_names = words.WORDS_INVENTORY[wiring_end:]
 
     assert deploy_names == _EXPECTED_INVENTORY[:_DEPLOY_ENGINE_WORD_COUNT]
     assert wizard_names == _EXPECTED_INVENTORY[_DEPLOY_ENGINE_WORD_COUNT:wizard_end]
-    assert wiring_names == _EXPECTED_INVENTORY[wizard_end:]
+    assert wiring_names == _EXPECTED_INVENTORY[wizard_end:wiring_end]
+    assert deploy_screen_names == _EXPECTED_INVENTORY[wiring_end:]
     assert "WIZARD_TITLE_APPS" not in deploy_names
     assert "refusal_not_shared" in deploy_names
     assert "wiring_line_app_sync" not in deploy_names
     assert "wiring_line_app_sync" not in wizard_names
+    assert "DEPLOY_TITLE" not in wiring_names
+    assert "wiring_finale_note" not in deploy_screen_names
 
 
 def test_wizard_headline_tuples_carry_the_gradient_word_in_the_middle() -> None:
@@ -487,3 +521,34 @@ def test_every_media_folder_has_a_label() -> None:
 
     assert used
     assert used <= set(words.MEDIA_FOLDER_LABEL.keys())
+
+
+def test_deploy_headline_puts_the_gradient_line_second() -> None:
+    lead, gradient = words.DEPLOY_HEADLINE
+
+    assert lead == "Tonight's feature:"
+    assert gradient == "your media server"
+
+
+def test_bill_line_functions_match_content_direction() -> None:
+    assert words.bill_line(3, "Prowlarr") == "3 apps on the bill tonight, starting with Prowlarr."
+    assert words.bill_one_app("Sonarr") == "One app on the bill tonight: Sonarr."
+
+
+def test_wiring_step_label_formats_the_shared_template() -> None:
+    assert words.WIRING_STEP_TEMPLATE == "Step {index} of {total}"
+    assert words.wiring_step_label(2, 4) == "Step 2 of 4"
+
+
+def test_open_app_label_names_the_app() -> None:
+    assert words.open_app_label("Sonarr") == "Open Sonarr"
+
+
+def test_last_problem_and_copy_words_match_content_direction() -> None:
+    assert words.LAST_PROBLEM_TITLE == "Last problem"
+    assert "secret keys" in words.LAST_PROBLEM_INTRO
+    assert "Nothing has gone wrong" in words.LAST_PROBLEM_EMPTY
+    assert words.COPY_BUTTON == "Copy"
+    assert words.COPY_DONE == "Copied"
+    assert "Ctrl+C" in words.COPY_BLOCKED
+    assert "Cmd+C" in words.COPY_BLOCKED

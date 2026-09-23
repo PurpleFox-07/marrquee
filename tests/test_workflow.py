@@ -258,29 +258,31 @@ def test_readme_sends_the_owner_to_the_wizard_and_names_diagnostics() -> None:
     assert "/diagnostics" in readme
 
 
-def test_readme_labels_the_curl_walk_as_a_temporary_developer_test() -> None:
+def test_readme_replaces_the_curl_walk_with_a_browser_only_update_section() -> None:
     readme = _README_PATH.read_text()
 
-    section = readme[readme.index("## Try the deploy engine") :]
-    assert "temporary" in section.lower()
-    assert "developer" in section.lower()
-    assert "/api/install" not in section
-    assert "use the two wizard screens" in section.lower()
+    assert "## Try the deploy engine" not in readme
+    assert "## Update Marrquee and deploy from your browser" in readme
+    # The whole user path - everything before the developer section - is
+    # the surface the owner rule ("no command-line steps") applies to.
+    user_path = readme.split("## Developing Marrquee", 1)[0]
+    assert "/api/deploy" not in user_path
+    assert "/api/install" not in user_path
 
 
 def test_readme_wiring_check_is_look_only_and_adds_no_command_line_step() -> None:
     readme = _README_PATH.read_text()
 
     section = readme[
-        readme.index("## Try the deploy engine") : readme.index("## Developing Marrquee")
+        readme.index("## Update Marrquee and deploy from your browser") : readme.index(
+            "## Developing Marrquee"
+        )
     ]
     assert "Settings -> Apps" in section
-    assert "Media Management -> Root Folders" in section
-    assert "optional" in section.lower()
-
-    # The three pre-existing pasted-command blocks (deploy, watch it,
-    # diagnostics) - unchanged in count, since the new check is look-only.
-    assert section.count("```bash") == 3
+    # The whole owner walk is GUI-only, start to finish - no pasted command
+    # anywhere in it, not even an optional one.
+    assert "```bash" not in section
+    assert "curl" not in section.lower()
 
 
 # --- stack-smoke: the real-Docker proof, and the guarantee it never gates ----

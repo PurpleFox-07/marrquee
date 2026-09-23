@@ -1,5 +1,9 @@
 {% extends "base.html" %}
 
+{% block head %}
+<script defer src="{{ url_for('static', path='js/diagnostics.js') }}"></script>
+{% endblock %}
+
 {% block content %}
 <div class="wrap">
   <p class="eyebrow">MARRQUEE</p>
@@ -20,6 +24,37 @@
     </div>
     {% endfor %}
   </div>
+
+  <section id="last-problem" class="card last-problem" aria-labelledby="last-problem-title">
+    <h2 id="last-problem-title" class="status-title">{{ words.LAST_PROBLEM_TITLE }}</h2>
+    {% if last_problem %}
+    <p class="status-detail">{{ words.LAST_PROBLEM_INTRO }}</p>
+    <textarea
+      readonly
+      data-copy-source
+      rows="10"
+      spellcheck="false"
+      aria-labelledby="last-problem-title"
+      class="last-problem-text"
+    >{{ last_problem }}</textarea>
+    <div class="last-problem-actions">
+      <button
+        type="button"
+        class="btn-ghost"
+        data-copy-button
+        hidden
+        data-copied-text="{{ words.COPY_DONE }}"
+        data-blocked-text="{{ words.COPY_BLOCKED }}"
+      >{{ words.COPY_BUTTON }}</button>
+      <p role="status" data-copy-status></p>
+    </div>
+    {% else %}
+    <div class="status-row">
+      <span class="status-icon status-icon--ok" aria-hidden="true">✓</span>
+      <p class="status-detail">{{ words.LAST_PROBLEM_EMPTY }}</p>
+    </div>
+    {% endif %}
+  </section>
 
   <div class="actions">
     <a class="btn-primary" href="/diagnostics">Check again</a>

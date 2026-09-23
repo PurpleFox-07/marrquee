@@ -54,12 +54,14 @@ from marrquee.words import (
     PHASE_HEADLINE_RUNNING,
     PHASE_HEADLINE_WIRING,
     STATUS_CHIP_DONE,
+    STATUS_CHIP_ERROR,
     STATUS_CHIP_STARTING,
     STATUS_CHIP_WAITING,
     app_headline_done,
     app_headline_starting,
     app_line_done,
     app_line_downloading,
+    app_line_error,
     app_line_starting,
     app_line_warming_up,
     app_note_slow_start,
@@ -277,14 +279,28 @@ class DeployManager:
     # --- Starting and resuming -------------------------------------------
 
     def start(self) -> DeploySnapshot:
-        """Start a deploy if none is running; otherwise, hand back the one already going."""
+        """Start a deploy if none is running; otherwise, hand back the one already going.
+
+        A NEW run clears the diagnostics file first, so "Last problem" on
+        the Diagnostics page can only ever show the most recent run's own
+        problem, never one an earlier, unrelated deploy left behind.
+        `resume_if_interrupted` never does this - a restart mid-deploy is
+        the same run continuing, and its evidence should survive it.
+        """
         if self._is_running():
             return self.snapshot()
         install = load_state(self._settings.config_dir)
         if install is None:
             return self.snapshot()
+        self._clear_diagnostics()
         self._task = asyncio.create_task(self._run(install))
         return self.snapshot()
+
+    def _clear_diagnostics(self) -> None:
+        try:
+            self._diagnostics_file.unlink(missing_ok=True)
+        except OSError:
+            pass  # a locked or otherwise unremovable file must never stop a deploy
 
     async def resume_if_interrupted(self) -> DeploySnapshot:
         """Re-enter a deploy that was still going when this process last stopped.
@@ -309,6 +325,22 @@ class DeployManager:
 
     def _is_running(self) -> bool:
         return self._task is not None and not self._task.done()
+
+    def return_to_ready(self) -> DeploySnapshot:
+        """Bring back the Deploy button after new choices are saved.
+
+        Called once, from the wizard's own success path, right after new
+        choices land on disk - the persisted "finale" or "error" from an
+        earlier deploy would otherwise send the owner straight back to the
+        old finale with no way to press Deploy again. A run still in
+        flight is left alone: saving new choices in a second tab must
+        never interrupt one already going.
+        """
+        if self._is_running():
+            return self.snapshot()
+        if self._snapshot.phase in ("finale", "error"):
+            self._emit(_resting_snapshot())
+        return self.snapshot()
 
     # --- Subscribing -------------------------------------------------------
 
@@ -707,7 +739,7 @@ class DeployManager:
             DeploySnapshot(
                 run_id=run_id,
                 phase="error",
-                apps=tuple(progresses),
+                apps=tuple(_stopped_progress(app) for app in progresses),
                 headline=redacted.headline,
                 detail=redacted.what_to_do,
                 failure=redacted,
@@ -721,6 +753,25 @@ class DeployManager:
         self._diagnostics_file.parent.mkdir(parents=True, exist_ok=True)
         with self._diagnostics_file.open("a", encoding="utf-8") as handle:
             handle.write(text if text.endswith("\n") else f"{text}\n")
+
+
+def read_last_failure(config_dir: Path) -> str | None:
+    """The diagnostics file's own text, for the Diagnostics page's "Last
+    problem" section - or `None` when there is nothing worth showing.
+
+    `None` covers a missing file, one that can't be read, and one that's
+    empty or whitespace-only - the page has exactly one wording for
+    "nothing has gone wrong", and this is the single place that decides
+    which of the two frames it's in. Reads with `errors="replace"` so a
+    stray non-UTF-8 byte in captured output can never turn "show the
+    problem" into a 500.
+    """
+    path = config_dir / _DIAGNOSTICS_FILE_NAME
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return None
+    return text if text.strip() else None
 
 
 def _running_snapshot(
@@ -762,6 +813,21 @@ def _waiting_progress(app: CatalogApp) -> AppProgress:
         line=STATUS_CHIP_WAITING,
         note=None,
         port=app.port,
+    )
+
+
+def _stopped_progress(app: AppProgress) -> AppProgress:
+    """The app that was `starting` when the deploy failed, told the truth.
+
+    `waiting` and `done` entries are untouched - only the one app the run
+    was actually waiting on when it gave up ever spent the failure sitting
+    there mid-boot, gold and spinning, above a panel that just said it
+    failed.
+    """
+    if app.state != "starting":
+        return app
+    return replace(
+        app, state="error", chip=STATUS_CHIP_ERROR, line=app_line_error(app.name), note=None
     )
 
 

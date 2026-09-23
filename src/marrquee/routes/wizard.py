@@ -216,6 +216,10 @@ async def post_setup_drive(request: Request) -> Response:
         )
         return templates.TemplateResponse(request, "wizard_drive.html", context)
 
+    # A finished or failed deploy from before these choices were saved would
+    # otherwise leave the owner staring at that old finale with no Deploy
+    # button to press. A run still in flight is left alone.
+    request.app.state.deploy.return_to_ready()
     return RedirectResponse("/deploy", status_code=303)
 
 

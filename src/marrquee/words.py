@@ -611,8 +611,123 @@ _WIRING_WORDS: tuple[str, ...] = (
 # end Wiring section
 # =============================================================================
 
+# =============================================================================
+# Deploy screen: the ready ticket, the running posters, the finale and the
+# calm failure - every sentence new to this story
+# =============================================================================
+
+DEPLOY_TITLE = "Deploy · Marrquee"
+DEPLOY_EYEBROW = "Opening night"
+
+# The lead line, then the line the template puts in the gradient span - two
+# separate lines, unlike the wizard headlines' single line with a gradient
+# word inside it.
+DEPLOY_HEADLINE: tuple[str, str] = ("Tonight's feature:", "your media server")
+
+DEPLOY_LEDE = "Every app takes the stage, one at a time. Roll the reel when you're ready."
+
+
+def bill_line(count: int, first_name: str) -> str:
+    return f"{count} apps on the bill tonight, starting with {first_name}."
+
+
+def bill_one_app(name: str) -> str:
+    return f"One app on the bill tonight: {name}."
+
+
+DOWNLOADS_LABEL = "Downloads"
+DEPLOY_BUTTON = "Deploy your media server"
+DEPLOY_MICROCOPY = "This usually takes a few minutes. You can leave this page open."
+RUN_SUB = "Each poster lights up as its app comes online."
+
+# The single source of truth for the wiring count - both the server and the
+# script's own `data-count-template` attribute read this exact template, so
+# the two can never quietly say something different.
+WIRING_STEP_TEMPLATE = "Step {index} of {total}"
+
+
+def wiring_step_label(index: int, total: int) -> str:
+    return WIRING_STEP_TEMPLATE.format(index=index, total=total)
+
+
+FINALE_BADGE = "Every app, first try"
+FINALE_HEADLINE = "Now showing: your media server"
+FINALE_SUB = "Full house. Every app came on, first try."
+FINALE_CTA = "Go to your Hub"
+SHOWTIMES_TITLE = "Or open anything directly"
+
+
+def open_app_label(name: str) -> str:
+    return f"Open {name}"
+
+
+DEPLOY_TRY_AGAIN = "Try again"
+DEPLOY_AGAIN = "Deploy again"
+SEE_TECHNICAL_DETAILS = "See the technical details"
+NOSCRIPT_REFRESH_NOTE = (
+    "Your browser has JavaScript switched off, so this page refreshes itself "
+    "every few seconds to show how far along the deploy is."
+)
+
+# --- Diagnostics page: the Last problem section --------------------------------
+LAST_PROBLEM_TITLE = "Last problem"
+LAST_PROBLEM_INTRO = (
+    "This is what went wrong the last time you pressed Deploy. If someone is "
+    "helping you, copy it and send it to them. Marrquee has already hidden "
+    "your apps' secret keys."
+)
+LAST_PROBLEM_EMPTY = (
+    "Nothing has gone wrong. If a deploy ever runs into trouble, the details will show up here."
+)
+COPY_BUTTON = "Copy"
+COPY_DONE = "Copied"
+COPY_BLOCKED = (
+    "Your browser wouldn't let Marrquee copy this. The text is selected - "
+    "press Ctrl+C (or Cmd+C on a Mac) to copy it."
+)
+
+_DEPLOY_SCREEN_WORDS: tuple[str, ...] = (
+    "DEPLOY_TITLE",
+    "DEPLOY_EYEBROW",
+    "DEPLOY_HEADLINE",
+    "DEPLOY_LEDE",
+    "bill_line",
+    "bill_one_app",
+    "DOWNLOADS_LABEL",
+    "DEPLOY_BUTTON",
+    "DEPLOY_MICROCOPY",
+    "RUN_SUB",
+    "WIRING_STEP_TEMPLATE",
+    "wiring_step_label",
+    "FINALE_BADGE",
+    "FINALE_HEADLINE",
+    "FINALE_SUB",
+    "FINALE_CTA",
+    "SHOWTIMES_TITLE",
+    "open_app_label",
+    "DEPLOY_TRY_AGAIN",
+    "DEPLOY_AGAIN",
+    "SEE_TECHNICAL_DETAILS",
+    "NOSCRIPT_REFRESH_NOTE",
+    "LAST_PROBLEM_TITLE",
+    "LAST_PROBLEM_INTRO",
+    "LAST_PROBLEM_EMPTY",
+    "COPY_BUTTON",
+    "COPY_DONE",
+    "COPY_BLOCKED",
+)
+
+# =============================================================================
+# end Deploy screen section
+# =============================================================================
+
 # The full review surface: every public name above, in one tuple. A later
 # feature area adds its own fenced section above this line, then extends
 # this tuple with its own `_..._WORDS` name - never editing an earlier
 # section's entries.
-WORDS_INVENTORY: tuple[str, ...] = (*_DEPLOY_ENGINE_WORDS, *_WIZARD_WORDS, *_WIRING_WORDS)
+WORDS_INVENTORY: tuple[str, ...] = (
+    *_DEPLOY_ENGINE_WORDS,
+    *_WIZARD_WORDS,
+    *_WIRING_WORDS,
+    *_DEPLOY_SCREEN_WORDS,
+)

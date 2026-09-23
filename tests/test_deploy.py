@@ -31,6 +31,7 @@ from marrquee.deploy import (
     DeploySnapshot,
     FakeReadinessProbe,
     HttpReadinessProbe,
+    read_last_failure,
 )
 from marrquee.docker_client import (
     ComposeResult,
@@ -41,7 +42,12 @@ from marrquee.docker_client import (
 )
 from marrquee.state import InstallState, save_state, write_json_atomic
 from marrquee.wiring import WiringStep, WiringStepState
-from marrquee.words import PHASE_HEADLINE_READY, wiring_finale_note
+from marrquee.words import (
+    PHASE_HEADLINE_READY,
+    STATUS_CHIP_ERROR,
+    app_line_error,
+    wiring_finale_note,
+)
 
 # --- Shared fixtures and small builders --------------------------------------
 
@@ -205,6 +211,14 @@ async def _run_to_terminal(
         if not seen or current != seen[-1]:
             seen.append(current)
         if current.phase in ("finale", "error"):
+            # `_emit` (inside the final `_publish`) already set this
+            # snapshot synchronously, but the task's own `await
+            # asyncio.sleep(0)` still has to be resumed and the coroutine
+            # unwound before `_is_running()` reports False - give it a few
+            # more turns so a caller acting on "the run is over" (for
+            # example, `return_to_ready`) sees that too.
+            for _ in range(5):
+                await asyncio.sleep(0)
             return seen
         await asyncio.sleep(0)
     raise AssertionError("deploy did not reach a terminal phase in time")
@@ -446,6 +460,82 @@ async def test_an_app_that_never_answers_ends_as_error_with_captured_logs(tmp_pa
 
     diagnostics = (settings.config_dir / "last-failure.txt").read_text()
     assert "never_became_ready" in diagnostics
+
+
+# --- `_fail` marks the stuck app `error`, and only that one -------------------
+
+
+async def test_a_stuck_app_is_marked_error_when_the_deploy_fails(tmp_path: Path) -> None:
+    """The engine, not the screen, owns this truth: `deploy.json` and the API
+    must both report the app that never answered as `error`, never as a
+    spinner sitting above a failure panel.
+    """
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+    install = _install_state(("sonarr",), root)
+    save_state(settings.config_dir, install)
+
+    engine = _happy_engine(("sonarr",))
+    probe = FakeReadinessProbe(default=False)  # never answers
+    clock = _FakeClock()
+    manager = DeployManager(settings, engine, probe=probe, clock=clock.time, sleep=clock.sleep)
+
+    manager.start()
+    history = await _run_to_terminal(manager)
+
+    final = history[-1]
+    assert final.phase == "error"
+    assert len(final.apps) == 1
+    stuck = final.apps[0]
+    assert stuck.state == "error"
+    assert stuck.chip == STATUS_CHIP_ERROR
+    assert stuck.line == app_line_error("Sonarr")
+    assert stuck.note is None
+
+
+async def test_apps_that_already_finished_stay_done_when_a_later_app_fails(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+    app_ids = ("prowlarr", "sonarr")
+    install = _install_state(app_ids, root)
+    save_state(settings.config_dir, install)
+
+    engine = _happy_engine(app_ids)
+    # Prowlarr answers ready first time; Sonarr (started next, catalog order)
+    # never answers at all.
+    probe = FakeReadinessProbe(
+        responses={("prowlarr", get_app("prowlarr").port): [True]}, default=False
+    )
+    clock = _FakeClock()
+    manager = DeployManager(settings, engine, probe=probe, clock=clock.time, sleep=clock.sleep)
+
+    manager.start()
+    history = await _run_to_terminal(manager)
+
+    final = history[-1]
+    assert final.phase == "error"
+    by_id = {app.app_id: app for app in final.apps}
+    assert by_id["prowlarr"].state == "done"
+    assert by_id["sonarr"].state == "error"
+
+
+async def test_a_failure_before_any_app_starts_leaves_every_app_waiting(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+    install = _install_state(("prowlarr", "sonarr"), root)
+    save_state(settings.config_dir, install)
+
+    engine = FakeDockerEngine(DockerStatus(connected=False, detail="no socket"))
+    manager = DeployManager(settings, engine)
+
+    manager.start()
+    history = await _run_to_terminal(manager)
+
+    final = history[-1]
+    assert final.phase == "error"
+    assert all(app.state == "waiting" for app in final.apps)
 
 
 async def test_a_port_conflict_is_reported_with_the_right_wording(tmp_path: Path) -> None:
@@ -1039,6 +1129,169 @@ def test_resume_if_interrupted_does_nothing_when_nothing_was_ever_started(tmp_pa
     assert manager.snapshot().phase == "ready"
 
 
+# --- Each new run starts with a clean diagnostics file; a resume keeps it -----
+
+
+async def test_starting_a_new_run_clears_the_last_problem(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+    install = _install_state(("prowlarr",), root)
+    save_state(settings.config_dir, install)
+    (settings.config_dir / "last-failure.txt").write_text("an old problem from a prior run\n")
+
+    engine = _happy_engine(("prowlarr",))
+    manager = DeployManager(settings, engine)
+
+    # The clear happens synchronously inside `start()`, before the task is
+    # even created, so this holds true without awaiting a single line of the
+    # run itself.
+    manager.start()
+
+    assert not (settings.config_dir / "last-failure.txt").exists()
+
+
+async def test_resuming_an_interrupted_run_keeps_the_last_problem(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+    install = _install_state(("prowlarr",), root)
+    save_state(settings.config_dir, install)
+    (settings.config_dir / "last-failure.txt").write_text("a problem from the run being resumed\n")
+
+    stale = DeploySnapshot(
+        run_id="stale-run-from-before-a-restart",
+        phase="running",
+        apps=(
+            AppProgress(
+                app_id="prowlarr",
+                name="Prowlarr",
+                state="starting",
+                chip="Starting…",
+                line="Starting Prowlarr",
+                note=None,
+                port=9696,
+            ),
+        ),
+        headline="Starting your apps, one at a time.",
+        detail=None,
+        failure=None,
+        started_at="2026-09-19T00:00:00+00:00",
+        finished_at=None,
+        wiring=(),
+    )
+    write_json_atomic(settings.config_dir / "deploy.json", dataclasses.asdict(stale))
+
+    engine = _happy_engine(("prowlarr",))
+    probe = FakeReadinessProbe(default=True)
+    clock = _FakeClock()
+    manager = DeployManager(settings, engine, probe=probe, clock=clock.time, sleep=clock.sleep)
+
+    await manager.resume_if_interrupted()
+
+    assert (settings.config_dir / "last-failure.txt").exists()
+
+
+async def test_start_never_raises_when_the_problem_file_cannot_be_removed(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+    install = _install_state(("prowlarr",), root)
+    save_state(settings.config_dir, install)
+    # A directory in the diagnostics file's place - `unlink()` raises for it
+    # even with `missing_ok=True`, which only swallows "not found".
+    (settings.config_dir / "last-failure.txt").mkdir()
+
+    engine = _happy_engine(("prowlarr",))
+    manager = DeployManager(settings, engine)
+
+    manager.start()  # must not raise
+
+
+# --- return_to_ready: saving new choices brings back the Deploy button -------
+
+
+async def test_return_to_ready_turns_a_finished_deploy_back_into_the_ready_screen(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+    install = _install_state(("prowlarr",), root)
+    save_state(settings.config_dir, install)
+
+    engine = _happy_engine(("prowlarr",))
+    probe = FakeReadinessProbe(default=True)
+    clock = _FakeClock()
+    manager = DeployManager(settings, engine, probe=probe, clock=clock.time, sleep=clock.sleep)
+    manager.start()
+    history = await _run_to_terminal(manager)
+    assert history[-1].phase == "finale"
+
+    result = manager.return_to_ready()
+
+    assert result.phase == "ready"
+    assert [app.app_id for app in result.apps] == ["prowlarr"]
+    assert all(app.state == "waiting" for app in result.apps)
+
+
+async def test_return_to_ready_persists_it_to_deploy_json(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+    install = _install_state(("prowlarr",), root)
+    save_state(settings.config_dir, install)
+
+    engine = _happy_engine(("prowlarr",))
+    probe = FakeReadinessProbe(default=True)
+    clock = _FakeClock()
+    manager = DeployManager(settings, engine, probe=probe, clock=clock.time, sleep=clock.sleep)
+    manager.start()
+    await _run_to_terminal(manager)
+
+    manager.return_to_ready()
+
+    persisted = json.loads((settings.config_dir / "deploy.json").read_text())
+    assert persisted["phase"] == "ready"
+
+
+async def test_return_to_ready_turns_a_failed_deploy_back_into_the_ready_screen(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+    install = _install_state(("sonarr",), root)
+    save_state(settings.config_dir, install)
+
+    engine = FakeDockerEngine(DockerStatus(connected=False, detail="no socket"))
+    manager = DeployManager(settings, engine)
+    manager.start()
+    history = await _run_to_terminal(manager)
+    assert history[-1].phase == "error"
+
+    result = manager.return_to_ready()
+
+    assert result.phase == "ready"
+
+
+async def test_return_to_ready_leaves_a_running_deploy_alone(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+    install = _install_state(("sonarr",), root)
+    save_state(settings.config_dir, install)
+
+    engine = _happy_engine(("sonarr",))
+    probe = FakeReadinessProbe(default=True)
+    clock = _FakeClock()
+    manager = DeployManager(settings, engine, probe=probe, clock=clock.time, sleep=clock.sleep)
+    manager.start()
+    for _ in range(1000):
+        if manager.snapshot().phase == "running":
+            break
+        await asyncio.sleep(0)
+    else:
+        raise AssertionError("deploy never reached the running phase")
+
+    result = manager.return_to_ready()
+
+    assert result.phase == "running"
+
+
 # --- The resting state: honest before any deploy has run ---------------------
 
 
@@ -1100,6 +1353,32 @@ async def test_api_keys_never_appear_in_a_snapshot_or_the_diagnostics_file(tmp_p
 
     diagnostics_text = (settings.config_dir / "last-failure.txt").read_text()
     assert secret not in diagnostics_text
+
+
+# --- read_last_failure: the Diagnostics page's own reader ---------------------
+
+
+def test_read_last_failure_is_none_for_missing_empty_and_whitespace_only_files(
+    tmp_path: Path,
+) -> None:
+    config_dir = tmp_path / "config"
+    config_dir.mkdir(parents=True)
+
+    assert read_last_failure(config_dir) is None  # nothing written yet
+
+    (config_dir / "last-failure.txt").write_text("")
+    assert read_last_failure(config_dir) is None  # empty
+
+    (config_dir / "last-failure.txt").write_text("   \n\t  \n")
+    assert read_last_failure(config_dir) is None  # whitespace-only
+
+
+def test_read_last_failure_returns_the_files_own_text(tmp_path: Path) -> None:
+    config_dir = tmp_path / "config"
+    config_dir.mkdir(parents=True)
+    (config_dir / "last-failure.txt").write_text("compose_failed\nsomething went wrong\n")
+
+    assert read_last_failure(config_dir) == "compose_failed\nsomething went wrong\n"
 
 
 # --- No technical string can reach a rendered field ---------------------------

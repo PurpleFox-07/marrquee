@@ -1,0 +1,163 @@
+{% extends "base.html" %}
+
+{% block title %}{{ words.DEPLOY_TITLE }}{% endblock %}
+
+{% block head %}
+<link rel="stylesheet" href="{{ url_for('static', path='css/wizard.css') }}">
+<link rel="stylesheet" href="{{ url_for('static', path='css/poster.css') }}">
+<link rel="stylesheet" href="{{ url_for('static', path='css/deploy.css') }}">
+<script defer src="{{ url_for('static', path='js/deploy.js') }}"></script>
+{% endblock %}
+
+{% block content %}
+<main
+  class="wrap deploy"
+  data-deploy
+  data-phase="{{ view.phase }}"
+  data-live="{{ 'true' if view.is_live else 'false' }}"
+  data-has-note="{{ 'true' if view.finale_note else 'false' }}"
+>
+  <p class="eyebrow">{{ words.DEPLOY_EYEBROW }}</p>
+
+  {% if view.phase == "ready" %}
+  {% include "partials/steps.html" %}
+  {% endif %}
+
+  <h1>{{ words.DEPLOY_HEADLINE[0] }}<br><span class="accent">{{ words.DEPLOY_HEADLINE[1] }}</span></h1>
+  <p class="lede">{{ words.DEPLOY_LEDE }}</p>
+
+  <p class="visually-hidden" aria-live="polite" data-role="announce">{{ view.announce }}</p>
+
+  {% if view.phase == "ready" %}
+  <div class="ready-panel">
+    <div class="ticket">
+      <ul class="summary-list">
+        <li>{{ view.bill }}</li>
+        {% for row in view.summary %}
+        <li>{{ row.label }} &rarr; <code>{{ row.path }}</code></li>
+        {% endfor %}
+      </ul>
+      <div class="ticket-action">
+        <form method="post" action="/deploy">
+          <button type="submit" class="deploy-btn">{{ words.DEPLOY_BUTTON }}</button>
+        </form>
+      </div>
+    </div>
+    <p class="deploy-microcopy">{{ words.DEPLOY_MICROCOPY }}</p>
+    <a class="btn-ghost deploy-back" href="{{ view.back_href }}">{{ words.WIZARD_BACK }}</a>
+  </div>
+  {% endif %}
+
+  <div class="deploy-panel" data-view="run">
+    <div class="run-title" data-role="run-title">{{ view.run_title }}</div>
+    <div class="run-sub">{{ words.RUN_SUB }}</div>
+  </div>
+
+  <ul class="poster-grid" data-role="poster-grid">
+    {% for tile in view.tiles %}
+    <li
+      class="poster"
+      data-app="{{ tile.app_id }}"
+      data-state="{{ tile.state }}"
+      data-has-note="{{ 'true' if tile.note else 'false' }}"
+      data-linking="{{ 'true' if tile.linking else 'false' }}"
+    >
+      <span data-role="order">{{ tile.order }}</span>
+      <div data-role="glyph" aria-hidden="true">{{ tile.glyph }}</div>
+      <div data-role="name">{{ tile.name }}</div>
+      <p data-role="desc">{{ tile.description }}</p>
+      <p class="poster-note">
+        <svg class="poster-note-icon" viewBox="0 0 20 20" width="13" height="13" aria-hidden="true"><circle cx="10" cy="10" r="7.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M10 6v4l3 2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span data-role="note-text">{{ tile.note or "" }}</span>
+      </p>
+      <div class="poster-status">
+        <span class="poster-icon" data-icon="waiting" aria-hidden="true">
+          <svg viewBox="0 0 20 20" width="14" height="14"><circle cx="10" cy="10" r="6" fill="none" stroke="currentColor" stroke-width="2"/></svg>
+        </span>
+        <span class="poster-icon" data-icon="starting" aria-hidden="true">
+          <svg viewBox="0 0 20 20" width="14" height="14"><circle cx="10" cy="10" r="7" fill="none" stroke="currentColor" stroke-width="2.4" stroke-dasharray="24 20" stroke-linecap="round"/></svg>
+        </span>
+        <span class="poster-icon" data-icon="done" aria-hidden="true">
+          <svg viewBox="0 0 20 20" width="14" height="14"><path d="M4 10.5l3.6 3.6L16 5.5" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </span>
+        <span class="poster-icon" data-icon="error" aria-hidden="true">
+          <svg viewBox="0 0 20 20" width="14" height="14"><path d="M6 6l8 8M14 6l-8 8" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg>
+        </span>
+        <span data-role="chip">{{ tile.chip }}</span>
+      </div>
+      <span class="visually-hidden" data-role="line">{{ tile.line }}</span>
+    </li>
+    {% endfor %}
+  </ul>
+
+  <div class="deploy-panel wiring-block" data-view="wiring" data-state="{{ view.wiring.state or '' }}">
+    <div
+      class="wiring-count"
+      data-role="wiring-count"
+      data-count-template="{{ words.WIRING_STEP_TEMPLATE }}"
+    >{{ view.wiring.count_label if view.wiring else "" }}</div>
+    <div class="wiring-text" data-role="wiring-text">{{ view.wiring.line if view.wiring else "" }}</div>
+    <p class="wiring-note" data-role="wiring-note">{{ (view.wiring.note if view.wiring else None) or "" }}</p>
+    <div class="wiring-status">
+      <span class="wiring-icon" data-icon="running" aria-hidden="true">
+        <svg viewBox="0 0 20 20" width="14" height="14"><circle cx="10" cy="10" r="7" fill="none" stroke="currentColor" stroke-width="2.4" stroke-dasharray="24 20" stroke-linecap="round"/></svg>
+      </span>
+      <span class="wiring-icon" data-icon="done" aria-hidden="true">
+        <svg viewBox="0 0 20 20" width="14" height="14"><path d="M4 10.5l3.6 3.6L16 5.5" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </span>
+      <span class="wiring-icon" data-icon="skipped" aria-hidden="true">
+        <svg viewBox="0 0 20 20" width="14" height="14"><path d="M5 10h10" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg>
+      </span>
+      <span class="wiring-icon" data-icon="error" aria-hidden="true">
+        <svg viewBox="0 0 20 20" width="14" height="14"><path d="M6 6l8 8M14 6l-8 8" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg>
+      </span>
+      <span data-role="wiring-chip">{{ view.wiring.chip if view.wiring else "" }}</span>
+    </div>
+  </div>
+
+  <div class="deploy-panel finale-panel" data-view="finale">
+    <div class="finale-badge">
+      <svg viewBox="0 0 20 20" width="14" height="14" aria-hidden="true"><path d="M4 10.5l3.6 3.6L16 5.5" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      {{ words.FINALE_BADGE }}
+    </div>
+    <h2 class="finale-headline">{{ words.FINALE_HEADLINE }}</h2>
+    <p class="finale-sub">{{ words.FINALE_SUB }}</p>
+    <a class="btn-primary finale-cta" href="/">{{ words.FINALE_CTA }}</a>
+
+    <div class="finale-note-area">
+      <div class="warning-banner" role="status">
+        <span class="warning-banner__glyph" aria-hidden="true">&#9888;</span>
+        <p data-role="finale-note">{{ view.finale_note or "" }}</p>
+      </div>
+      <form method="post" action="/deploy">
+        <button type="submit" class="btn-primary">{{ words.DEPLOY_AGAIN }}</button>
+      </form>
+      <a class="diagnostics-link" href="/diagnostics#last-problem">{{ words.SEE_TECHNICAL_DETAILS }}</a>
+    </div>
+
+    {% if view.links %}
+    <div class="showtimes">
+      <div class="showtimes-title">{{ words.SHOWTIMES_TITLE }}</div>
+      <div class="showtimes-grid">
+        {% for link in view.links %}
+        <a class="deploy-link" href="{{ link.url }}" target="_blank" rel="noopener noreferrer">{{ link.label }}</a>
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
+  </div>
+
+  <div class="deploy-panel failure-panel" data-view="error">
+    <h2 class="failure-headline" data-role="failure-headline">{{ view.failure.headline if view.failure else "" }}</h2>
+    <p class="failure-advice" data-role="failure-advice">{{ view.failure.what_to_do if view.failure else "" }}</p>
+    <form method="post" action="/deploy">
+      <button type="submit" class="btn-primary">{{ words.DEPLOY_TRY_AGAIN }}</button>
+    </form>
+    <a class="diagnostics-link" href="/diagnostics#last-problem">{{ words.SEE_TECHNICAL_DETAILS }}</a>
+  </div>
+
+  {% if view.is_live %}
+  <noscript><meta http-equiv="refresh" content="5"><p>{{ words.NOSCRIPT_REFRESH_NOTE }}</p></noscript>
+  {% endif %}
+</main>
+{% endblock %}

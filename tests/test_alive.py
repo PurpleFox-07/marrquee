@@ -238,9 +238,10 @@ def test_status_icons_are_aria_hidden_and_state_is_in_the_title_text(settings: S
 
     response = client.get("/diagnostics")
 
-    # Two status rows on the page, each with a decorative, aria-hidden icon -
+    # Two check rows plus the Last problem section's own empty-state row (no
+    # problem file exists here), each with a decorative, aria-hidden icon -
     # the wording of the title carries the state, not the icon's colour.
-    assert response.text.count('aria-hidden="true"') == 2
+    assert response.text.count('aria-hidden="true"') == 3
     assert "Talking to Docker" in response.text
     assert "Settings folder ready" in response.text
 

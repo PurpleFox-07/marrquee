@@ -15,6 +15,7 @@ from fastapi.templating import Jinja2Templates
 
 from marrquee import __version__, words
 from marrquee.config import ConfigDirStatus, Settings, ensure_config_dir
+from marrquee.deploy import read_last_failure
 from marrquee.docker_client import DockerEngine, DockerFailure, DockerStatus
 
 router = APIRouter()
@@ -121,7 +122,13 @@ async def alive(request: Request) -> Response:
 
     docker_status = await engine.status()
     config_status = ensure_config_dir(settings.config_dir)
+    last_problem = read_last_failure(settings.config_dir)
 
     lines = [docker_status_line(docker_status), config_status_line(config_status)]
-    context = {"lines": lines, "version": __version__, "words": words}
+    context = {
+        "lines": lines,
+        "version": __version__,
+        "words": words,
+        "last_problem": last_problem,
+    }
     return templates.TemplateResponse(request, "alive.html", context)

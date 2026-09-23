@@ -5,9 +5,10 @@
 Marrquee is a self-hosted web app that sets up and wires together the
 "arr" media apps (Sonarr, Radarr, Prowlarr, and friends) on your own
 NAS or Linux box. Open it and you land on the setup wizard: pick your
-apps, point it at your big drive, and it takes it from there. A
-separate diagnostics page proves Marrquee is running and can talk to
-Docker. Later versions add the screen that actually starts your apps.
+apps, point it at your big drive, and it takes it from there. Then the
+Deploy screen starts your apps for you, one at a time, and connects
+them together - no typing, no command line. A separate diagnostics
+page proves Marrquee is running and can talk to Docker.
 
 ## What you need
 
@@ -62,7 +63,8 @@ Files app.
 **Already installed Marrquee before?** Ugreen's Docker app was updated
 in September 2026 and now refuses the old `-v /:/host` line. If you
 installed before then, paste the current [`compose.install.yaml`](./compose.install.yaml)
-over your old one (see step 1 under **Try the deploy engine** below),
+over your old one (see **Option B: paste a file** below, or step 2
+under **Update Marrquee and deploy from your browser** further down),
 or reinstall using Option A below with today's mounts.
 If you installed using the old `marrquee-config` Docker volume, nothing
 carries over from it automatically - but there's nothing to lose yet,
@@ -130,79 +132,50 @@ Docker" line means it's ready. If a line there is red, the page itself
 explains what to do in plain language - fix what it describes, then
 select **Check again**.
 
-## Try the deploy engine (a temporary developer test)
+## Update Marrquee and deploy from your browser
 
-The screen that actually starts your apps once you've deployed is a
-later piece of this project. The part underneath it, the deploy engine
-that builds your folders and starts your apps, already works today,
-and this section is a temporary developer test that drives it directly
-with a handful of pasted commands - not something you need for normal
-use. It goes away once that screen ships.
+Everything below is done in a web browser - nothing to paste into a
+Terminal or an SSH session.
 
-1. **Update Marrquee on the NAS, if you installed it before this
-   feature existed.** Open the **Docker** app -> **Project**, select
-   `marrquee`, and paste the current contents of
-   [`compose.install.yaml`](./compose.install.yaml) over the old ones.
-   The new lines mount a `config` folder next to the project, and your
-   NAS's shared folders (`/volume1`, and `/volume2` too if you have
-   one) at `/host/volume1` and `/host/volume2` - together, that's what
-   lets Marrquee see your files. Click **Deploy** again. If you
-   installed fresh using the instructions above, this step is already
-   done - skip ahead.
-2. **Check it came back.** In a browser go to
-   `http://<your NAS's address>:7788/diagnostics`. You should still
-   see a green "Talking to Docker" line.
-3. **Tell it what to build.** Use the two wizard screens instead of a
-   pasted command: open `http://<your NAS's address>:7788`, tick your
-   apps, type your big drive's folder, pick your time zone, and press
-   Continue. It saves the exact same settings a pasted command used to.
-4. **Press the button.** Paste:
-
-   ```bash
-   curl -X POST http://<your NAS's address>:7788/api/deploy
-   ```
-
-   A good answer is a block of JSON with `"phase":"running"` in it.
-5. **Watch it.** Paste this a few times over the next couple of
-   minutes:
-
-   ```bash
-   curl http://<your NAS's address>:7788/api/deploy
-   ```
-
-   You'll see each app move from `"waiting"` to `"starting"` to
-   `"done"`, in the `apps` list. The first run downloads three apps, so
-   it can take a few minutes. If one app's `note` says it's taking
-   longer than usual, that's normal and it isn't broken - only
-   `"phase":"error"` means something needs your attention. A finished
-   deploy answers with `"phase":"finale"` and every app `"done"`.
-6. **Look at what it built.** In the NAS's **Files** app, open the
-   folder you typed. You should see a `data` folder (with `media` and
-   `torrents` inside) and a `marrquee` folder containing
-   `compose.yaml`. Open `compose.yaml` - it's meant to be readable.
-   That file is the actual description of your media server, and it's
-   the file that created every container. It contains your apps'
-   secret keys, so it's only readable by you (the owner of this
-   folder) - don't paste its contents anywhere public.
-7. **Open an app.** In a browser go to `http://<your NAS's
-   address>:8989`. Sonarr should open straight up with no login. Same
-   for `:7878` (Radarr) and `:9696` (Prowlarr).
-8. **See them connected (optional).** Marrquee already introduced these
-   apps to each other while it deployed - nothing to click for that -
-   but if you'd like to see it for yourself: in Prowlarr (`:9696`) open
-   **Settings -> Apps** and you should see Sonarr and Radarr already
-   listed. In Sonarr (`:8989`) and Radarr (`:7878`), open **Settings ->
-   Media Management -> Root Folders** and you should see your TV shows
-   (or movies) folder already there. Prowlarr's **Indexers** page will
-   be empty - that's expected, adding search sources is a later
-   feature.
-9. **If something goes wrong.** Paste these two commands and send both
-   of their outputs to whoever is helping you:
-
-   ```bash
-   curl http://<your NAS's address>:7788/api/deploy/diagnostics
-   docker logs marrquee --tail 200
-   ```
+1. **Wait for the green tick.** In your browser, open the project on
+   github.com and click the **Actions** tab. Wait until the newest run
+   shows a green tick. That means the new Marrquee was built, tested
+   and published. A red X means stop and tell me.
+2. **Update Marrquee on the NAS.** Open the Ugreen **Docker** app and
+   go to **Project**. Next to `marrquee` you should see a mark saying
+   an update is available. Choose to update it. The NAS downloads the
+   newest Marrquee and restarts it, which takes a minute. **If you
+   don't see an update option, stop here and tell me what that screen
+   shows.** Do not use a command line.
+3. **Check it's healthy.** Go to
+   `http://<your NAS's address>:7788/diagnostics`. You should see a
+   green "Talking to Docker" line. Further down there is a new **Last
+   problem** section. It may show an old problem from earlier testing,
+   or say nothing has gone wrong. Either is fine.
+4. **Go through the wizard.** Go to
+   `http://<your NAS's address>:7788/setup/apps`. Leave Prowlarr,
+   Sonarr and Radarr ticked and press **Continue**. Type your big
+   drive's folder, check the time zone, and press **Continue to
+   Deploy**.
+5. **Read the ticket.** The Deploy screen lists your three apps and
+   the folders it will build. The paths should be on your drive
+   (starting with your folder), never `/data`. If something is wrong,
+   press **Back**.
+6. **Press "Deploy your media server"** and watch. Each poster lights
+   up gold, then turns green, one at a time. The first time can take a
+   few minutes while the apps download. A note saying an app "is
+   taking a little longer than usual" is normal. Then the wiring steps
+   play, with a gold outline on the apps being connected, and finally
+   "Now showing: your media server".
+7. **Open Prowlarr from the finale.** Press **Open Prowlarr**. In
+   Prowlarr, open **Settings -> Apps**. Sonarr and Radarr should
+   already be listed. Nobody typed a key or an address.
+8. **If anything turns red**, press **See the technical details**,
+   then **Copy** in the Last problem section, and paste it to me. Also
+   tell me whether Copy worked or whether it asked you to press
+   Ctrl+C.
+9. **One expected oddity:** **Go to your Hub** brings you back to this
+   same finale for now. The Hub is the next piece being built.
 
 ## Developing Marrquee
 
@@ -224,3 +197,27 @@ uv run ruff format --check .
 uv run mypy
 uv run pytest
 ```
+
+### Watch the deploy screen on your Mac (developer preview)
+
+This is a developer tool, not something an owner needs - it's for
+checking the Deploy screen's four beats (ready, running, wiring,
+finale) without a NAS or a real Docker daemon.
+[`tools/dev_fake_server.py`](./tools/dev_fake_server.py) runs the real
+deploy engine, view model, templates and scripts against a scripted
+Docker engine, readiness probe and wiring runner, in a temporary
+folder it deletes on its own when you stop it. It never ships: it
+lives under `tools/`, which `.dockerignore` excludes from the image,
+and there is no setting anywhere that would turn it on by accident.
+
+```bash
+uv run python tools/dev_fake_server.py --scene happy
+uv run python tools/dev_fake_server.py --scene wiring-problem
+uv run python tools/dev_fake_server.py --scene failure
+```
+
+Then open <http://127.0.0.1:7788/deploy> and press **Deploy your media
+server**. `happy` plays a clean run (with one app pausing just long
+enough to show the reassurance note); `wiring-problem` reaches a green
+finale with a wiring note and something to see on `/diagnostics#last-problem`;
+`failure` shows the error frame with a stuck app.
