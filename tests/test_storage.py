@@ -18,8 +18,9 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
-from marrquee import storage, words
+from marrquee import catalog, compose, storage, words
 from marrquee.config import Settings
+from marrquee.state import InstallState
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _COMPOSE_PATH = _REPO_ROOT / "compose.install.yaml"
@@ -358,6 +359,53 @@ def test_prowlarr_alone_plans_no_data_folders() -> None:
         PurePosixPath("marrquee"),
         PurePosixPath("marrquee/apps/prowlarr"),
     )
+
+
+# --- container_media_path / host_media_path: the wiring engine's one home --
+
+
+def test_host_media_path_agrees_with_every_plan_folders_media_entry() -> None:
+    root = "/volume1/media"
+    media_entries = [
+        relative
+        for relative in storage.plan_folders(("sonarr", "radarr"))
+        if str(relative).startswith("data/media/")
+    ]
+
+    assert media_entries
+
+    for relative in media_entries:
+        media = relative.name
+        assert storage.host_media_path(root, media) == PurePosixPath(root) / relative
+
+
+def test_container_media_path_sits_under_each_data_mounting_services_volume() -> None:
+    state = InstallState(
+        version=1,
+        storage_root="/volume1/media",
+        app_ids=("sonarr", "radarr"),
+        api_keys={"sonarr": "s" * 32, "radarr": "r" * 32},
+        puid=1000,
+        pgid=1000,
+        umask="002",
+        timezone="Etc/UTC",
+        created="2026-01-01T00:00:00+00:00",
+    )
+    plan = compose.build_stack_plan(state)
+
+    data_mounting = [
+        service for service in plan.services if catalog.get_app(service.app_id).needs_data_mount
+    ]
+    assert data_mounting
+
+    for service in data_mounting:
+        data_volumes = [volume for volume in service.volumes if volume.endswith(":/data")]
+        assert len(data_volumes) == 1
+
+        app = catalog.get_app(service.app_id)
+        for media in app.media_folders:
+            container_path = storage.container_media_path(media)
+            assert str(container_path).startswith("/data/media/")
 
 
 # --- check_fresh_start: the owner's hardest rule ----------------------------

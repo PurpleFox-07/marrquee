@@ -481,8 +481,138 @@ _WIZARD_WORDS: tuple[str, ...] = (
 # end Wizard screens section
 # =============================================================================
 
+# =============================================================================
+# Wiring: connecting Prowlarr, Sonarr and Radarr together
+# =============================================================================
+
+
+# --- Step lines - what each connection step says while it runs ---------------
+def wiring_line_app_sync(source_name: str, target_name: str) -> str:
+    return f"Introducing {source_name} to {target_name}"
+
+
+def wiring_line_root_folder(app_name: str, media_label: str) -> str:
+    return f"Telling {app_name} where your {media_label} live"
+
+
+# Keyed by the catalog's own `media_folders` entries - the plain-language
+# name for each, reused anywhere a media folder needs a friendly label.
+# Lowercase "movies" is deliberate: it reads naturally both inline ("your
+# movies live") and as a standalone row label ("movies").
+MEDIA_FOLDER_LABEL: dict[str, str] = {
+    "tv": "TV shows",
+    "movies": "movies",
+}
+
+
+# --- Step chips - one per state, chosen purely from state --------------------
+WIRING_CHIP_RUNNING = "Connecting…"
+WIRING_CHIP_DONE = "Connected"
+WIRING_CHIP_SKIPPED = "Nothing to do"
+WIRING_CHIP_ERROR = "Couldn't connect"
+
+
+# --- Step note - a connection that needed no change ---------------------------
+WIRING_NOTE_ALREADY_CONNECTED = "Already connected - nothing to change."
+
+
+# --- Plan-level skips - honest, never a failure --------------------------------
+WIRING_NOTHING_TO_CONNECT = "Nothing to connect this time."
+
+
+def wiring_skip_no_prowlarr(app_name: str) -> str:
+    return (
+        f"You didn't add Prowlarr this time, so {app_name} has no search sources to connect to yet."
+    )
+
+
+WIRING_SKIP_PROWLARR_ALONE = (
+    "Prowlarr is on its own for now - add Sonarr or Radarr later and Marrquee will connect them."
+)
+
+
+# --- Step note - a slow app the engine is still waiting for --------------------
+def wiring_note_still_waking(app_name: str) -> str:
+    return f"{app_name} is still waking up - Marrquee is waiting for it."
+
+
+# --- Step failures - what happened, and what to do next -----------------------
+def wiring_failure_unreachable(app_name: str) -> str:
+    return (
+        f"Marrquee couldn't reach {app_name} to finish connecting it. Your apps "
+        "are running fine - press Deploy again and Marrquee will pick up where "
+        "it left off."
+    )
+
+
+def wiring_failure_refused(app_name: str) -> str:
+    return (
+        f"{app_name} didn't accept the connection. Your apps are running fine - "
+        "press Deploy again to retry. If it keeps happening, the Diagnostics "
+        "page has the details to send for help."
+    )
+
+
+def wiring_failure_folder(app_name: str, host_path: str) -> str:
+    return (
+        f"{app_name} wouldn't accept the folder {host_path}. Check that folder "
+        "exists on your drive, then press Deploy again."
+    )
+
+
+def wiring_failure_prowlarr_too_old(app_name: str) -> str:
+    return (
+        f"This version of Prowlarr doesn't know how to connect to {app_name}. "
+        "Marrquee left it alone."
+    )
+
+
+# --- Finale note - names every failed connection, never a count ----------------
+def wiring_finale_note(failed_lines: _Sequence[str]) -> str:
+    """The finale screen shows only its own last wiring row, so a note that
+    said "one connection didn't finish" without naming which one could point
+    at a step that actually succeeded. Naming every failed line here keeps
+    the note true standing on its own.
+    """
+    lines = list(failed_lines)
+    if len(lines) == 1:
+        return (
+            f"Your apps are all running. One connection didn't finish: {lines[0]}. "
+            "Press Deploy again to retry - it's safe to repeat."
+        )
+    joined = ", ".join(lines)
+    return (
+        f"Your apps are all running. These connections didn't finish: {joined}. "
+        "Press Deploy again to retry - it's safe to repeat."
+    )
+
+
+_WIRING_WORDS: tuple[str, ...] = (
+    "wiring_line_app_sync",
+    "wiring_line_root_folder",
+    "MEDIA_FOLDER_LABEL",
+    "WIRING_CHIP_RUNNING",
+    "WIRING_CHIP_DONE",
+    "WIRING_CHIP_SKIPPED",
+    "WIRING_CHIP_ERROR",
+    "WIRING_NOTE_ALREADY_CONNECTED",
+    "WIRING_NOTHING_TO_CONNECT",
+    "wiring_skip_no_prowlarr",
+    "WIRING_SKIP_PROWLARR_ALONE",
+    "wiring_note_still_waking",
+    "wiring_failure_unreachable",
+    "wiring_failure_refused",
+    "wiring_failure_folder",
+    "wiring_failure_prowlarr_too_old",
+    "wiring_finale_note",
+)
+
+# =============================================================================
+# end Wiring section
+# =============================================================================
+
 # The full review surface: every public name above, in one tuple. A later
 # feature area adds its own fenced section above this line, then extends
 # this tuple with its own `_..._WORDS` name - never editing an earlier
 # section's entries.
-WORDS_INVENTORY: tuple[str, ...] = (*_DEPLOY_ENGINE_WORDS, *_WIZARD_WORDS)
+WORDS_INVENTORY: tuple[str, ...] = (*_DEPLOY_ENGINE_WORDS, *_WIZARD_WORDS, *_WIRING_WORDS)

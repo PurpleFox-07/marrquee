@@ -187,7 +187,16 @@ use. It goes away once that screen ships.
 7. **Open an app.** In a browser go to `http://<your NAS's
    address>:8989`. Sonarr should open straight up with no login. Same
    for `:7878` (Radarr) and `:9696` (Prowlarr).
-8. **If something goes wrong.** Paste these two commands and send both
+8. **See them connected (optional).** Marrquee already introduced these
+   apps to each other while it deployed - nothing to click for that -
+   but if you'd like to see it for yourself: in Prowlarr (`:9696`) open
+   **Settings -> Apps** and you should see Sonarr and Radarr already
+   listed. In Sonarr (`:8989`) and Radarr (`:7878`), open **Settings ->
+   Media Management -> Root Folders** and you should see your TV shows
+   (or movies) folder already there. Prowlarr's **Indexers** page will
+   be empty - that's expected, adding search sources is a later
+   feature.
+9. **If something goes wrong.** Paste these two commands and send both
    of their outputs to whoever is helping you:
 
    ```bash

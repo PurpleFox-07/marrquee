@@ -21,7 +21,8 @@ from marrquee.docker_client import DockerEngine, SocketDockerEngine
 from marrquee.routes.alive import router as alive_router
 from marrquee.routes.api import router as api_router
 from marrquee.routes.wizard import router as wizard_router
-from marrquee.wiring import NoWiringYet, WiringRunner
+from marrquee.wiring import WiringRunner
+from marrquee.wiring.engine import WiringEngine
 
 # Resolved from the installed package, not the repository: the runtime image
 # copies only the built venv (no `src/` tree survives), so a path built from
@@ -46,7 +47,10 @@ def create_app(
     binary those same settings point at. `manager=None` builds one
     `DeployManager` from `settings` and `engine` - a test that only needs to
     control readiness or wiring passes `probe=`/`wiring=` instead of
-    building and injecting a whole manager itself.
+    building and injecting a whole manager itself. `wiring=None` builds a
+    real `WiringEngine` here, at the one place the live app is assembled -
+    `DeployManager`'s own default stays the do-nothing `NoWiringYet`, so a
+    test that builds a `DeployManager` directly never touches the network.
 
     On startup, the built app re-enters any deploy that was still running
     when Marrquee last stopped - every step downstream is idempotent, so
@@ -61,7 +65,7 @@ def create_app(
             settings,
             engine,
             probe=probe if probe is not None else HttpReadinessProbe(),
-            wiring=wiring if wiring is not None else NoWiringYet(),
+            wiring=wiring if wiring is not None else WiringEngine(),
         )
 
     @asynccontextmanager

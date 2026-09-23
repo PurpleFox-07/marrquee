@@ -18,6 +18,7 @@ import asyncio
 import dataclasses
 import json
 import os
+from collections.abc import Sequence
 from pathlib import Path, PurePosixPath
 
 import httpx
@@ -39,8 +40,8 @@ from marrquee.docker_client import (
     NetworkConnectResult,
 )
 from marrquee.state import InstallState, save_state, write_json_atomic
-from marrquee.wiring import WiringStep
-from marrquee.words import PHASE_HEADLINE_READY
+from marrquee.wiring import WiringStep, WiringStepState
+from marrquee.words import PHASE_HEADLINE_READY, wiring_finale_note
 
 # --- Shared fixtures and small builders --------------------------------------
 
@@ -239,6 +240,26 @@ class _OneStepWiringRunner:
             technical=self._technical,
         )
         emit(step)  # type: ignore[operator]
+
+
+class _ScriptedWiringRunner:
+    """Emits a fixed sequence of WiringSteps, yielding to the event loop
+    after each one.
+
+    A real WiringEngine always awaits an HTTP call between frames, which is
+    what gives a poller a chance to observe an intermediate one - a scripted
+    stand-in has to yield the same way on purpose, or `_run_to_terminal`
+    (which itself only yields via `asyncio.sleep(0)`) would never see
+    anything but the very last frame.
+    """
+
+    def __init__(self, steps: Sequence[WiringStep]) -> None:
+        self._steps = steps
+
+    async def run(self, state: InstallState, emit: object) -> None:
+        for step in self._steps:
+            emit(step)  # type: ignore[operator]
+            await asyncio.sleep(0)
 
 
 # --- The full happy path: waiting -> starting -> done, in catalog order -----
@@ -641,6 +662,9 @@ async def test_a_wiring_failure_never_fails_the_deploy_and_its_detail_is_diagnos
     assert len(final.wiring) == 1
     assert final.wiring[0].technical is None
     assert final.wiring[0].state == "error"
+    # The finale note names the failed step's own line - never the raw
+    # technical text that only the diagnostics file below is allowed to see.
+    assert final.detail == wiring_finale_note(("Connecting things together",))
 
     diagnostics = (settings.config_dir / "last-failure.txt").read_text()
     assert "something an owner should never see raw" in diagnostics
@@ -675,6 +699,198 @@ async def test_a_wiring_runner_that_raises_still_reaches_finale(tmp_path: Path) 
     history = await _run_to_terminal(manager)
 
     assert history[-1].phase == "finale"
+
+
+_CHIP_FOR_STATE = {"running": "Connecting…", "done": "Connected", "error": "Couldn't connect"}
+
+
+def _wiring_step(
+    index: int, total: int, *, line: str, state: WiringStepState, note: str | None = None
+) -> WiringStep:
+    return WiringStep(
+        index=index,
+        total=total,
+        key=f"step-{index}",
+        line=line,
+        state=state,
+        chip=_CHIP_FOR_STATE[state],
+        note=note,
+        technical=None,
+    )
+
+
+async def test_wiring_rows_are_published_live_one_per_step(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+    install = _install_state(("prowlarr", "sonarr"), root)
+    save_state(settings.config_dir, install)
+
+    engine = _happy_engine(("prowlarr", "sonarr"))
+    probe = FakeReadinessProbe(default=True)
+    clock = _FakeClock()
+    line_1 = "Introducing Prowlarr to Sonarr"
+    line_2 = "Telling Sonarr where your TV shows live"
+    steps = [
+        _wiring_step(1, 2, line=line_1, state="running"),
+        _wiring_step(
+            1, 2, line=line_1, state="done", note="Already connected - nothing to change."
+        ),
+        _wiring_step(2, 2, line=line_2, state="running"),
+        _wiring_step(
+            2, 2, line=line_2, state="done", note="Already connected - nothing to change."
+        ),
+    ]
+    wiring = _ScriptedWiringRunner(steps)
+    manager = DeployManager(
+        settings, engine, probe=probe, clock=clock.time, sleep=clock.sleep, wiring=wiring
+    )
+
+    manager.start()
+    history = await _run_to_terminal(manager)
+
+    wiring_phase_snapshots = [snapshot for snapshot in history if snapshot.phase == "wiring"]
+    assert any(
+        len(snapshot.wiring) == 1 and snapshot.wiring[0].state == "running"
+        for snapshot in wiring_phase_snapshots
+    )
+
+    final = history[-1]
+    assert final.phase == "finale"
+    assert [step.index for step in final.wiring] == [1, 2]
+    assert all(step.state == "done" for step in final.wiring)
+
+
+async def test_a_reassurance_frame_replaces_its_steps_row_instead_of_adding_one(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+    install = _install_state(("sonarr",), root)
+    save_state(settings.config_dir, install)
+
+    engine = _happy_engine(("sonarr",))
+    probe = FakeReadinessProbe(default=True)
+    clock = _FakeClock()
+    line = "Telling Sonarr where your TV shows live"
+    reassurance = "Sonarr is still waking up - Marrquee is waiting for it."
+    steps = [
+        _wiring_step(1, 1, line=line, state="running"),
+        _wiring_step(1, 1, line=line, state="running", note=reassurance),
+        _wiring_step(1, 1, line=line, state="done", note="Already connected - nothing to change."),
+    ]
+    wiring = _ScriptedWiringRunner(steps)
+    manager = DeployManager(
+        settings, engine, probe=probe, clock=clock.time, sleep=clock.sleep, wiring=wiring
+    )
+
+    manager.start()
+    history = await _run_to_terminal(manager)
+
+    for snapshot in history:
+        assert len(snapshot.wiring) <= 1  # the same step's index never appears twice
+
+    reassured = [
+        snapshot
+        for snapshot in history
+        if snapshot.phase == "wiring" and snapshot.wiring and snapshot.wiring[0].note == reassurance
+    ]
+    assert reassured
+
+    final = history[-1]
+    assert len(final.wiring) == 1
+    assert final.wiring[0].state == "done"
+
+
+async def test_a_failed_wiring_step_sets_the_finale_detail_naming_it(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+    install = _install_state(("prowlarr",), root)
+    save_state(settings.config_dir, install)
+
+    engine = _happy_engine(("prowlarr",))
+    probe = FakeReadinessProbe(default=True)
+    clock = _FakeClock()
+    wiring = _OneStepWiringRunner(
+        technical="HTTP 400 BaseUrl: something an owner should never see raw"
+    )
+    manager = DeployManager(
+        settings, engine, probe=probe, clock=clock.time, sleep=clock.sleep, wiring=wiring
+    )
+
+    manager.start()
+    history = await _run_to_terminal(manager)
+
+    final = history[-1]
+    assert final.phase == "finale"
+    assert final.failure is None
+    assert all(app.state == "done" for app in final.apps)
+    assert final.detail == wiring_finale_note(("Connecting things together",))
+
+
+async def test_two_failed_wiring_steps_set_the_finale_detail_naming_both_in_step_order(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+    install = _install_state(("prowlarr", "sonarr", "radarr"), root)
+    save_state(settings.config_dir, install)
+
+    engine = _happy_engine(("prowlarr", "sonarr", "radarr"))
+    probe = FakeReadinessProbe(default=True)
+    clock = _FakeClock()
+    line_1 = "Introducing Prowlarr to Sonarr"
+    line_2 = "Introducing Prowlarr to Radarr"
+    steps = [
+        _wiring_step(1, 2, line=line_1, state="error", note="Couldn't connect"),
+        _wiring_step(2, 2, line=line_2, state="error", note="Couldn't connect"),
+    ]
+    wiring = _ScriptedWiringRunner(steps)
+    manager = DeployManager(
+        settings, engine, probe=probe, clock=clock.time, sleep=clock.sleep, wiring=wiring
+    )
+
+    manager.start()
+    history = await _run_to_terminal(manager)
+
+    final = history[-1]
+    assert final.phase == "finale"
+    assert [step.state for step in final.wiring] == ["error", "error"]
+    assert final.detail == wiring_finale_note((line_1, line_2))
+    assert final.detail is not None
+    assert line_1 in final.detail
+    assert line_2 in final.detail
+
+
+async def test_a_clean_wiring_run_leaves_the_finale_detail_empty(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+    install = _install_state(("prowlarr",), root)
+    save_state(settings.config_dir, install)
+
+    engine = _happy_engine(("prowlarr",))
+    probe = FakeReadinessProbe(default=True)
+    clock = _FakeClock()
+    steps = [
+        _wiring_step(
+            1,
+            1,
+            line="Prowlarr is on its own for now - add Sonarr or Radarr later and Marrquee will "
+            "connect them.",
+            state="done",
+            note="Already connected - nothing to change.",
+        ),
+    ]
+    wiring = _ScriptedWiringRunner(steps)
+    manager = DeployManager(
+        settings, engine, probe=probe, clock=clock.time, sleep=clock.sleep, wiring=wiring
+    )
+
+    manager.start()
+    history = await _run_to_terminal(manager)
+
+    final = history[-1]
+    assert final.phase == "finale"
+    assert final.detail is None
 
 
 # --- Starting, subscribing, persisting, and resuming -------------------------

@@ -74,6 +74,7 @@ from marrquee.words import (
     refusal_path_missing,
     refusal_populated_target,
     refusal_system_path,
+    wiring_finale_note,
 )
 
 logger = logging.getLogger(__name__)
@@ -521,12 +522,30 @@ class DeployManager:
             )
         )
 
-        wiring_steps: list[WiringStep] = []
+        # Keyed by `index` rather than appended, so a step that re-emits
+        # `running` (a reassurance note) or moves from `running` to a
+        # terminal state replaces its own row instead of leaving a stale one
+        # behind - the screen (and the finale) only ever sees the latest
+        # frame for each step.
+        wiring_rows: dict[int, WiringStep] = {}
 
         def collect_wiring_step(step: WiringStep) -> None:
             if step.technical:
                 self._append_diagnostics(_redact_secrets(step.technical, install.api_keys))
-            wiring_steps.append(replace(step, technical=None))
+            wiring_rows[step.index] = replace(step, technical=None)
+            self._emit(
+                DeploySnapshot(
+                    run_id=run_id,
+                    phase="wiring",
+                    apps=tuple(progresses),
+                    headline=PHASE_HEADLINE_WIRING,
+                    detail=None,
+                    failure=None,
+                    started_at=started_at,
+                    finished_at=None,
+                    wiring=tuple(wiring_rows[index] for index in sorted(wiring_rows)),
+                )
+            )
 
         try:
             await self._wiring.run(install, collect_wiring_step)
@@ -536,17 +555,18 @@ class DeployManager:
             # into one that looks failed.
             logger.exception("wiring runner raised; continuing to finale anyway")
 
+        wiring_steps = tuple(wiring_rows[index] for index in sorted(wiring_rows))
         await self._publish(
             DeploySnapshot(
                 run_id=run_id,
                 phase="finale",
                 apps=tuple(progresses),
                 headline=PHASE_HEADLINE_FINALE,
-                detail=None,
+                detail=_wiring_finale_detail(wiring_steps),
                 failure=None,
                 started_at=started_at,
                 finished_at=_now_iso(),
-                wiring=tuple(wiring_steps),
+                wiring=wiring_steps,
             )
         )
 
@@ -842,6 +862,15 @@ def _redact_secrets(text: str, api_keys: Mapping[str, str]) -> str:
         if key:
             redacted = redacted.replace(key, _REDACTED_PLACEHOLDER)
     return redacted
+
+
+def _wiring_finale_detail(steps: tuple[WiringStep, ...]) -> str | None:
+    """`None` on a clean run; otherwise every failed step's own line, in
+    step order - the finale stays green either way (a wiring problem is
+    never a deploy failure), but a failed connection still gets named.
+    """
+    failed_lines = tuple(step.line for step in steps if step.state == "error")
+    return wiring_finale_note(failed_lines) if failed_lines else None
 
 
 # --- deploy.json round-tripping: reload-on-construction, resume, persistence -

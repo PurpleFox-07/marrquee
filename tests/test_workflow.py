@@ -268,6 +268,21 @@ def test_readme_labels_the_curl_walk_as_a_temporary_developer_test() -> None:
     assert "use the two wizard screens" in section.lower()
 
 
+def test_readme_wiring_check_is_look_only_and_adds_no_command_line_step() -> None:
+    readme = _README_PATH.read_text()
+
+    section = readme[
+        readme.index("## Try the deploy engine") : readme.index("## Developing Marrquee")
+    ]
+    assert "Settings -> Apps" in section
+    assert "Media Management -> Root Folders" in section
+    assert "optional" in section.lower()
+
+    # The three pre-existing pasted-command blocks (deploy, watch it,
+    # diagnostics) - unchanged in count, since the new check is look-only.
+    assert section.count("```bash") == 3
+
+
 # --- stack-smoke: the real-Docker proof, and the guarantee it never gates ----
 
 
@@ -446,6 +461,72 @@ def test_stack_smoke_also_puts_diagnostics_in_a_public_annotation_truncated_and_
     # The plain log dump stays too - the annotation is additional, not a
     # replacement for it.
     assert 'echo "$diagnostics"' in run
+
+
+def test_stack_smoke_asserts_prowlarr_sonarr_and_radarr_are_wired_together() -> None:
+    """The proof the whole story exists for: two applications, both
+    `fullSync`, and both apps' own root folder - asserted straight against
+    the real, running containers, plus Marrquee's own report agreeing.
+    """
+    step = _step_named(_stack_smoke_job(), "assert", "wired together")
+    run = step["run"]
+
+    assert "api/v1/applications" in run
+    assert "Sonarr" in run
+    assert "Radarr" in run
+    assert "fullSync" in run
+    assert "/data/media/tv" in run
+    assert "/data/media/movies" in run
+    assert ".wiring[]" in run
+    assert "done" in run
+
+
+def test_stack_smoke_wiring_assertion_never_echoes_a_key() -> None:
+    step = _step_named(_stack_smoke_job(), "assert", "wired together")
+    run = step["run"]
+
+    for line in run.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("echo") or "::error::" in stripped:
+            assert "_key" not in stripped, f"a key variable appears in an echoed line: {line!r}"
+
+
+def test_stack_smoke_deploys_a_second_time_and_polls_it_to_finale() -> None:
+    job = _stack_smoke_job()
+
+    second_deploy_step = _step_named(job, "second", "deploy")
+    assert "POST http://127.0.0.1:7788/api/deploy" in second_deploy_step["run"]
+
+    # Two "poll ... finale" steps: the first deploy's and the second's.
+    poll_steps = [
+        step
+        for step in _steps(job)
+        if "poll" in str(step.get("name", "")).lower()
+        and "finale" in str(step.get("name", "")).lower()
+    ]
+    assert len(poll_steps) == 2
+
+
+def test_stack_smoke_re_asserts_the_same_counts_after_the_second_deploy() -> None:
+    step = _step_named(_stack_smoke_job(), "second deploy changed nothing")
+    run = step["run"]
+
+    assert "length == 2" in run  # still exactly two applications
+    assert "length == 1" in run  # still exactly one root folder each
+    assert ".wiring[]" in run
+    assert "done" in run
+
+
+def test_stack_smoke_wiring_and_second_deploy_steps_run_in_the_right_order() -> None:
+    job = _stack_smoke_job()
+    names = [str(step.get("name", "")) for step in _steps(job)]
+
+    wiring_index = names.index(_step_named(job, "assert", "wired together")["name"])
+    second_deploy_index = names.index(_step_named(job, "second", "deploy")["name"])
+    reassert_index = names.index(_step_named(job, "second deploy changed nothing")["name"])
+    dump_index = names.index(_step_named(job, "dump diagnostics")["name"])
+
+    assert wiring_index < second_deploy_index < reassert_index < dump_index
 
 
 def test_stack_smoke_always_cleans_up_containers_network_and_temp_files() -> None:

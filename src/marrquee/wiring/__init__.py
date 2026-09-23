@@ -1,16 +1,18 @@
 """The seam between the deploy engine and however the deployed apps get
 connected together.
 
-The deploy engine owns this seam and ships `NoWiringYet` as its default -
-there is nothing to wire yet, since deploying apps and connecting them to
-each other are two different jobs. A real `WiringRunner` can replace
-`NoWiringYet` later without the deploy engine changing how it calls one: it
-always constructs a `DeployManager` with a `wiring=` runner and always calls
-`run(state, emit)` the same way.
+`DeployManager`'s own default stays `NoWiringYet` - a `DeployManager` built
+on its own (the shape most of this project's tests use) does no real wiring
+and touches no network. The live app wires for real: `create_app` builds a
+`WiringEngine` (from `marrquee.wiring.engine`) and hands it in as `wiring=`
+instead. Either way, the deploy engine always constructs a `DeployManager`
+with a `wiring=` runner and always calls `run(state, emit)` the same way.
 
 This package never imports from `deploy` - the dependency runs one
 direction only, so the wiring seam stays a plain, testable interface rather
-than growing a circular link back into the engine that owns it.
+than growing a circular link back into the engine that owns it. It also
+never imports `marrquee.wiring.engine` - that module imports from here, and
+importing it back would be a circular import.
 """
 
 from __future__ import annotations
@@ -59,11 +61,12 @@ class WiringRunner(Protocol):
 
 
 class NoWiringYet:
-    """The default runner for as long as nothing needs wiring together.
+    """`DeployManager`'s own default runner - not "nothing is wired anywhere".
 
-    Completes immediately without emitting a single step, so the deploy
-    engine's wiring phase is near-instant until a real runner replaces this
-    one.
+    Completes immediately without emitting a single step, so any test that
+    builds a `DeployManager` directly touches no network and waits no real
+    second. The live app never sees this one: `create_app` hands in a real
+    `WiringEngine` instead.
     """
 
     async def run(self, state: InstallState, emit: Callable[[WiringStep], None]) -> None:

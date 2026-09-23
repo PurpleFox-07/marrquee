@@ -1,10 +1,12 @@
 """Tests for the seam between the deploy engine and however apps get wired
 together.
 
-Cycle 1 has nothing to wire yet, so this module ships only `NoWiringYet` - a
-runner that does nothing. The dataclass shape and the protocol are what a
-later story replaces the runner against, so both are pinned here even
-though nothing in this cycle exercises them beyond "it completes".
+The real wiring behaviour (`WiringEngine`, `plan_wiring`, the two connection
+types) lives in `tests/test_wiring_engine.py` and `tests/test_wiring_steps.py`.
+This module only pins the shared seam itself - `WiringStep`, `WiringRunner`
+and `NoWiringYet`, the do-nothing runner `DeployManager` still defaults to -
+so a later change to any of those three fails here before it fails anywhere
+downstream.
 """
 
 from __future__ import annotations

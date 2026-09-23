@@ -431,6 +431,28 @@ def plan_folders(app_ids: Iterable[str]) -> tuple[PurePosixPath, ...]:
     return tuple(planned)
 
 
+def container_media_path(media_folder: str) -> PurePosixPath:
+    """Where one media type lives inside a data-mounting app's container.
+
+    Mirrors `plan_folders`'s own `data/media/<m>` rule, under the `/data`
+    mount every data-mounting app gets (`compose.py`'s data-mount suffix) -
+    this is the one place that path is derived, so the wiring engine and the
+    compose file can never drift apart on where a library folder actually
+    is.
+    """
+    return PurePosixPath("/data", "media", media_folder)
+
+
+def host_media_path(storage_root: str, media_folder: str) -> PurePosixPath:
+    """The owner's own HOST path for one media type.
+
+    This is what a wiring failure may show the owner - they have never seen
+    the container's `/data` view, so `container_media_path` must never reach
+    a failure message on its own.
+    """
+    return PurePosixPath(storage_root) / "data" / "media" / media_folder
+
+
 def _safe_join(container_root: Path, relative: PurePosixPath) -> Path:
     """Join `relative` onto `container_root`, proving the result lands inside it.
 

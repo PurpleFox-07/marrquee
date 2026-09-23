@@ -36,6 +36,8 @@ from marrquee.main import create_app
 from marrquee.routes.api import _event_stream
 from marrquee.state import InstallState, load_state, save_state, write_json_atomic
 from marrquee.storage import write_marker
+from marrquee.wiring import NoWiringYet, WiringStep
+from marrquee.wiring.engine import WiringEngine
 from marrquee.words import PHASE_HEADLINE_READY, REFUSAL_NOTHING_CHOSEN, STORAGE_CHECK_OK_MESSAGE
 
 # --- Shared fixtures and small builders --------------------------------------
@@ -546,3 +548,96 @@ def test_create_app_keeps_working_with_only_settings_and_engine_supplied(tmp_pat
 
     assert client.get("/healthz").status_code == 200
     assert client.get("/api/deploy").status_code == 200
+
+
+# --- The live app wires for real; a bare DeployManager does not ---------------
+
+
+def test_create_app_wires_for_real_but_a_bare_deploy_manager_does_not(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+
+    app = create_app(settings=settings, engine=FakeDockerEngine(DockerStatus(connected=True)))
+
+    # No deploy is ever started here, so this never touches the network -
+    # it only proves which runner `create_app` wired in.
+    assert isinstance(app.state.deploy._wiring, WiringEngine)
+    assert isinstance(_idle_manager(settings)._wiring, NoWiringYet)
+
+
+class _PausingWiringRunner:
+    """Emits one running frame, waits briefly (real time, so a client
+    polling `GET /api/deploy` over the wire can observe it), then finishes.
+    """
+
+    async def run(self, state: InstallState, emit: object) -> None:
+        step = WiringStep(
+            index=1,
+            total=1,
+            key="app-sync:sonarr",
+            line="Introducing Prowlarr to Sonarr",
+            state="running",
+            chip="Connecting…",
+            note=None,
+            technical=None,
+        )
+        emit(step)  # type: ignore[operator]
+        await asyncio.sleep(0.2)
+        emit(  # type: ignore[operator]
+            dataclasses.replace(
+                step,
+                state="done",
+                chip="Connected",
+                note="Already connected - nothing to change.",
+            )
+        )
+
+
+def test_get_deploy_mid_wiring_shows_the_rows_so_far(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+    install = _install_state(("prowlarr", "sonarr"), root)
+    save_state(settings.config_dir, install)
+    # Marks both apps as already ours, so the name-clash check (which would
+    # otherwise see the pre-seeded "already running" containers below as
+    # somebody else's) skips straight past them.
+    write_marker(settings, root, ("prowlarr", "sonarr"), install.puid, install.pgid)
+
+    engine = FakeDockerEngine(
+        DockerStatus(connected=True),
+        containers={
+            "prowlarr": _running_container("prowlarr"),
+            "sonarr": _running_container("sonarr"),
+        },
+        images={get_app("prowlarr").image, get_app("sonarr").image},
+        network_exists=True,
+        self_container_id="marrquee",
+    )
+    manager = DeployManager(
+        settings, engine, probe=FakeReadinessProbe(default=True), wiring=_PausingWiringRunner()
+    )
+    app = create_app(
+        settings=settings, engine=FakeDockerEngine(DockerStatus(connected=True)), manager=manager
+    )
+
+    # `with` keeps one portal (one event loop) alive across every request in
+    # this block - a plain `TestClient(app)` spins up a fresh one per call,
+    # which would orphan the manager's background task between polls instead
+    # of letting it keep progressing on real wall-clock time.
+    with TestClient(app) as client:
+        client.post("/api/deploy")
+
+        seen_running_row = False
+        final_phase = None
+        for _ in range(500):
+            body = client.get("/api/deploy").json()
+            final_phase = body["phase"]
+            if final_phase == "wiring" and body["wiring"]:
+                seen_running_row = True
+                assert body["wiring"][0]["state"] == "running"
+            if final_phase == "finale":
+                break
+            time.sleep(0.01)
+
+    assert seen_running_row
+    assert final_phase == "finale"
+    assert final_phase == "finale"

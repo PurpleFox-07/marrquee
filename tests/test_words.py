@@ -12,7 +12,7 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-from marrquee import deploy, words
+from marrquee import catalog, deploy, words
 
 _SRC_DIR = Path(__file__).resolve().parent.parent / "src" / "marrquee"
 
@@ -95,9 +95,27 @@ _EXPECTED_INVENTORY = (
     "WIZARD_TIMEZONE_HINT",
     "WIZARD_TIMEZONE_UTC",
     "TIMEZONE_REGION_LABELS",
+    "wiring_line_app_sync",
+    "wiring_line_root_folder",
+    "MEDIA_FOLDER_LABEL",
+    "WIRING_CHIP_RUNNING",
+    "WIRING_CHIP_DONE",
+    "WIRING_CHIP_SKIPPED",
+    "WIRING_CHIP_ERROR",
+    "WIRING_NOTE_ALREADY_CONNECTED",
+    "WIRING_NOTHING_TO_CONNECT",
+    "wiring_skip_no_prowlarr",
+    "WIRING_SKIP_PROWLARR_ALONE",
+    "wiring_note_still_waking",
+    "wiring_failure_unreachable",
+    "wiring_failure_refused",
+    "wiring_failure_folder",
+    "wiring_failure_prowlarr_too_old",
+    "wiring_finale_note",
 )
 
 _DEPLOY_ENGINE_WORD_COUNT = 40
+_WIZARD_WORD_COUNT = 35
 
 
 def test_words_inventory_is_pinned() -> None:
@@ -222,14 +240,20 @@ def test_storage_check_message_and_the_deploy_refusal_map_both_handle_not_shared
     assert "/mnt/storage" in deploy._STORAGE_REFUSAL_WORDS["not_shared"]("/mnt/storage")
 
 
-def test_the_words_inventory_is_the_deploy_engine_names_followed_by_the_wizard_names() -> None:
+def test_the_words_inventory_is_deploy_names_then_wizard_names_then_wiring_names() -> None:
+    wizard_end = _DEPLOY_ENGINE_WORD_COUNT + _WIZARD_WORD_COUNT
+
     deploy_names = words.WORDS_INVENTORY[:_DEPLOY_ENGINE_WORD_COUNT]
-    wizard_names = words.WORDS_INVENTORY[_DEPLOY_ENGINE_WORD_COUNT:]
+    wizard_names = words.WORDS_INVENTORY[_DEPLOY_ENGINE_WORD_COUNT:wizard_end]
+    wiring_names = words.WORDS_INVENTORY[wizard_end:]
 
     assert deploy_names == _EXPECTED_INVENTORY[:_DEPLOY_ENGINE_WORD_COUNT]
-    assert wizard_names == _EXPECTED_INVENTORY[_DEPLOY_ENGINE_WORD_COUNT:]
+    assert wizard_names == _EXPECTED_INVENTORY[_DEPLOY_ENGINE_WORD_COUNT:wizard_end]
+    assert wiring_names == _EXPECTED_INVENTORY[wizard_end:]
     assert "WIZARD_TITLE_APPS" not in deploy_names
     assert "refusal_not_shared" in deploy_names
+    assert "wiring_line_app_sync" not in deploy_names
+    assert "wiring_line_app_sync" not in wizard_names
 
 
 def test_wizard_headline_tuples_carry_the_gradient_word_in_the_middle() -> None:
@@ -364,8 +388,13 @@ def _sentence_shaped_literals(source: str, filename: str) -> list[str]:
 
 
 def test_no_user_facing_sentence_lives_outside_words_py() -> None:
+    # Top-level modules plus `wiring/*.py` - not a recursive glob. A
+    # recursive scan would also fail on `routes/alive.py`, which is a
+    # pre-existing, separately-flagged gap this test does not own.
+    scanned_paths = [*sorted(_SRC_DIR.glob("*.py")), *sorted((_SRC_DIR / "wiring").glob("*.py"))]
+
     offenders_by_file: dict[str, list[str]] = {}
-    for path in sorted(_SRC_DIR.glob("*.py")):
+    for path in scanned_paths:
         if path.name == "words.py":
             continue
         found = _sentence_shaped_literals(path.read_text(), filename=str(path))
@@ -373,3 +402,88 @@ def test_no_user_facing_sentence_lives_outside_words_py() -> None:
             offenders_by_file[path.name] = found
 
     assert offenders_by_file == {}
+
+
+def test_wiring_line_functions_match_content_direction() -> None:
+    assert words.wiring_line_app_sync("Prowlarr", "Sonarr") == "Introducing Prowlarr to Sonarr"
+    assert (
+        words.wiring_line_root_folder("Sonarr", "TV shows")
+        == "Telling Sonarr where your TV shows live"
+    )
+    assert (
+        words.wiring_line_root_folder("Radarr", "movies") == "Telling Radarr where your movies live"
+    )
+
+
+def test_wiring_note_already_connected_matches_content_direction() -> None:
+    assert words.WIRING_NOTE_ALREADY_CONNECTED == "Already connected - nothing to change."
+
+
+def test_wiring_chips_are_chosen_purely_from_state() -> None:
+    assert words.WIRING_CHIP_RUNNING == "Connecting…"
+    assert words.WIRING_CHIP_DONE == "Connected"
+    assert words.WIRING_CHIP_SKIPPED == "Nothing to do"
+    assert words.WIRING_CHIP_ERROR == "Couldn't connect"
+    chips = {
+        words.WIRING_CHIP_RUNNING,
+        words.WIRING_CHIP_DONE,
+        words.WIRING_CHIP_SKIPPED,
+        words.WIRING_CHIP_ERROR,
+    }
+    assert len(chips) == 4
+
+
+def test_wiring_plan_level_skip_words_match_content_direction() -> None:
+    assert words.WIRING_NOTHING_TO_CONNECT == "Nothing to connect this time."
+    assert "Sonarr" in words.wiring_skip_no_prowlarr("Sonarr")
+    assert "Prowlarr" in words.wiring_skip_no_prowlarr("Sonarr")
+    assert "Sonarr or Radarr" in words.WIRING_SKIP_PROWLARR_ALONE
+
+
+def test_wiring_note_still_waking_names_the_app() -> None:
+    assert words.wiring_note_still_waking("Sonarr") == (
+        "Sonarr is still waking up - Marrquee is waiting for it."
+    )
+
+
+def test_wiring_failure_functions_carry_the_apps_own_name() -> None:
+    assert "Sonarr" in words.wiring_failure_unreachable("Sonarr")
+    assert "Sonarr" in words.wiring_failure_refused("Sonarr")
+    assert "Diagnostics" in words.wiring_failure_refused("Sonarr")
+    assert "last-failure.txt" not in words.wiring_failure_refused("Sonarr")
+    assert "Sonarr" in words.wiring_failure_prowlarr_too_old("Sonarr")
+
+
+def test_wiring_failure_folder_names_the_owners_host_path_only() -> None:
+    message = words.wiring_failure_folder("Sonarr", "/volume1/media/data/media/tv")
+
+    assert "/volume1/media/data/media/tv" in message
+    assert "Sonarr" in message
+
+
+def test_wiring_finale_note_names_every_failed_step_and_never_a_count() -> None:
+    one = words.wiring_finale_note(("Introducing Prowlarr to Sonarr",))
+    assert one == (
+        "Your apps are all running. One connection didn't finish: "
+        "Introducing Prowlarr to Sonarr. Press Deploy again to retry - it's safe to repeat."
+    )
+    assert not any(char.isdigit() for char in one)
+
+    two = words.wiring_finale_note(
+        ("Introducing Prowlarr to Sonarr", "Introducing Prowlarr to Radarr")
+    )
+    assert two == (
+        "Your apps are all running. These connections didn't finish: "
+        "Introducing Prowlarr to Sonarr, Introducing Prowlarr to Radarr. "
+        "Press Deploy again to retry - it's safe to repeat."
+    )
+    assert not any(char.isdigit() for char in two)
+    assert "Introducing Prowlarr to Sonarr" in two
+    assert "Introducing Prowlarr to Radarr" in two
+
+
+def test_every_media_folder_has_a_label() -> None:
+    used = {media for app in catalog.CATALOG for media in app.media_folders}
+
+    assert used
+    assert used <= set(words.MEDIA_FOLDER_LABEL.keys())

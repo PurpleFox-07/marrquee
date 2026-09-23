@@ -396,6 +396,78 @@ jobs:
           test -f "$root/marrquee/compose.yaml"
           test -f "$root/marrquee/marrquee-root.json"
 
+      # This is the proof the whole story exists for: adding an application
+      # in Prowlarr is a live, two-directional connection test (both
+      # containers really do have to see each other, or Prowlarr refuses to
+      # save it) - so a passing assertion here means the apps are genuinely
+      # wired together, not just that a setting was written somewhere.
+      - name: Assert Prowlarr, Sonarr and Radarr are wired together
+        run: |
+          compose_file="$RUNNER_TEMP/marrquee-smoke/media/marrquee/compose.yaml"
+          prowlarr_key=$(grep -E '^\s*PROWLARR__AUTH__APIKEY:' "$compose_file" | sed -E 's/.*: *"([^"]+)".*/\1/')
+          sonarr_key=$(grep -E '^\s*SONARR__AUTH__APIKEY:' "$compose_file" | sed -E 's/.*: *"([^"]+)".*/\1/')
+          radarr_key=$(grep -E '^\s*RADARR__AUTH__APIKEY:' "$compose_file" | sed -E 's/.*: *"([^"]+)".*/\1/')
+          if [ -z "$prowlarr_key" ] || [ -z "$sonarr_key" ] || [ -z "$radarr_key" ]; then
+            echo "::error::could not read every app's API key out of the compose file"
+            exit 1
+          fi
+
+          applications=$(curl -fsS -H "X-Api-Key: ${prowlarr_key}" http://127.0.0.1:9696/api/v1/applications)
+          echo "$applications" | jq -e 'length == 2' > /dev/null
+          echo "$applications" | jq -e '[.[].implementation] | sort == ["Radarr", "Sonarr"]' > /dev/null
+          echo "$applications" | jq -e '[.[].syncLevel] | all(. == "fullSync")' > /dev/null
+
+          curl -fsS -H "X-Api-Key: ${sonarr_key}" http://127.0.0.1:8989/api/v3/rootfolder \
+            | jq -e '[.[].path] | any(endswith("/data/media/tv"))' > /dev/null
+          curl -fsS -H "X-Api-Key: ${radarr_key}" http://127.0.0.1:7878/api/v3/rootfolder \
+            | jq -e '[.[].path] | any(endswith("/data/media/movies"))' > /dev/null
+
+          curl -fsS http://127.0.0.1:7788/api/deploy \
+            | jq -e '[.wiring[].state] | length > 0 and all(. == "done")' > /dev/null
+
+      # "Twice is safe" only really means something proven against real
+      # containers and a real Prowlarr database - re-running the whole
+      # deploy must change nothing an owner could ever observe.
+      - name: Deploy a second time to prove nothing changes
+        run: curl -fsS -X POST http://127.0.0.1:7788/api/deploy
+
+      - name: Poll GET /api/deploy until the second deploy reaches finale
+        run: |
+          for _ in $(seq 1 60); do
+            body=$(curl -fsS http://127.0.0.1:7788/api/deploy)
+            phase=$(echo "$body" | jq -r '.phase')
+            echo "second deploy phase: $phase"
+            if [ "$phase" = "finale" ]; then
+              exit 0
+            fi
+            if [ "$phase" = "error" ]; then
+              code=$(echo "$body" | jq -r '.failure.code // "unknown"')
+              headline=$(echo "$body" | jq -r '.headline // "the deploy reported an error"')
+              MESSAGE="the second deploy reached error (${code}): ${headline}" \
+                python3 -c "import os; text = os.environ['MESSAGE'].replace('%', '%25').replace(chr(13), '%0D').replace(chr(10), '%0A').replace('::', ': :'); print('::error::' + text)"
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "::error::the second deploy never reached finale in time"
+          exit 1
+
+      - name: Assert the second deploy changed nothing observable
+        run: |
+          compose_file="$RUNNER_TEMP/marrquee-smoke/media/marrquee/compose.yaml"
+          prowlarr_key=$(grep -E '^\s*PROWLARR__AUTH__APIKEY:' "$compose_file" | sed -E 's/.*: *"([^"]+)".*/\1/')
+          sonarr_key=$(grep -E '^\s*SONARR__AUTH__APIKEY:' "$compose_file" | sed -E 's/.*: *"([^"]+)".*/\1/')
+          radarr_key=$(grep -E '^\s*RADARR__AUTH__APIKEY:' "$compose_file" | sed -E 's/.*: *"([^"]+)".*/\1/')
+
+          curl -fsS -H "X-Api-Key: ${prowlarr_key}" http://127.0.0.1:9696/api/v1/applications \
+            | jq -e 'length == 2' > /dev/null
+          curl -fsS -H "X-Api-Key: ${sonarr_key}" http://127.0.0.1:8989/api/v3/rootfolder \
+            | jq -e 'length == 1' > /dev/null
+          curl -fsS -H "X-Api-Key: ${radarr_key}" http://127.0.0.1:7878/api/v3/rootfolder \
+            | jq -e 'length == 1' > /dev/null
+          curl -fsS http://127.0.0.1:7788/api/deploy \
+            | jq -e '[.wiring[].state] | length > 0 and all(. == "done")' > /dev/null
+
       # The one place technical detail is allowed to show up, and exactly
       # where a first-time developer needs it: a red run here is debuggable
       # from the workflow's own log, not just "it failed". The same text
