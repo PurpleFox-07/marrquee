@@ -785,9 +785,9 @@ HUB_DOCKER_BANNER = (
     "are running. The buttons below still open your apps."
 )
 HUB_PROXY_BANNER = (
-    "You opened Marrquee at an address that isn't your NAS's own. These "
-    "buttons use that same address with each app's own port, which may not "
-    "work."
+    "You opened Marrquee at an address that isn't your NAS's own. The "
+    "buttons for Marrquee's apps use that same address with each app's own "
+    "port, which may not work. Your own links aren't affected."
 )
 HUB_STALE_NOTE = "Marrquee couldn't check just now. Reload this page to see the latest."
 HUB_NOSCRIPT_NOTE = (
@@ -864,6 +864,130 @@ _HUB_WORDS: tuple[str, ...] = (
 # end Hub section
 # =============================================================================
 
+# =============================================================================
+# Hub: your own links
+# =============================================================================
+
+# --- Link form refusals - one sentence per marrquee.links.LinkProblem --------
+LINK_PROBLEM_LABEL_MISSING = "Give this link a name, so you know which card is which."
+LINK_PROBLEM_LABEL_TOO_LONG = "Keep the name to 40 characters or fewer."
+LINK_PROBLEM_URL_MISSING = "Enter the address this card should open."
+LINK_PROBLEM_URL_TOO_LONG = "That address is too long."
+LINK_PROBLEM_URL_NOT_WEB = "Marrquee can only open web addresses (http:// or https://)."
+LINK_PROBLEM_URL_HAS_LOGIN = (
+    "Leave the username and password out - the site will ask for them when you open it."
+)
+LINK_PROBLEM_URL_INVALID = (
+    "That doesn't look like an address. Try something like 192.168.1.20:8123 "
+    "or https://example.com."
+)
+LINK_PROBLEM_TOO_MANY = "You already have 50 links - remove one to add another."
+
+_LINK_PROBLEM_MESSAGES: dict[str, str] = {
+    "label_missing": LINK_PROBLEM_LABEL_MISSING,
+    "label_too_long": LINK_PROBLEM_LABEL_TOO_LONG,
+    "url_missing": LINK_PROBLEM_URL_MISSING,
+    "url_too_long": LINK_PROBLEM_URL_TOO_LONG,
+    "url_not_web": LINK_PROBLEM_URL_NOT_WEB,
+    "url_has_login": LINK_PROBLEM_URL_HAS_LOGIN,
+    "url_invalid": LINK_PROBLEM_URL_INVALID,
+    "too_many": LINK_PROBLEM_TOO_MANY,
+}
+
+
+def link_problem_message(problem: str) -> str:
+    return _LINK_PROBLEM_MESSAGES[problem]
+
+
+# --- Link card status - Marrquee checks from inside its own container, so ---
+# "down" here is a hint about reachability, never a verdict that the site
+# itself is broken.
+HUB_LINK_LINE_DOWN = "Marrquee can't reach this from the NAS - it may still work from your device."
+
+# --- Live region - links get their own sentence, counted apart from apps ----
+HUB_LINKS_ALL_UP = "All your links are up."
+
+
+def hub_links_some_down(down: int, total: int) -> str:
+    verb = "is" if down == 1 else "are"
+    return f"{down} of {total} links {verb} down."
+
+
+# --- The "+" panel - two choices, then the install pane and the link form ----
+HUB_PLUS_ARIA = "Add an app or a link"
+HUB_PANEL_TITLE = "Add to your Hub"
+HUB_PANEL_CLOSE = "Close"
+HUB_PANEL_BACK = "Back"
+
+HUB_PANEL_CHOOSE_INSTALL_TITLE = "Install an app"
+HUB_PANEL_CHOOSE_INSTALL_ONE_LINER = "Add one of Marrquee's own apps."
+HUB_PANEL_CHOOSE_LINK_TITLE = "Add a link"
+HUB_PANEL_CHOOSE_LINK_ONE_LINER = (
+    "Add a card for another Docker app, an IP address or any web shortcut."
+)
+
+# A partial install (the wizard allows choosing only some apps) makes "you
+# already have everything" untrue, so the install pane has to pick between
+# these two sentences rather than always showing one fixed line.
+HUB_INSTALL_ALL_DONE = "Everything Marrquee offers is already installed."
+HUB_INSTALL_ARRIVING = "Installing these from your Hub arrives in the next Marrquee update."
+
+HUB_LINK_LABEL_FIELD = "Name on the card"
+HUB_LINK_LABEL_HINT = "Shown under the card's glyph, the same way the apps above it are."
+HUB_LINK_URL_FIELD = "Address"
+HUB_LINK_URL_HINT = "A web address, or an IP address like 192.168.1.20:8123."
+HUB_LINK_ADD_SUBMIT = "Add to my Hub"
+HUB_LINK_SAVE_SUBMIT = "Save changes"
+HUB_LINK_REMOVE_SUBMIT = "Remove this link"
+HUB_LINK_REMOVE_NOTE = (
+    "Removing a link only takes the card off your Hub - it doesn't uninstall or change anything."
+)
+HUB_LINK_EDIT_LABEL = "Edit"
+
+
+def hub_link_edit_aria(label: str) -> str:
+    return f"Edit {label}"
+
+
+_HUB_LINK_WORDS: tuple[str, ...] = (
+    "LINK_PROBLEM_LABEL_MISSING",
+    "LINK_PROBLEM_LABEL_TOO_LONG",
+    "LINK_PROBLEM_URL_MISSING",
+    "LINK_PROBLEM_URL_TOO_LONG",
+    "LINK_PROBLEM_URL_NOT_WEB",
+    "LINK_PROBLEM_URL_HAS_LOGIN",
+    "LINK_PROBLEM_URL_INVALID",
+    "LINK_PROBLEM_TOO_MANY",
+    "link_problem_message",
+    "HUB_LINK_LINE_DOWN",
+    "HUB_LINKS_ALL_UP",
+    "hub_links_some_down",
+    "HUB_PLUS_ARIA",
+    "HUB_PANEL_TITLE",
+    "HUB_PANEL_CLOSE",
+    "HUB_PANEL_BACK",
+    "HUB_PANEL_CHOOSE_INSTALL_TITLE",
+    "HUB_PANEL_CHOOSE_INSTALL_ONE_LINER",
+    "HUB_PANEL_CHOOSE_LINK_TITLE",
+    "HUB_PANEL_CHOOSE_LINK_ONE_LINER",
+    "HUB_INSTALL_ALL_DONE",
+    "HUB_INSTALL_ARRIVING",
+    "HUB_LINK_LABEL_FIELD",
+    "HUB_LINK_LABEL_HINT",
+    "HUB_LINK_URL_FIELD",
+    "HUB_LINK_URL_HINT",
+    "HUB_LINK_ADD_SUBMIT",
+    "HUB_LINK_SAVE_SUBMIT",
+    "HUB_LINK_REMOVE_SUBMIT",
+    "HUB_LINK_REMOVE_NOTE",
+    "HUB_LINK_EDIT_LABEL",
+    "hub_link_edit_aria",
+)
+
+# =============================================================================
+# end Hub: your own links section
+# =============================================================================
+
 # The full review surface: every public name above, in one tuple. A later
 # feature area adds its own fenced section above this line, then extends
 # this tuple with its own `_..._WORDS` name - never editing an earlier
@@ -874,4 +998,5 @@ WORDS_INVENTORY: tuple[str, ...] = (
     *_WIRING_WORDS,
     *_DEPLOY_SCREEN_WORDS,
     *_HUB_WORDS,
+    *_HUB_LINK_WORDS,
 )

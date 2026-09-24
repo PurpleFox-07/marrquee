@@ -26,6 +26,8 @@ from marrquee.catalog import apps_in_order
 from marrquee.config import Settings
 from marrquee.deploy import AppProgress, DeploySnapshot, Failure
 from marrquee.docker_client import ContainerSnapshot, DockerStatus, FakeDockerEngine
+from marrquee.health import FakeLinkProbe
+from marrquee.links import LINK_COUNT_MAX, LinkCard, load_links, save_links
 from marrquee.main import create_app
 from marrquee.routes.wizard import router as wizard_router
 from marrquee.state import STATE_VERSION, InstallState, save_state, write_json_atomic
@@ -83,10 +85,17 @@ def _write_snapshot(settings: Settings, snapshot: DeploySnapshot) -> None:
     write_json_atomic(settings.config_dir / "deploy.json", dataclasses.asdict(snapshot))
 
 
-def _client(settings: Settings, engine: FakeDockerEngine | None = None) -> TestClient:
+def _client(
+    settings: Settings,
+    engine: FakeDockerEngine | None = None,
+    *,
+    link_probe: FakeLinkProbe | None = None,
+) -> TestClient:
     if engine is None:
         engine = FakeDockerEngine(DockerStatus(connected=True, version="27.3.1"))
-    app = create_app(settings=settings, engine=engine)
+    if link_probe is None:
+        link_probe = FakeLinkProbe()
+    app = create_app(settings=settings, engine=engine, link_probe=link_probe)
     return TestClient(app)
 
 
@@ -138,6 +147,108 @@ def _root(page_html: str) -> dict[str, str | None]:
     collector = _RootCollector()
     collector.feed(page_html)
     return collector.attrs
+
+
+def _link(link_id: str, label: str, url: str) -> LinkCard:
+    return LinkCard(id=link_id, label=label, url=url)
+
+
+class _LinkCollector(HTMLParser):
+    """Collects every link card `<a data-link="...">`'s own attributes,
+    keyed by link id - mirrors `_PosterCollector` for app posters.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.links: dict[str, dict[str, str | None]] = {}
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attrs_dict = dict(attrs)
+        link_id = attrs_dict.get("data-link")
+        if tag == "a" and link_id is not None:
+            self.links[link_id] = attrs_dict
+
+
+def _links(page_html: str) -> dict[str, dict[str, str | None]]:
+    collector = _LinkCollector()
+    collector.feed(page_html)
+    return collector.links
+
+
+class _GridOrderCollector(HTMLParser):
+    """Collects `data-app`/`data-link` values (and `"+"` for the "+" tile)
+    in the order they appear in the poster grid, proving apps are drawn
+    before link cards, which are drawn before the "+" tile.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.order: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag != "a":
+            return
+        attrs_dict = dict(attrs)
+        value = attrs_dict.get("data-app") or attrs_dict.get("data-link")
+        if value is not None:
+            self.order.append(value)
+        elif "hub-plus" in (attrs_dict.get("class") or "").split():
+            self.order.append("+")
+
+
+def _grid_order(page_html: str) -> list[str]:
+    collector = _GridOrderCollector()
+    collector.feed(page_html)
+    return collector.order
+
+
+class _DialogCollector(HTMLParser):
+    """Collects the page's own `<dialog data-role="hub-panel">` attributes."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.attrs: dict[str, str | None] = {}
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "dialog" and not self.attrs:
+            self.attrs = dict(attrs)
+
+
+def _dialog(page_html: str) -> dict[str, str | None]:
+    collector = _DialogCollector()
+    collector.feed(page_html)
+    return collector.attrs
+
+
+class _AnchorNestingCollector(HTMLParser):
+    """Walks every start/end tag, and fails the moment an `<a class="…
+    hub-link-edit …">` opens while another `<a>` is still open around it -
+    the one shape HTML forbids (nested interactive content) and the one
+    the Edit pill's markup must never take.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.open_anchors = 0
+        self.nested_edit_pill = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag != "a":
+            return
+        classes = (dict(attrs).get("class") or "").split()
+        if "hub-link-edit" in classes and self.open_anchors > 0:
+            self.nested_edit_pill = True
+        self.open_anchors += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "a" and self.open_anchors > 0:
+            self.open_anchors -= 1
+
+
+def _every_edit_pill_is_a_sibling(page_html: str) -> bool:
+    collector = _AnchorNestingCollector()
+    collector.feed(page_html)
+    return not collector.nested_edit_pill
 
 
 # --- GET /: the front door ----------------------------------------------------
@@ -508,3 +619,352 @@ def test_the_status_endpoints_json_has_no_detail_field_anywhere(tmp_path: Path) 
     assert response.status_code == 200
     assert "detail" not in response.text
     assert "connection refused" not in response.text
+
+
+# --- Link cards: saved, checked, and drawn the same way on the page and the poll -
+
+
+def test_a_saved_link_renders_as_a_card_after_the_apps(tmp_path: Path) -> None:
+    """FIRST TEST - a link saved to links.json shows up as its own card,
+    checked by the injected `FakeLinkProbe` rather than the network, and
+    drawn after the app posters.
+    """
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    _write_snapshot(settings, _finale_snapshot(("sonarr",)))
+    save_links(settings.config_dir, [_link("a" * 16, "Router", "http://192.168.1.1")])
+    engine = FakeDockerEngine(
+        DockerStatus(connected=True, version="27.3.1"),
+        containers=_running_containers(("sonarr",)),
+    )
+    client = _client(settings, engine)
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert _grid_order(response.text) == ["sonarr", "a" * 16, "+"]
+    link = _links(response.text)["a" * 16]
+    assert link["href"] == "http://192.168.1.1"
+    assert link["data-state"] == "up"
+
+
+def test_a_down_link_card_keeps_its_href_and_says_the_hedged_line(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    _write_snapshot(settings, _finale_snapshot(("sonarr",)))
+    save_links(settings.config_dir, [_link("b" * 16, "Router", "http://192.168.1.1")])
+    client = _client(settings, link_probe=FakeLinkProbe(default=False))
+
+    response = client.get("/")
+
+    link = _links(response.text)["b" * 16]
+    assert link["href"] == "http://192.168.1.1"
+    assert link["data-state"] == "down"
+    # Jinja autoescapes `'`, and HUB_LINK_LINE_DOWN carries one.
+    assert words.HUB_LINK_LINE_DOWN.replace("'", "&#39;") in response.text
+
+
+def test_page_and_status_agree_on_link_cards(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    _write_snapshot(settings, _finale_snapshot(("sonarr",)))
+    save_links(settings.config_dir, [_link("c" * 16, "Router", "http://192.168.1.1")])
+    client = _client(settings, link_probe=FakeLinkProbe(default=False))
+
+    page = client.get("/")
+    status = client.get("/api/hub/status")
+
+    assert status.status_code == 200
+    payload = status.json()
+    assert len(payload["links"]) == 1
+    link_out = payload["links"][0]
+    assert link_out["chip"] in page.text
+    # Jinja autoescapes `'`, and the hedged line carries one.
+    assert link_out["line"].replace("'", "&#39;") in page.text
+
+
+def test_a_broken_links_json_still_renders_the_hub_with_200_and_no_link_cards(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    _write_snapshot(settings, _finale_snapshot(("sonarr",)))
+    (settings.config_dir / "links.json").write_text("not json")
+    client = _client(settings)
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert _links(response.text) == {}
+
+
+def test_the_status_endpoint_carries_links_empty_with_no_links_json(tmp_path: Path) -> None:
+    client = _client(_settings(tmp_path))
+
+    response = client.get("/api/hub/status")
+
+    assert response.status_code == 200
+    assert response.json()["links"] == []
+
+
+def test_no_link_probe_runs_when_there_are_no_links(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    _write_snapshot(settings, _finale_snapshot(("sonarr",)))
+    probe = FakeLinkProbe()
+    client = _client(settings, link_probe=probe)
+
+    client.get("/")
+
+    assert probe.calls == []
+
+
+# --- Writing links: "+" and Edit are real form posts, no JavaScript needed --
+
+
+def _link_id(n: int) -> str:
+    return f"{n:016x}"
+
+
+def test_posts_before_finale_save_nothing(tmp_path: Path) -> None:
+    """FIRST TEST - install.json exists but no deploy has ever reached
+    finale (no deploy.json at all), so every write route must refuse and
+    change nothing, the same guard `GET /` already applies.
+    """
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    client = _client(settings)
+
+    response = client.post(
+        "/hub/links", data={"label": "Router", "url": "192.168.1.1"}, follow_redirects=False
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/"
+    assert not (settings.config_dir / "links.json").exists()
+
+
+def test_added_link_lands_between_the_apps_and_plus(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    _write_snapshot(settings, _finale_snapshot(("sonarr",)))
+    client = _client(settings)
+
+    response = client.post(
+        "/hub/links", data={"label": "Router", "url": "192.168.1.1"}, follow_redirects=False
+    )
+    assert response.status_code == 303
+    assert response.headers["location"] == "/"
+
+    saved = load_links(settings.config_dir)
+    assert len(saved) == 1
+    assert saved[0].url == "http://192.168.1.1"
+
+    page = client.get("/")
+    assert _grid_order(page.text) == ["sonarr", saved[0].id, "+"]
+
+
+def test_a_refusal_re_renders_with_the_typed_values_and_the_panel_open_on_link(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    _write_snapshot(settings, _finale_snapshot(("sonarr",)))
+    client = _client(settings)
+
+    response = client.post("/hub/links", data={"label": "Test", "url": "ftp://x"})
+
+    assert response.status_code == 200
+    assert _dialog(response.text).get("data-panel-mode") == "link"
+    assert words.link_problem_message("url_not_web") in response.text
+    assert 'value="ftp://x"' in response.text
+    assert not (settings.config_dir / "links.json").exists()
+
+
+def test_the_51st_link_is_refused_with_too_many(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    _write_snapshot(settings, _finale_snapshot(("sonarr",)))
+    existing = [_link(_link_id(n), f"Link {n}", f"http://host{n}") for n in range(LINK_COUNT_MAX)]
+    save_links(settings.config_dir, existing)
+    client = _client(settings)
+
+    response = client.post("/hub/links", data={"label": "One too many", "url": "http://host50"})
+
+    assert response.status_code == 200
+    assert words.LINK_PROBLEM_TOO_MANY in response.text
+    assert len(load_links(settings.config_dir)) == LINK_COUNT_MAX
+
+
+def test_edit_keeps_the_cards_place_and_id(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    _write_snapshot(settings, _finale_snapshot(("sonarr",)))
+    card_a = _link(_link_id(1), "Router", "http://192.168.1.1")
+    card_b = _link(_link_id(2), "NAS", "http://192.168.1.2")
+    save_links(settings.config_dir, [card_a, card_b])
+    client = _client(settings)
+
+    response = client.post(
+        f"/hub/links/{card_a.id}",
+        data={"label": "New Name", "url": "192.168.1.99"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/"
+
+    saved = load_links(settings.config_dir)
+    assert [card.id for card in saved] == [card_a.id, card_b.id]
+    assert saved[0].label == "New Name"
+    assert saved[0].url == "http://192.168.1.99"
+
+    page = client.get("/")
+    assert _grid_order(page.text) == ["sonarr", card_a.id, card_b.id, "+"]
+
+
+def test_edit_of_an_unknown_id_changes_nothing(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    _write_snapshot(settings, _finale_snapshot(("sonarr",)))
+    card = _link(_link_id(1), "Router", "http://192.168.1.1")
+    save_links(settings.config_dir, [card])
+    client = _client(settings)
+    before = load_links(settings.config_dir)
+
+    well_formed_but_missing = client.post(
+        f"/hub/links/{_link_id(9)}",
+        data={"label": "New", "url": "http://x"},
+        follow_redirects=False,
+    )
+    malformed = client.post(
+        "/hub/links/not-a-real-id", data={"label": "New", "url": "http://x"}, follow_redirects=False
+    )
+
+    assert well_formed_but_missing.status_code == 303
+    assert well_formed_but_missing.headers["location"] == "/"
+    assert malformed.status_code == 303
+    assert malformed.headers["location"] == "/"
+    assert load_links(settings.config_dir) == before
+
+
+def test_remove_drops_only_that_card_and_leaves_install_json_byte_identical(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    _write_snapshot(settings, _finale_snapshot(("sonarr",)))
+    card_a = _link(_link_id(1), "Router", "http://192.168.1.1")
+    card_b = _link(_link_id(2), "NAS", "http://192.168.1.2")
+    save_links(settings.config_dir, [card_a, card_b])
+    install_before = (settings.config_dir / "install.json").read_bytes()
+    client = _client(settings)
+
+    response = client.post(f"/hub/links/{card_a.id}/remove", follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/"
+    assert load_links(settings.config_dir) == (card_b,)
+    assert (settings.config_dir / "install.json").read_bytes() == install_before
+
+
+def test_panel_choose_draws_the_dialog_open_with_two_choices_install_first(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    _write_snapshot(settings, _finale_snapshot(("sonarr",)))
+    client = _client(settings)
+
+    response = client.get("/?panel=choose")
+
+    dialog = _dialog(response.text)
+    assert dialog.get("data-panel-mode") == "choose"
+    assert "open" in dialog
+    assert response.text.index('data-panel-choice="install"') < response.text.index(
+        'data-panel-choice="link"'
+    )
+
+
+def test_panel_nonsense_and_edit_unknown_link_draw_it_closed(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    _write_snapshot(settings, _finale_snapshot(("sonarr",)))
+    client = _client(settings)
+
+    nonsense = client.get("/?panel=nonsense")
+    unknown_edit = client.get(f"/?panel=edit&link={_link_id(9)}")
+
+    for response in (nonsense, unknown_edit):
+        dialog = _dialog(response.text)
+        assert dialog.get("data-panel-mode") == "closed"
+        assert "open" not in dialog
+
+
+def test_install_pane_is_truthful(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("prowlarr", "sonarr", "radarr")))
+    _write_snapshot(settings, _finale_snapshot(("prowlarr", "sonarr", "radarr")))
+    all_done_client = _client(settings)
+
+    all_done = all_done_client.get("/?panel=install")
+
+    assert words.HUB_INSTALL_ALL_DONE in all_done.text
+    assert words.HUB_INSTALL_ARRIVING not in all_done.text
+
+    partial_settings = _settings(tmp_path / "partial")
+    save_state(partial_settings.config_dir, _install_state(("sonarr",)))
+    _write_snapshot(partial_settings, _finale_snapshot(("sonarr",)))
+    partial_client = _client(partial_settings)
+
+    partial = partial_client.get("/?panel=install")
+
+    assert words.HUB_INSTALL_ALL_DONE not in partial.text
+    assert words.HUB_INSTALL_ARRIVING in partial.text
+    assert "Prowlarr" in partial.text
+    assert "Radarr" in partial.text
+
+
+def test_plus_is_the_last_li_with_zero_links(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    _write_snapshot(settings, _finale_snapshot(("sonarr",)))
+    client = _client(settings)
+
+    response = client.get("/")
+
+    assert _grid_order(response.text) == ["sonarr", "+"]
+
+
+def test_every_edit_pill_is_a_sibling_of_its_card_link_never_inside_it(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    _write_snapshot(settings, _finale_snapshot(("sonarr",)))
+    save_links(settings.config_dir, [_link(_link_id(1), "Router", "http://192.168.1.1")])
+    client = _client(settings)
+
+    response = client.get("/")
+
+    assert 'class="hub-link-edit"' in response.text
+    assert _every_edit_pill_is_a_sibling(response.text)
+
+
+def test_the_edit_pane_form_actions_target_the_cards_own_id(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    _write_snapshot(settings, _finale_snapshot(("sonarr",)))
+    card = _link(_link_id(1), "Router", "http://192.168.1.1")
+    save_links(settings.config_dir, [card])
+    client = _client(settings)
+
+    response = client.get(f"/?panel=edit&link={card.id}")
+
+    assert _dialog(response.text).get("data-panel-mode") == "edit"
+    assert f'action="/hub/links/{card.id}"' in response.text
+    assert f'action="/hub/links/{card.id}/remove"' in response.text
+    assert 'data-role="edit-form"' in response.text
+    assert 'data-role="remove-form"' in response.text
+    assert 'data-role="edit-label"' in response.text
+    assert 'data-role="edit-url"' in response.text
+    assert f'value="{card.label}"' in response.text
+    assert f'value="{card.url}"' in response.text

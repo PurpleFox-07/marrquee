@@ -21,17 +21,20 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Final
+from typing import Final, Literal
 
 from marrquee.addresses import app_url
-from marrquee.catalog import CatalogApp, apps_in_order
-from marrquee.health import AppHealth, HubState
+from marrquee.catalog import CATALOG, CatalogApp, apps_in_order
+from marrquee.health import AppHealth, HubState, LinkHealth, LinkState
+from marrquee.links import LinkCard, link_address, link_glyph
 from marrquee.words import (
     HUB_ALL_UP,
     HUB_CHIP_DOWN,
     HUB_CHIP_STARTING,
     HUB_CHIP_UNKNOWN,
     HUB_CHIP_UP,
+    HUB_LINK_LINE_DOWN,
+    HUB_LINKS_ALL_UP,
     HUB_NOTHING_SET_UP,
     hub_line_down,
     hub_line_down_last_seen,
@@ -39,6 +42,7 @@ from marrquee.words import (
     hub_line_no_address,
     hub_line_starting,
     hub_line_unknown,
+    hub_links_some_down,
     hub_open_app_aria,
     hub_some_up,
     relative_time,
@@ -54,6 +58,11 @@ _CHIP_BY_STATE: dict[HubState, str] = {
     "starting": HUB_CHIP_STARTING,
     "down": HUB_CHIP_DOWN,
     "unknown": HUB_CHIP_UNKNOWN,
+}
+
+_LINK_CHIP_BY_STATE: dict[LinkState, str] = {
+    "up": HUB_CHIP_UP,
+    "down": HUB_CHIP_DOWN,
 }
 
 # States whose poster still gets a link: "up" obviously, and "unknown"
@@ -78,15 +87,61 @@ class HubTile:
 
 
 @dataclass(frozen=True)
+class LinkTile:
+    """One link card, exactly as the page (and the live check) should draw it.
+
+    `url` and `aria` are never `None` - unlike an app poster, a link card
+    stays clickable even when it reads Down, because Marrquee checks from
+    inside its own container and "down" here is only a hint.
+    """
+
+    link_id: str
+    glyph: str
+    label: str
+    address: str
+    url: str
+    state: LinkState
+    chip: str
+    line: str
+    aria: str
+
+
+@dataclass(frozen=True)
 class HubView:
     """Everything the Hub page draws, from one deploy's worth of apps."""
 
     tiles: tuple[HubTile, ...]
+    links: tuple[LinkTile, ...]
+    installable: tuple[CatalogApp, ...]
     announce: str
     any_down: bool
     docker_unreachable: bool
     proxied: bool
     empty: bool
+
+
+PanelMode = Literal["closed", "choose", "install", "link", "edit"]
+
+
+@dataclass(frozen=True)
+class HubPanel:
+    """What the "+" tile's panel should draw - closed by default, so a
+    plain `GET /` renders the same dialog markup either way, just without
+    its `open` attribute.
+
+    `label`/`url` are the boxes' current values: empty for `choose` and
+    `install`, the stored card's own values for a fresh `edit`, and
+    whatever the owner just typed (valid or not) after a refusal. `edit` is
+    the card being edited - its `id` is what the edit and remove forms'
+    `action` targets - and stays `None` everywhere else, including a `link`
+    refusal (a new card has no id yet).
+    """
+
+    mode: PanelMode
+    edit: LinkCard | None
+    label: str
+    url: str
+    error: str | None
 
 
 def hub_view(
@@ -96,19 +151,47 @@ def hub_view(
     authority: str | None,
     proxied: bool,
     now: datetime,
+    links: Sequence[LinkCard] = (),
+    link_healths: Sequence[LinkHealth] = (),
 ) -> HubView:
     healths_by_id = {health.app_id: health for health in healths}
     tiles = tuple(
         _tile(app, healths_by_id.get(app.id), authority=authority, now=now)
         for app in apps_in_order(app_ids)
     )
+    link_healths_by_id = {health.link_id: health for health in link_healths}
+    link_tiles = tuple(_link_tile(card, link_healths_by_id.get(card.id)) for card in links)
+    deployed_ids = set(app_ids)
+    installable = tuple(app for app in CATALOG if app.id not in deployed_ids)
     return HubView(
         tiles=tiles,
-        announce=_announce(tiles),
+        links=link_tiles,
+        installable=installable,
+        announce=_announce(tiles, link_tiles),
         any_down=any(tile.state == "down" for tile in tiles),
         docker_unreachable=bool(tiles) and all(tile.state == "unknown" for tile in tiles),
         proxied=proxied,
         empty=not tiles,
+    )
+
+
+def _link_tile(card: LinkCard, health: LinkHealth | None) -> LinkTile:
+    # A link Marrquee hasn't checked yet (no matching health reading) is
+    # honestly "down", never a silent "up" - the first render always probes
+    # before drawing a card, so this only ever fires when it genuinely
+    # hasn't been checked.
+    state: LinkState = health.state if health is not None else "down"
+    chip = _LINK_CHIP_BY_STATE[state]
+    return LinkTile(
+        link_id=card.id,
+        glyph=link_glyph(card.label),
+        label=card.label,
+        address=link_address(card.url),
+        url=card.url,
+        state=state,
+        chip=chip,
+        line="" if state == "up" else HUB_LINK_LINE_DOWN,
+        aria=hub_open_app_aria(card.label, chip),
     )
 
 
@@ -179,10 +262,43 @@ def _last_seen(finished_at: str | None, now: datetime) -> str | None:
     return relative_time((now - parsed).total_seconds())
 
 
-def _announce(tiles: tuple[HubTile, ...]) -> str:
+def _announce(tiles: tuple[HubTile, ...], link_tiles: tuple[LinkTile, ...]) -> str:
     if not tiles:
-        return HUB_NOTHING_SET_UP
-    up_count = sum(1 for tile in tiles if tile.state == "up")
-    if up_count == len(tiles):
-        return HUB_ALL_UP
-    return hub_some_up(up_count, len(tiles))
+        apps_sentence = HUB_NOTHING_SET_UP
+    else:
+        up_count = sum(1 for tile in tiles if tile.state == "up")
+        apps_sentence = HUB_ALL_UP if up_count == len(tiles) else hub_some_up(up_count, len(tiles))
+
+    if not link_tiles:
+        return apps_sentence
+
+    down_count = sum(1 for tile in link_tiles if tile.state == "down")
+    links_sentence = (
+        HUB_LINKS_ALL_UP if down_count == 0 else hub_links_some_down(down_count, len(link_tiles))
+    )
+    return f"{apps_sentence} {links_sentence}"
+
+
+_CLOSED_PANEL: Final = HubPanel(mode="closed", edit=None, label="", url="", error=None)
+
+
+def hub_panel(panel: str | None, link_id: str | None, links: Sequence[LinkCard]) -> HubPanel:
+    """The panel `GET /?panel=...&link=...` should draw.
+
+    Anything this doesn't recognise - a missing `panel`, a typo'd value, an
+    `edit` whose `link` id matches no saved card - is honestly closed,
+    never a guess. `edit` is the one mode that reads `links`: it prefills
+    the *stored* label and URL, so what the owner sees, what gets saved on
+    a plain re-submit and what the card's own `href` uses are one value.
+    """
+    if panel == "choose":
+        return HubPanel(mode="choose", edit=None, label="", url="", error=None)
+    if panel == "install":
+        return HubPanel(mode="install", edit=None, label="", url="", error=None)
+    if panel == "link":
+        return HubPanel(mode="link", edit=None, label="", url="", error=None)
+    if panel == "edit":
+        card = next((link for link in links if link.id == link_id), None)
+        if card is not None:
+            return HubPanel(mode="edit", edit=card, label=card.label, url=card.url, error=None)
+    return _CLOSED_PANEL

@@ -2,17 +2,19 @@
  * Page chrome (wrap, eyebrow, h1, the gradient accent, the lede) is reused
  * from app.css, and the poster tile's shared structure and art layer from
  * poster.css; this file only ever adds what's specific to the Hub: the
- * clickable tile, its per-state colour and motion, the status dot, and the
+ * clickable tile, its per-state colour and motion, the status dot, the
  * notes/banners that live in every page load and are shown or hidden by an
- * attribute on the root `<main>`.
+ * attribute on the root `<main>`, the "+" tile, the link card's Edit pill,
+ * and the panel `<dialog>` the "+" tile and every Edit pill open.
  *
  * Every colour, spacing, type, radius and motion value here is a CSS
  * custom property from tokens.css - never a literal. The only literals
  * allowed are structural values with no matching token: 1px (the down
- * note's border), 2px (the focus ring's width and offset),
- * translateY(-3px) (the hover lift), brightness(1.12) (the hover glow) and
- * grayscale(0.85) / brightness(0.5) (the down poster's dim, matching
- * poster.css's own waiting look).
+ * note's border), 2px (the focus ring's width and offset, and the "+"
+ * tile's dashed border width), 480px (the panel's own width cap - a plain
+ * fixed size, not a spacing rhythm), translateY(-3px) (the hover lift),
+ * brightness(1.12) (the hover glow) and grayscale(0.85) / brightness(0.5)
+ * (the down poster's dim, matching poster.css's own waiting look).
  */
 
 /* --- The poster link: a Hub tile is an <a>, not an <li> --------------------- */
@@ -150,6 +152,151 @@
   display: block;
 }
 
+/* --- The "+" tile: always the last poster, always useful ------------------
+ * Its hit area comes entirely from the padding around its glyph - never a
+ * `min-height`/`min-width` - so shrinking the glyph can never shrink the
+ * target below a comfortable tap size. */
+
+.hub-plus-item {
+  display: grid;
+  place-items: center;
+}
+
+.hub-plus {
+  display: inline-flex;
+  padding: var(--space-5);
+  border: 2px dashed var(--border-strong);
+  border-radius: var(--radius-2xl);
+  color: var(--text-secondary);
+  font-size: var(--text-3xl);
+  line-height: var(--leading-none);
+  transition:
+    color var(--transition-fast),
+    border-color var(--transition-fast);
+}
+
+.hub-plus:hover,
+.hub-plus:focus-visible {
+  color: var(--text-primary);
+  border-color: var(--border-accent);
+}
+
+.hub-plus:focus-visible,
+.hub-link-edit:focus-visible,
+.hub-panel-choice:focus-visible {
+  outline: 2px solid var(--spotlight);
+  outline-offset: 2px;
+}
+
+/* --- The Edit pill: a sibling of the card's own link, never nested in it -- */
+
+.hub-link-item {
+  position: relative;
+}
+
+.hub-link-edit {
+  position: absolute;
+  top: var(--space-2);
+  right: var(--space-2);
+  /* One layer above poster.css's own `.poster > *` children (z-index 1),
+   * so the pill always sits on top of the card's art and text. */
+  z-index: 2;
+  background: var(--scrim);
+  color: var(--text-primary);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+  border-radius: var(--radius-full);
+  padding: var(--space-1) var(--space-3);
+}
+
+/* Extends the pill's own small hit area well past its visible edges,
+ * without growing the pill itself or overlapping the card's own link. */
+.hub-link-edit::after {
+  content: "";
+  position: absolute;
+  inset: calc(var(--space-3) * -1);
+}
+
+/* A link card's light is a hint, never a lock - Marrquee checks it from
+ * inside its own container, so a Down reading must never look disabled.
+ * Same specificity as poster.css's own down-state dim; this wins by
+ * coming later in the cascade. */
+.hub-link[data-state="down"]::before {
+  filter: none;
+}
+
+/* --- The panel: one <dialog>, four panes, shown by data-panel-mode ------- */
+
+.hub-panel {
+  background: var(--background-alt);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-2xl);
+  padding: var(--space-6);
+  box-shadow: var(--shadow-xl);
+  color: var(--text-primary);
+  /* A solid surface, not `--surface` (50% see-through) - the poster grid
+   * must never show through the form sitting on top of it. */
+  width: min(calc(100% - var(--space-8)), 480px);
+}
+
+.hub-panel::backdrop {
+  background: var(--scrim);
+}
+
+[data-panel-pane] {
+  display: none;
+}
+
+.hub-panel[data-panel-mode="choose"] [data-panel-pane="choose"],
+.hub-panel[data-panel-mode="install"] [data-panel-pane="install"],
+.hub-panel[data-panel-mode="link"] [data-panel-pane="link"],
+.hub-panel[data-panel-mode="edit"] [data-panel-pane="edit"] {
+  display: block;
+}
+
+.hub-panel-choice {
+  display: block;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-4);
+  color: inherit;
+  text-decoration: none;
+  transition: border-color var(--transition-fast);
+}
+
+.hub-panel-choice:hover {
+  border-color: var(--border-accent);
+}
+
+.hub-panel-choice__title {
+  display: block;
+  font-size: var(--text-base);
+  font-weight: var(--weight-bold);
+  color: var(--text-primary);
+}
+
+.hub-panel-choice__note {
+  display: block;
+  margin-top: var(--space-1);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+/* The label box holds a short name, not a path - sans, unlike the
+ * monospace `.path-input` it shares every other rule with. */
+.hub-panel input[name="label"] {
+  font-family: var(--font-sans);
+}
+
+/* Removing a link only takes its card off the Hub - the button still
+ * reads as a plain ghost action, just tinted toward the same red the
+ * refusal banner already uses for "something needs fixing". */
+[data-role="remove-form"] .btn-ghost {
+  color: var(--error);
+  border-color: var(--error);
+}
+
 /* --- Footer link: matches deploy.css's own diagnostics link, with its tap
  * target coming from padding rather than a fixed height. */
 
@@ -169,7 +316,9 @@
 
 @media (prefers-reduced-motion: reduce) {
   .hub-poster,
-  .hub-poster::before {
+  .hub-poster::before,
+  .hub-plus,
+  .hub-panel-choice {
     transition: none;
   }
 

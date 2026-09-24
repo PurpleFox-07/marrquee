@@ -18,6 +18,7 @@ from fastapi.templating import Jinja2Templates
 from marrquee.config import Settings
 from marrquee.deploy import DeployManager, HttpReadinessProbe, ReadinessProbe
 from marrquee.docker_client import DockerEngine, SocketDockerEngine
+from marrquee.health import HttpLinkProbe, LinkProbe
 from marrquee.routes.alive import router as alive_router
 from marrquee.routes.api import router as api_router
 from marrquee.routes.deploy import router as deploy_router
@@ -41,6 +42,7 @@ def create_app(
     manager: DeployManager | None = None,
     probe: ReadinessProbe | None = None,
     wiring: WiringRunner | None = None,
+    link_probe: LinkProbe | None = None,
 ) -> FastAPI:
     """Build the Marrquee app.
 
@@ -53,6 +55,9 @@ def create_app(
     real `WiringEngine` here, at the one place the live app is assembled -
     `DeployManager`'s own default stays the do-nothing `NoWiringYet`, so a
     test that builds a `DeployManager` directly never touches the network.
+    `link_probe=None` builds a real `HttpLinkProbe`, the same pattern as
+    `probe` - a Hub test passes a `FakeLinkProbe` so no test ever reaches
+    the network to check a link card.
 
     On startup, the built app re-enters any deploy that was still running
     when Marrquee last stopped - every step downstream is idempotent, so
@@ -69,6 +74,8 @@ def create_app(
             probe=probe if probe is not None else HttpReadinessProbe(),
             wiring=wiring if wiring is not None else WiringEngine(),
         )
+    if link_probe is None:
+        link_probe = HttpLinkProbe()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -79,6 +86,7 @@ def create_app(
     app.state.settings = settings
     app.state.docker_engine = engine
     app.state.deploy = manager
+    app.state.link_probe = link_probe
     app.state.templates = Jinja2Templates(directory=_TEMPLATES_DIR)
 
     app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")

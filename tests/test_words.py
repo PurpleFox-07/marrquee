@@ -10,9 +10,10 @@ of these.
 from __future__ import annotations
 
 import ast
+import typing
 from pathlib import Path
 
-from marrquee import catalog, deploy, words
+from marrquee import catalog, deploy, links, words
 
 _SRC_DIR = Path(__file__).resolve().parent.parent / "src" / "marrquee"
 
@@ -166,12 +167,45 @@ _EXPECTED_INVENTORY = (
     "HUB_NOTHING_SET_UP",
     "HUB_DIAGNOSTICS_LINK",
     "relative_time",
+    "LINK_PROBLEM_LABEL_MISSING",
+    "LINK_PROBLEM_LABEL_TOO_LONG",
+    "LINK_PROBLEM_URL_MISSING",
+    "LINK_PROBLEM_URL_TOO_LONG",
+    "LINK_PROBLEM_URL_NOT_WEB",
+    "LINK_PROBLEM_URL_HAS_LOGIN",
+    "LINK_PROBLEM_URL_INVALID",
+    "LINK_PROBLEM_TOO_MANY",
+    "link_problem_message",
+    "HUB_LINK_LINE_DOWN",
+    "HUB_LINKS_ALL_UP",
+    "hub_links_some_down",
+    "HUB_PLUS_ARIA",
+    "HUB_PANEL_TITLE",
+    "HUB_PANEL_CLOSE",
+    "HUB_PANEL_BACK",
+    "HUB_PANEL_CHOOSE_INSTALL_TITLE",
+    "HUB_PANEL_CHOOSE_INSTALL_ONE_LINER",
+    "HUB_PANEL_CHOOSE_LINK_TITLE",
+    "HUB_PANEL_CHOOSE_LINK_ONE_LINER",
+    "HUB_INSTALL_ALL_DONE",
+    "HUB_INSTALL_ARRIVING",
+    "HUB_LINK_LABEL_FIELD",
+    "HUB_LINK_LABEL_HINT",
+    "HUB_LINK_URL_FIELD",
+    "HUB_LINK_URL_HINT",
+    "HUB_LINK_ADD_SUBMIT",
+    "HUB_LINK_SAVE_SUBMIT",
+    "HUB_LINK_REMOVE_SUBMIT",
+    "HUB_LINK_REMOVE_NOTE",
+    "HUB_LINK_EDIT_LABEL",
+    "hub_link_edit_aria",
 )
 
 _DEPLOY_ENGINE_WORD_COUNT = 40
 _WIZARD_WORD_COUNT = 35
 _WIRING_WORD_COUNT = 17
 _DEPLOY_SCREEN_WORD_COUNT = 28
+_HUB_WORD_COUNT = 26
 
 
 def test_words_inventory_is_pinned() -> None:
@@ -320,8 +354,8 @@ def test_the_words_inventory_is_deploy_names_then_wizard_names_then_wiring_names
 
 
 def test_the_hub_names_are_the_last_section() -> None:
-    """The Hub section follows the Deploy screen section, and its own slice
-    is open-ended - it's the newest section, so nothing else follows it yet.
+    """The Hub section follows the Deploy screen section - a closed slice,
+    since the Hub: your own links section now follows it.
     """
     deploy_screen_end = (
         _DEPLOY_ENGINE_WORD_COUNT
@@ -329,13 +363,35 @@ def test_the_hub_names_are_the_last_section() -> None:
         + _WIRING_WORD_COUNT
         + _DEPLOY_SCREEN_WORD_COUNT
     )
+    hub_end = deploy_screen_end + _HUB_WORD_COUNT
 
-    hub_names = words.WORDS_INVENTORY[deploy_screen_end:]
+    hub_names = words.WORDS_INVENTORY[deploy_screen_end:hub_end]
 
-    assert hub_names == _EXPECTED_INVENTORY[deploy_screen_end:]
+    assert hub_names == _EXPECTED_INVENTORY[deploy_screen_end:hub_end]
     assert hub_names[0] == "HUB_TITLE"
     assert hub_names[-1] == "relative_time"
     assert "COPY_BLOCKED" not in hub_names
+    assert "LINK_PROBLEM_TOO_MANY" not in hub_names
+
+
+def test_the_hub_links_section_is_last() -> None:
+    """Hub: your own links is the newest section, so its slice is
+    open-ended - later chunks in this story append more names to it.
+    """
+    hub_end = (
+        _DEPLOY_ENGINE_WORD_COUNT
+        + _WIZARD_WORD_COUNT
+        + _WIRING_WORD_COUNT
+        + _DEPLOY_SCREEN_WORD_COUNT
+        + _HUB_WORD_COUNT
+    )
+
+    link_names = words.WORDS_INVENTORY[hub_end:]
+
+    assert link_names == _EXPECTED_INVENTORY[hub_end:]
+    assert link_names[0] == "LINK_PROBLEM_LABEL_MISSING"
+    assert link_names[-1] == "hub_link_edit_aria"
+    assert "HUB_TITLE" not in link_names
 
 
 def test_wizard_headline_tuples_carry_the_gradient_word_in_the_middle() -> None:
@@ -661,6 +717,14 @@ def test_hub_notes_and_banners_match_content_direction() -> None:
     assert "JavaScript switched off" in words.HUB_NOSCRIPT_NOTE
 
 
+def test_the_proxy_banner_names_marrquees_apps_not_the_owners_own_links() -> None:
+    # The Down wording already hedges that Marrquee checks from inside its
+    # own container, so this banner must not also claim an odd address
+    # breaks a link card - only the app buttons share that address's port.
+    assert "Marrquee's apps" in words.HUB_PROXY_BANNER
+    assert "Your own links aren't affected." in words.HUB_PROXY_BANNER
+
+
 def test_hub_announce_words_use_the_owners_up_down_wording() -> None:
     assert words.HUB_ALL_UP == "All your apps are up."
     assert words.hub_some_up(2, 3) == "2 of 3 apps are up."
@@ -681,3 +745,62 @@ def test_relative_time_boundaries() -> None:
     assert words.relative_time(86400) == "yesterday"
     assert words.relative_time(172799) == "yesterday"
     assert words.relative_time(172800) == "2 days ago"
+
+
+def test_every_link_problem_has_a_non_empty_message() -> None:
+    for problem in typing.get_args(links.LinkProblem):
+        message = words.link_problem_message(problem)
+        assert isinstance(message, str)
+        assert message.strip()
+
+
+def test_link_problem_messages_match_content_direction() -> None:
+    assert words.LINK_PROBLEM_LABEL_MISSING == (
+        "Give this link a name, so you know which card is which."
+    )
+    assert words.LINK_PROBLEM_LABEL_TOO_LONG == "Keep the name to 40 characters or fewer."
+    assert words.LINK_PROBLEM_URL_MISSING == "Enter the address this card should open."
+    assert words.LINK_PROBLEM_URL_TOO_LONG == "That address is too long."
+    assert words.LINK_PROBLEM_URL_NOT_WEB == (
+        "Marrquee can only open web addresses (http:// or https://)."
+    )
+    assert words.LINK_PROBLEM_URL_HAS_LOGIN == (
+        "Leave the username and password out - the site will ask for them when you open it."
+    )
+    assert words.LINK_PROBLEM_URL_INVALID == (
+        "That doesn't look like an address. Try something like 192.168.1.20:8123 or "
+        "https://example.com."
+    )
+    assert words.LINK_PROBLEM_TOO_MANY == "You already have 50 links - remove one to add another."
+
+
+def test_hub_link_status_words_match_content_direction() -> None:
+    assert words.HUB_LINK_LINE_DOWN == (
+        "Marrquee can't reach this from the NAS - it may still work from your device."
+    )
+    assert words.HUB_LINKS_ALL_UP == "All your links are up."
+    assert words.hub_links_some_down(1, 2) == "1 of 2 links is down."
+    assert words.hub_links_some_down(2, 3) == "2 of 3 links are down."
+
+
+def test_the_panels_two_choices_are_install_and_link() -> None:
+    assert words.HUB_PANEL_CHOOSE_INSTALL_TITLE == "Install an app"
+    assert words.HUB_PANEL_CHOOSE_LINK_TITLE == "Add a link"
+    assert words.HUB_PLUS_ARIA
+    assert words.HUB_PANEL_TITLE
+
+
+def test_the_install_pane_has_two_truthful_states() -> None:
+    assert words.HUB_INSTALL_ALL_DONE == "Everything Marrquee offers is already installed."
+    assert "next Marrquee update" in words.HUB_INSTALL_ARRIVING
+
+
+def test_removing_a_link_uninstalls_nothing() -> None:
+    assert words.HUB_LINK_REMOVE_NOTE == (
+        "Removing a link only takes the card off your Hub - it doesn't uninstall or "
+        "change anything."
+    )
+
+
+def test_hub_link_edit_aria_names_the_card() -> None:
+    assert words.hub_link_edit_aria("Router") == "Edit Router"

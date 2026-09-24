@@ -66,3 +66,38 @@ def test_the_poster_grid_shows_no_list_bullets() -> None:
     grid_block = css.split(".poster-grid {", 1)[1].split("}", 1)[0]
     assert "list-style: none" in grid_block
     assert "padding: 0" in grid_block
+
+
+def _block_for(css: str, selector: str) -> str:
+    """The first rule block whose selector line is exactly `selector`, read
+    the same naive brace-split way as `_rule_blocks` above. A block's own
+    leading comment (if any) is dropped before splitting, since it isn't
+    part of the selector list.
+    """
+    for block in _rule_blocks(css):
+        head, _, body = block.partition("{")
+        head = head.rsplit("*/", 1)[-1]
+        if selector in {part.strip() for part in head.split(",")}:
+            return body
+    raise AssertionError(f"no {selector!r} block found")
+
+
+def test_the_plus_tiles_size_comes_from_padding_not_a_minimum() -> None:
+    body = _block_for(_HUB_CSS.read_text(), ".hub-plus")
+
+    assert "padding:" in body
+    assert "min-height" not in body
+    assert "min-width" not in body
+
+
+def test_the_edit_pills_hit_area_is_extended_with_a_negative_inset_after() -> None:
+    body = _block_for(_HUB_CSS.read_text(), ".hub-link-edit::after")
+
+    assert "inset:" in body
+    assert "-1" in body or "calc(" in body
+
+
+def test_a_down_link_card_is_never_dimmed() -> None:
+    body = _block_for(_HUB_CSS.read_text(), '.hub-link[data-state="down"]::before')
+
+    assert "filter: none" in body

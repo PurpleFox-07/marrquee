@@ -64,6 +64,48 @@
         </a>
       </li>
       {% endfor %}
+      {% for link in view.links %}
+      <li class="hub-link-item">
+        <a
+          class="poster hub-poster hub-link"
+          data-link="{{ link.link_id }}"
+          data-state="{{ link.state }}"
+          href="{{ link.url }}"
+          aria-label="{{ link.aria }}"
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          <div data-role="glyph" aria-hidden="true">{{ link.glyph }}</div>
+          <div data-role="name">{{ link.label }}</div>
+          <p data-role="desc">{{ link.address }}</p>
+          <div class="hub-status">
+            <span class="hub-dot" aria-hidden="true"></span>
+            <span>{{ words.HUB_STATUS_LABEL }}</span>
+            <span data-role="chip">{{ link.chip }}</span>
+          </div>
+          <p data-role="line">{{ link.line }}</p>
+        </a>
+        <a
+          class="hub-link-edit"
+          href="/?panel=edit&amp;link={{ link.link_id }}#hub-panel"
+          data-panel-open="edit"
+          data-link-label="{{ link.label }}"
+          data-link-url="{{ link.url }}"
+          data-edit-action="/hub/links/{{ link.link_id }}"
+          data-remove-action="/hub/links/{{ link.link_id }}/remove"
+          aria-label="{{ words.hub_link_edit_aria(link.label) }}"
+        >{{ words.HUB_LINK_EDIT_LABEL }}</a>
+      </li>
+      {% endfor %}
+      <li class="hub-plus-item">
+        <a
+          class="hub-plus"
+          href="/?panel=choose#hub-panel"
+          data-panel-open="choose"
+          aria-haspopup="dialog"
+          aria-label="{{ words.HUB_PLUS_ARIA }}"
+        ><span aria-hidden="true">+</span></a>
+      </li>
     </ul>
   </div>
 
@@ -76,5 +118,130 @@
   <noscript><p>{{ words.HUB_NOSCRIPT_NOTE }}</p></noscript>
 
   <a class="hub-footer-link" href="/diagnostics">{{ words.HUB_DIAGNOSTICS_LINK }}</a>
+
+  <dialog
+    id="hub-panel"
+    class="hub-panel"
+    data-role="hub-panel"
+    data-panel-mode="{{ panel.mode }}"
+    aria-labelledby="hub-panel-title"
+    {% if panel.mode != 'closed' %}open{% endif %}
+  >
+    <h2 id="hub-panel-title">{{ words.HUB_PANEL_TITLE }}</h2>
+    <a href="/" data-panel-close class="btn-ghost">{{ words.HUB_PANEL_CLOSE }}</a>
+
+    <div data-panel-pane="choose">
+      <a class="hub-panel-choice" href="/?panel=install#hub-panel" data-panel-choice="install">
+        <span class="hub-panel-choice__title">{{ words.HUB_PANEL_CHOOSE_INSTALL_TITLE }}</span>
+        <span class="hub-panel-choice__note">{{ words.HUB_PANEL_CHOOSE_INSTALL_ONE_LINER }}</span>
+      </a>
+      <a class="hub-panel-choice" href="/?panel=link#hub-panel" data-panel-choice="link">
+        <span class="hub-panel-choice__title">{{ words.HUB_PANEL_CHOOSE_LINK_TITLE }}</span>
+        <span class="hub-panel-choice__note">{{ words.HUB_PANEL_CHOOSE_LINK_ONE_LINER }}</span>
+      </a>
+    </div>
+
+    <div data-panel-pane="install">
+      <a class="btn-ghost" href="/?panel=choose#hub-panel" data-panel-choice="choose">{{ words.HUB_PANEL_BACK }}</a>
+      {% if view.installable %}
+      <ul>
+        {% for app in view.installable %}
+        <li>{{ app.name }}</li>
+        {% endfor %}
+      </ul>
+      <p>{{ words.HUB_INSTALL_ARRIVING }}</p>
+      {% else %}
+      <p>{{ words.HUB_INSTALL_ALL_DONE }}</p>
+      {% endif %}
+    </div>
+
+    <div data-panel-pane="link">
+      <a class="btn-ghost" href="/?panel=choose#hub-panel" data-panel-choice="choose">{{ words.HUB_PANEL_BACK }}</a>
+      {% if panel.mode == 'link' and panel.error %}
+      <div class="refusal-banner" role="alert">
+        <span class="refusal-banner__glyph" aria-hidden="true">&#10007;</span>
+        <p>{{ panel.error }}</p>
+      </div>
+      {% endif %}
+      <form method="post" action="/hub/links">
+        <label class="field-label" for="link-label">{{ words.HUB_LINK_LABEL_FIELD }}</label>
+        <input
+          class="path-input"
+          type="text"
+          id="link-label"
+          name="label"
+          maxlength="40"
+          value="{{ panel.label if panel.mode == 'link' else '' }}"
+          {% if panel.mode == 'link' and panel.error %}autofocus{% endif %}
+          aria-describedby="link-label-hint"
+        >
+        <p class="field-hint" id="link-label-hint">{{ words.HUB_LINK_LABEL_HINT }}</p>
+
+        <label class="field-label" for="link-url">{{ words.HUB_LINK_URL_FIELD }}</label>
+        <input
+          class="path-input"
+          type="text"
+          inputmode="url"
+          autocapitalize="off"
+          spellcheck="false"
+          id="link-url"
+          name="url"
+          value="{{ panel.url if panel.mode == 'link' else '' }}"
+          aria-describedby="link-url-hint"
+        >
+        <p class="field-hint" id="link-url-hint">{{ words.HUB_LINK_URL_HINT }}</p>
+
+        <button type="submit" class="btn-primary">{{ words.HUB_LINK_ADD_SUBMIT }}</button>
+      </form>
+    </div>
+
+    <div data-panel-pane="edit">
+      <a class="btn-ghost" href="/?panel=choose#hub-panel" data-panel-choice="choose">{{ words.HUB_PANEL_BACK }}</a>
+      {% if panel.mode == 'edit' and panel.error %}
+      <div class="refusal-banner" role="alert">
+        <span class="refusal-banner__glyph" aria-hidden="true">&#10007;</span>
+        <p>{{ panel.error }}</p>
+      </div>
+      {% endif %}
+      <form
+        method="post"
+        action="{{ '/hub/links/' ~ panel.edit.id if panel.edit else '' }}"
+        data-role="edit-form"
+      >
+        <label class="field-label" for="edit-label">{{ words.HUB_LINK_LABEL_FIELD }}</label>
+        <input
+          class="path-input"
+          type="text"
+          id="edit-label"
+          name="label"
+          maxlength="40"
+          data-role="edit-label"
+          value="{{ panel.label if panel.mode == 'edit' else '' }}"
+          {% if panel.mode == 'edit' and panel.error %}autofocus{% endif %}
+        >
+        <label class="field-label" for="edit-url">{{ words.HUB_LINK_URL_FIELD }}</label>
+        <input
+          class="path-input"
+          type="text"
+          inputmode="url"
+          autocapitalize="off"
+          spellcheck="false"
+          id="edit-url"
+          name="url"
+          data-role="edit-url"
+          value="{{ panel.url if panel.mode == 'edit' else '' }}"
+        >
+        <button type="submit" class="btn-primary">{{ words.HUB_LINK_SAVE_SUBMIT }}</button>
+      </form>
+      <form
+        method="post"
+        action="{{ '/hub/links/' ~ panel.edit.id ~ '/remove' if panel.edit else '' }}"
+        data-role="remove-form"
+      >
+        <p>{{ words.HUB_LINK_REMOVE_NOTE }}</p>
+        <button type="submit" class="btn-ghost">{{ words.HUB_LINK_REMOVE_SUBMIT }}</button>
+      </form>
+    </div>
+  </dialog>
 </main>
 {% endblock %}
