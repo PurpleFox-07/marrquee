@@ -35,6 +35,7 @@ from marrquee.docker_client import (
     DockerStatus,
     FakeDockerEngine,
 )
+from marrquee.login import load_login, save_login
 from marrquee.main import create_app
 from marrquee.questions import QuestionCheck, QuestionField, QuestionStep, load_answers
 from marrquee.routes.api import _event_stream
@@ -43,9 +44,12 @@ from marrquee.storage import write_marker
 from marrquee.wiring import NoWiringYet, WiringStep
 from marrquee.wiring.engine import WiringEngine
 from marrquee.words import (
+    HUB_INSTALL_LOGIN_FIRST,
     HUB_INSTALL_UNKNOWN,
     HUB_SETUP_DONE_REFUSAL,
+    LOGIN_PROBLEM_PASSWORD_SHORT,
     PHASE_HEADLINE_READY,
+    REFUSAL_NO_LOGIN,
     REFUSAL_NOTHING_CHOSEN,
     STORAGE_CHECK_OK_MESSAGE,
     hub_install_busy,
@@ -100,6 +104,12 @@ def _idle_manager(settings: Settings) -> DeployManager:
     return DeployManager(settings, FakeDockerEngine(DockerStatus(connected=True)))
 
 
+# The one login every `/api/install` body below carries - a fixed, valid
+# credential, since none of these tests are about the login rules
+# themselves (those live in `tests/test_login.py`).
+_LOGIN_BODY = {"username": "install-owner", "password": "s3cret-password-1"}
+
+
 # --- The catalog route --------------------------------------------------------
 
 
@@ -137,6 +147,20 @@ def test_resting_state_is_honest_and_refuses_politely(tmp_path: Path) -> None:
     assert post_response.json()["detail"] == REFUSAL_NOTHING_CHOSEN
 
 
+def test_deploy_without_a_saved_login_answers_409_and_starts_nothing(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",), PurePosixPath("/volume1/media")))
+    manager = _idle_manager(settings)
+    client = _client(settings, manager)
+    assert load_login(settings.config_dir).login is None
+
+    response = client.post("/api/deploy")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == REFUSAL_NO_LOGIN
+    assert manager.snapshot().phase == "ready"
+
+
 # --- Installing --------------------------------------------------------------
 
 
@@ -147,7 +171,10 @@ def test_install_saves_state_generates_one_key_per_app_and_keeps_keys_on_repost(
     root = _fresh_root(settings)
     client = _client(settings, _idle_manager(settings))
 
-    first = client.post("/api/install", json={"path": str(root), "app_ids": ["sonarr", "radarr"]})
+    first = client.post(
+        "/api/install",
+        json={"path": str(root), "app_ids": ["sonarr", "radarr"], "login": _LOGIN_BODY},
+    )
     assert first.status_code == 200
     assert first.json() == {"saved": True}
 
@@ -156,12 +183,88 @@ def test_install_saves_state_generates_one_key_per_app_and_keeps_keys_on_repost(
     assert set(first_state.api_keys) == {"sonarr", "radarr"}
     first_keys = dict(first_state.api_keys)
 
-    second = client.post("/api/install", json={"path": str(root), "app_ids": ["sonarr", "radarr"]})
+    second = client.post(
+        "/api/install",
+        json={"path": str(root), "app_ids": ["sonarr", "radarr"], "login": _LOGIN_BODY},
+    )
     assert second.status_code == 200
 
     second_state = load_state(settings.config_dir)
     assert second_state is not None
     assert dict(second_state.api_keys) == first_keys
+
+
+def test_install_saves_the_posted_login_lowered_and_generation_one(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+    client = _client(settings, _idle_manager(settings))
+
+    response = client.post(
+        "/api/install",
+        json={
+            "path": str(root),
+            "app_ids": ["sonarr"],
+            "login": {"username": "Install-Owner", "password": "s3cret-password-1"},
+        },
+    )
+
+    assert response.status_code == 200
+    record = load_login(settings.config_dir)
+    assert record.login is not None
+    assert record.login.username == "install-owner"
+    assert record.login.generation == 1
+
+
+def test_install_refuses_a_bad_login_with_400_and_never_leaks_the_password(
+    tmp_path: Path,
+) -> None:
+    """`LOGIN_STEP.check` owns the 8-128 rule, not pydantic - a refusal is
+    always the plain sentence that rule already owns, and the password
+    itself never reaches the response body, the state file or login.json.
+    """
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+    client = _client(settings, _idle_manager(settings))
+
+    response = client.post(
+        "/api/install",
+        json={
+            "path": str(root),
+            "app_ids": ["sonarr"],
+            "login": {"username": "owner", "password": "abc12"},
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == LOGIN_PROBLEM_PASSWORD_SHORT
+    assert "abc12" not in response.text
+    assert load_state(settings.config_dir) is None
+    assert load_login(settings.config_dir).login is None
+
+
+def test_install_refuses_with_a_valid_login_but_a_bad_install_saves_neither(
+    tmp_path: Path,
+) -> None:
+    """The login is checked before `install_apps` runs, but only SAVED once
+    that install actually succeeds - a refused install (here, a populated
+    target) must never leave a login saved with no storage choice to go
+    with it.
+    """
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+    (settings.host_mount / "volume1" / "media" / "data" / "media" / "tv").mkdir(parents=True)
+    (
+        settings.host_mount / "volume1" / "media" / "data" / "media" / "tv" / "Old Show.mkv"
+    ).write_text("")
+    client = _client(settings, _idle_manager(settings))
+
+    response = client.post(
+        "/api/install", json={"path": str(root), "app_ids": ["sonarr"], "login": _LOGIN_BODY}
+    )
+
+    assert response.status_code == 409
+    assert load_state(settings.config_dir) is None
+    assert load_login(settings.config_dir).login is None
 
 
 def test_install_refuses_a_populated_target_with_409_and_saves_nothing(tmp_path: Path) -> None:
@@ -173,7 +276,9 @@ def test_install_refuses_a_populated_target_with_409_and_saves_nothing(tmp_path:
     ).write_text("")
     client = _client(settings, _idle_manager(settings))
 
-    response = client.post("/api/install", json={"path": str(root), "app_ids": ["sonarr"]})
+    response = client.post(
+        "/api/install", json={"path": str(root), "app_ids": ["sonarr"], "login": _LOGIN_BODY}
+    )
 
     assert response.status_code == 409
     assert response.json()["detail"]
@@ -192,7 +297,9 @@ def test_install_refuses_a_target_whose_media_folder_links_outside_with_409_not_
     (media / "tv").symlink_to(outside)
     client = _client(settings, _idle_manager(settings))
 
-    response = client.post("/api/install", json={"path": str(root), "app_ids": ["sonarr"]})
+    response = client.post(
+        "/api/install", json={"path": str(root), "app_ids": ["sonarr"], "login": _LOGIN_BODY}
+    )
 
     assert response.status_code == 409
     assert response.json()["detail"]
@@ -204,7 +311,9 @@ def test_install_refuses_an_empty_app_list_with_400(tmp_path: Path) -> None:
     root = _fresh_root(settings)
     client = _client(settings, _idle_manager(settings))
 
-    response = client.post("/api/install", json={"path": str(root), "app_ids": []})
+    response = client.post(
+        "/api/install", json={"path": str(root), "app_ids": [], "login": _LOGIN_BODY}
+    )
 
     assert response.status_code == 400
     assert response.json()["detail"] == REFUSAL_NOTHING_CHOSEN
@@ -215,7 +324,9 @@ def test_install_refuses_an_unknown_app_id_with_400(tmp_path: Path) -> None:
     root = _fresh_root(settings)
     client = _client(settings, _idle_manager(settings))
 
-    response = client.post("/api/install", json={"path": str(root), "app_ids": ["plex"]})
+    response = client.post(
+        "/api/install", json={"path": str(root), "app_ids": ["plex"], "login": _LOGIN_BODY}
+    )
 
     assert response.status_code == 400
 
@@ -237,7 +348,9 @@ def test_install_refuses_once_the_hub_exists_and_changes_nothing(tmp_path: Path)
     write_json_atomic(settings.config_dir / "deploy.json", dataclasses.asdict(finished))
     client = _client(settings, _idle_manager(settings))
 
-    response = client.post("/api/install", json={"path": str(root), "app_ids": ["sonarr"]})
+    response = client.post(
+        "/api/install", json={"path": str(root), "app_ids": ["sonarr"], "login": _LOGIN_BODY}
+    )
 
     assert response.status_code == 409
     assert response.json()["detail"] == HUB_SETUP_DONE_REFUSAL
@@ -258,6 +371,7 @@ async def test_hub_install_endpoint_starts_an_add_and_refuses_a_second(tmp_path:
     settings = _settings(tmp_path)
     root = _fresh_root(settings)
     save_state(settings.config_dir, _install_state(("prowlarr", "sonarr"), root))
+    save_login(settings.config_dir, "owner", "s3cret-password-1", honor_reset=None)
 
     engine = _StatefulEngine(
         ("prowlarr", "sonarr"),
@@ -292,6 +406,30 @@ def test_hub_install_endpoint_refuses_an_unknown_app_with_409(tmp_path: Path) ->
     assert response.json()["message"] == HUB_INSTALL_UNKNOWN
 
 
+async def test_hub_install_endpoint_refuses_with_409_when_no_login_is_saved(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+    save_state(settings.config_dir, _install_state(("prowlarr", "sonarr"), root))
+
+    engine = _StatefulEngine(
+        ("prowlarr", "sonarr"),
+        images={get_app(app_id).image for app_id in ("prowlarr", "sonarr", "radarr")},
+    )
+    manager = DeployManager(settings, engine, probe=FakeReadinessProbe(default=True))
+    manager.start()
+    await _run_to_terminal(manager)
+    assert manager.snapshot().phase == "finale"
+
+    app = create_app(settings=settings, engine=engine, manager=manager)
+    with TestClient(app) as client:
+        response = client.post("/api/hub/apps/radarr/install", json={"answers": {}})
+
+    assert response.status_code == 409
+    assert response.json()["message"] == HUB_INSTALL_LOGIN_FIRST
+
+
 async def test_hub_install_fixture_step_refuses_with_400_and_saves_only_after_a_pass(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -313,6 +451,7 @@ async def test_hub_install_fixture_step_refuses_with_400_and_saves_only_after_a_
     settings = _settings(tmp_path)
     root = _fresh_root(settings)
     save_state(settings.config_dir, _install_state(("prowlarr", "sonarr"), root))
+    save_login(settings.config_dir, "owner", "s3cret-password-1", honor_reset=None)
     engine = _StatefulEngine(
         ("prowlarr", "sonarr"),
         images={get_app(app_id).image for app_id in ("prowlarr", "sonarr", "radarr")},
@@ -380,6 +519,7 @@ def test_deploy_start_returns_202_once_and_200_on_a_second_call_while_running(
     root = _fresh_root(settings)
     install = _install_state(("prowlarr",), root)
     save_state(settings.config_dir, install)
+    save_login(settings.config_dir, "owner", "s3cret-password-1", honor_reset=None)
 
     engine = FakeDockerEngine(
         DockerStatus(connected=True),
@@ -593,7 +733,10 @@ def test_too_many_app_ids_returns_a_4xx_not_a_500(tmp_path: Path) -> None:
     root = _fresh_root(settings)
     client = _client(settings, _idle_manager(settings))
 
-    response = client.post("/api/install", json={"path": str(root), "app_ids": ["sonarr"] * 51})
+    response = client.post(
+        "/api/install",
+        json={"path": str(root), "app_ids": ["sonarr"] * 51, "login": _LOGIN_BODY},
+    )
 
     assert 400 <= response.status_code < 500
 
@@ -728,6 +871,7 @@ def test_get_deploy_mid_wiring_shows_the_rows_so_far(tmp_path: Path) -> None:
     root = _fresh_root(settings)
     install = _install_state(("prowlarr", "sonarr"), root)
     save_state(settings.config_dir, install)
+    save_login(settings.config_dir, "owner", "s3cret-password-1", honor_reset=None)
     # Marks both apps as already ours, so the name-clash check (which would
     # otherwise see the pre-seeded "already running" containers below as
     # somebody else's) skips straight past them.

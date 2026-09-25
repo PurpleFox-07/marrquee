@@ -1,8 +1,10 @@
 # Marrquee - paste this whole file into your NAS's Docker app.
 #
 # On the Ugreen NAS: open the Docker app, choose Project, then Create, and
-# paste this in. Nothing here needs changing except the line marked below,
-# and only if something else on your NAS is already using port 7788.
+# paste this in. Nothing here needs changing except the port (only if
+# something else on your NAS is already using 7788) and the optional
+# MARRQUEE_RESET_LOGIN line further down (only if you forget your apps'
+# password - see the README's "Forgot your apps' password?" section).
 services:
   marrquee:
     image: ghcr.io/purplefox-07/marrquee:latest
@@ -30,3 +32,9 @@ services:
       # longer accepts mounting the whole NAS as one line, so this is
       # mounted folder by folder instead.)
       - /volume1:/host/volume1
+    environment:
+      # Forgot the login for your apps? Type any word between the quotes
+      # (for example MARRQUEE_RESET_LOGIN: "reset"), choose Redeploy, then
+      # choose a new login on your Hub. Once you're signed in with it,
+      # empty the quotes again and choose Redeploy once more.
+      MARRQUEE_RESET_LOGIN: ""

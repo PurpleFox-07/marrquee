@@ -35,6 +35,11 @@ class Settings:
     host_mount: Path = Path("/host")
     compose_binary: Path = Path("/usr/local/bin/docker-compose")
     stack_project: str = "marrquee-apps"  # never "marrquee" - see compose._STACK_PROJECT
+    # The forgotten-password reset: any non-blank value the owner hasn't
+    # already had honoured (login.py's `reset_honored`) puts the Hub into
+    # "choose a new login, no current password needed". Blank (the shipped
+    # default) means "nothing to reset".
+    reset_login: str | None = None
 
     @staticmethod
     def from_env(env: Mapping[str, str] | None = None) -> Settings:
@@ -64,6 +69,7 @@ class Settings:
             if "MARRQUEE_COMPOSE_BINARY" in env
             else defaults.compose_binary,
             stack_project=env.get("MARRQUEE_STACK_PROJECT", defaults.stack_project),
+            reset_login=_parse_reset_login(env.get("MARRQUEE_RESET_LOGIN")),
         )
 
 
@@ -85,6 +91,16 @@ def _parse_port(raw_value: str) -> int:
     if not (_MIN_PORT <= port <= _MAX_PORT):
         raise ValueError(message)
     return port
+
+
+def _parse_reset_login(raw_value: str | None) -> str | None:
+    """Strip MARRQUEE_RESET_LOGIN, turning a blank (or unset) value into
+    None - the "nothing to reset" case every reader compares against.
+    """
+    if raw_value is None:
+        return None
+    stripped = raw_value.strip()
+    return stripped or None
 
 
 @dataclass(frozen=True)

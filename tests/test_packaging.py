@@ -245,15 +245,23 @@ def test_readmes_user_path_points_at_diagnostics_and_never_at_the_json_api() -> 
     assert "/api/" not in user_path
 
 
-def test_readme_owner_walk_step_9_no_longer_says_the_hub_loops_back() -> None:
+def test_readme_owner_walk_visit_your_hub_step_no_longer_says_the_hub_loops_back() -> None:
+    """Was step 9 before this story's login step (5) pushed it to 11 - the
+    sub-steps' own letters are what this test pins, not a specific number,
+    so a later story that adds yet another step ahead of it won't need to
+    touch this test again.
+    """
     readme = _readme_text()
 
     assert "loops back" not in readme.lower()
     assert "brings you back" not in readme.lower()
-    assert "9a." in readme
-    assert "9b." in readme
-    assert "9c." in readme
-    assert "9d." in readme
+    match = re.search(r"^\d+\.\s*\*\*Visit your Hub\.\*\*", readme, re.MULTILINE)
+    assert match is not None
+    step_number = match.group(0).split(".", 1)[0]
+    assert f"{step_number}a." in readme
+    assert f"{step_number}b." in readme
+    assert f"{step_number}c." in readme
+    assert f"{step_number}d." in readme
     assert "Go to your Hub" in readme
     assert "Status: Up" in readme
 
@@ -268,3 +276,32 @@ def test_dockerignore_excludes_craft_and_git_but_not_source_files() -> None:
 
     for kept in ("src", "pyproject.toml", "uv.lock"):
         assert kept not in ignored, f"{kept} must not be excluded - the build needs it"
+
+
+# --- The one saved login: the reset line ships off, and the README's own
+# GUI-only reset walkthrough exists -------------------------------------
+
+
+def test_compose_ships_the_reset_login_line_off() -> None:
+    """Explicit over implicit: the line ships spelled out and empty, not
+    simply absent - an owner who never needs it should still see exactly
+    where it lives and that it's off.
+    """
+    environment = _compose_service().get("environment")
+    assert isinstance(environment, dict)
+    assert environment == {"MARRQUEE_RESET_LOGIN": ""}
+
+
+def test_readme_has_the_forgot_password_section_with_no_terminal_command() -> None:
+    readme = _readme_text()
+    heading = "## Forgot your apps' password?"
+    assert heading in readme
+
+    section = readme[readme.index(heading) :]
+    section = section[: section.index("\n## ", len(heading))]
+
+    assert "MARRQUEE_RESET_LOGIN" in section
+    assert "Redeploy" in section
+    # GUI-only: no fenced code block, so nothing here reads as a command to
+    # paste into a Terminal or an SSH session.
+    assert "```" not in section

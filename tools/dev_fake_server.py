@@ -66,6 +66,8 @@ from marrquee.docker_client import (
     DockerStatus,
     FakeDockerEngine,
 )
+from marrquee.login import record_applied, save_login
+from marrquee.login_apply import FakeLoginApplier
 from marrquee.main import create_app
 from marrquee.state import InstallState, save_state, write_json_atomic
 from marrquee.wiring import WiringStep
@@ -131,8 +133,10 @@ class _DemoDockerEngine(FakeDockerEngine):
     wait on.
     """
 
-    async def compose_up(self, project: str, compose_file: Path, service: str) -> ComposeResult:
-        result = await super().compose_up(project, compose_file, service)
+    async def compose_up(
+        self, project: str, compose_file: Path, service: str, *, recreate: bool = False
+    ) -> ComposeResult:
+        result = await super().compose_up(project, compose_file, service, recreate=recreate)
         if result.ok:
             self._containers[service] = ContainerSnapshot(
                 name=service,
@@ -235,8 +239,14 @@ def _probe_for_scene(scene: str) -> FakeReadinessProbe:
 
 
 def _seed_install(settings: Settings) -> None:
-    """Create the demo's storage folder and save the choices a deploy reads."""
+    """Create the demo's storage folder and save the choices a deploy reads.
+
+    Also seeds a login - without one, pressing **Deploy** on the demo's own
+    `/deploy` page would just redirect to the login step instead of doing
+    anything, since that guard doesn't know this is a demo.
+    """
     (settings.host_mount / "volume1" / "media").mkdir(parents=True, exist_ok=True)
+    save_login(settings.config_dir, "demo", "demo-password", honor_reset=None)
     save_state(
         settings.config_dir,
         InstallState(
@@ -258,12 +268,18 @@ def _seed_install(settings: Settings) -> None:
 
 
 def _seed_hub_deploy(settings: Settings) -> None:
-    """Write a `finale` `deploy.json` straight to disk.
+    """Write a `finale` `deploy.json` straight to disk, and mark every app
+    as already carrying `_seed_install`'s login.
 
     `DeployManager` only reads this file once, at construction, so seeding
     it before the manager is built is enough to make a Hub scene show the
-    front door with no deploy ever run.
+    front door with no deploy ever run. Recording every app as applied is
+    what keeps a Hub scene's own front door clean - a Hub scene means
+    "already fully set up", never "still waiting for a login", and no
+    login run ever gets a chance to earn that itself here.
     """
+    for app_id in _APP_IDS:
+        record_applied(settings.config_dir, app_id, generation=1)
     apps = tuple(
         AppProgress(
             app_id=app.id,
@@ -363,6 +379,7 @@ def build_app(
         clock=clock,
         sleep=sleep,
         wiring=_DemoWiringRunner(scene=scene, sleep=sleep),
+        login=FakeLoginApplier(),
     )
     return create_app(settings, engine, manager=manager)
 

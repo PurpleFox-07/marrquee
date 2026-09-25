@@ -28,6 +28,7 @@ from marrquee.deploy import AppAdd, AppProgress, DeploySnapshot
 from marrquee.docker_client import DockerStatus, FakeDockerEngine
 from marrquee.health import FakeLinkProbe
 from marrquee.links import LinkCard, save_links
+from marrquee.login import save_login
 from marrquee.main import create_app
 from marrquee.questions import QuestionCheck, QuestionField, QuestionStep
 from marrquee.routes.api import HubInstallOut, HubStatusOut, HubTileOut, LinkTileOut
@@ -85,6 +86,47 @@ def test_the_script_names_only_fields_on_the_hub_output_models() -> None:
     assert arrays["APP_FIELDS"] <= set(HubTileOut.model_fields)
     assert arrays["LINK_FIELDS"] <= set(LinkTileOut.model_fields)
     assert arrays["INSTALL_FIELDS"] <= set(HubInstallOut.model_fields)
+
+
+def test_status_fields_include_login_banner() -> None:
+    """The reload guard needs `login_banner` in every polled frame - without
+    it in `STATUS_FIELDS`, a future field-name drift on `HubStatusOut`
+    could silently stop being checked here.
+    """
+    script = _HUB_JS_PATH.read_text()
+    arrays = _field_arrays(script)
+
+    assert "login_banner" in arrays["STATUS_FIELDS"]
+
+
+def test_the_reload_guard_signature_folds_in_the_login_banner() -> None:
+    """`structureSignature` has to actually combine both inputs - a version
+    that quietly went back to `return actions;` would still poll and paint
+    fine, and every other test here would stay green, but a login state
+    that flips the page's whole banner section (choose -> set, say) would
+    never trigger the one-time reload that repaints it.
+    """
+    script = _HUB_JS_PATH.read_text()
+    match = re.search(r"function structureSignature\([^)]*\)\s*\{.*?\n  \}", script, re.DOTALL)
+    assert match is not None, "expected a structureSignature function in hub.js"
+    body = match.group(0)
+
+    assert re.search(r"return\s+actions\b.*loginBanner", body, re.DOTALL), (
+        "structureSignature must combine both actions and loginBanner in its return value"
+    )
+
+    # And the reload guard must actually call it with the *incoming* login
+    # banner (the payload's) on one side and the *page's own* current one
+    # (`data-login-banner`, via `root.dataset.loginBanner`) on the other -
+    # comparing two signatures built from the same side would never detect
+    # a change at all.
+    guard_match = re.search(
+        r"function reloadIfStructureChanged\([^)]*\)\s*\{.*?\n  \}", script, re.DOTALL
+    )
+    assert guard_match is not None, "expected a reloadIfStructureChanged function in hub.js"
+    guard_body = guard_match.group(0)
+    assert "payload.login_banner" in guard_body
+    assert "root.dataset.loginBanner" in guard_body
 
 
 # --- FIRST TEST: every hook the panel script queries exists on the page ----
@@ -171,6 +213,10 @@ def test_every_hook_the_script_queries_exists_on_the_rendered_hub(
     settings = _settings(tmp_path)
     save_state(settings.config_dir, _install_state(("prowlarr", "sonarr")))
     _write_snapshot(settings, _finale_snapshot(("prowlarr", "sonarr")))
+    # A saved login, so the install pane renders its fixture question step
+    # (and every hook the install flow needs) instead of the "choose your
+    # login first" sentence this story adds ahead of it.
+    save_login(settings.config_dir, "owner", "s3cret-password-1", honor_reset=None)
     card = LinkCard(id="0" * 16, label="Router", url="http://192.168.1.1")
     save_links(settings.config_dir, [card])
     client = _client(settings)

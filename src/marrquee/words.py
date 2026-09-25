@@ -1101,6 +1101,157 @@ _HUB_INSTALL_WORDS: tuple[str, ...] = (
 # end Hub: install an app section
 # =============================================================================
 
+# =============================================================================
+# One login - the owner's single username and password, applied to every
+# app Marrquee installs (Prowlarr, Sonarr, Radarr - Plex is the exception
+# and always uses its own account)
+# =============================================================================
+
+WIZARD_STEP_LOGIN = "Your login"
+
+LOGIN_STEP_TITLE = "Choose one login for your apps"
+LOGIN_STEP_LEDE = (
+    "Every app Marrquee installs asks for this username and password. Your "
+    "browser can remember it, so you only type it once per device."
+)
+
+LOGIN_PLEX_NOTE = "Plex is the exception: it always uses your own Plex account."
+
+LOGIN_RESET_TITLE = "Choose a new login"
+LOGIN_RESET_LEDE = (
+    "Choose a new username and password. Every app Marrquee installs will switch over to it."
+)
+
+LOGIN_USERNAME_LABEL = "Username"
+LOGIN_USERNAME_HINT = (
+    "3 to 32 characters: letters, numbers, dots, dashes or underscores. "
+    "Capitals become small letters."
+)
+LOGIN_PASSWORD_LABEL = "Password"
+LOGIN_PASSWORD_HINT = "At least 8 characters, with no space at the start or end."
+LOGIN_PASSWORD_AGAIN_LABEL = "Type it again"
+
+LOGIN_PROBLEM_USERNAME = (
+    "Usernames are 3 to 32 characters: letters, numbers, dots, dashes or underscores."
+)
+LOGIN_PROBLEM_PASSWORD_SHORT = "That password is too short - use at least 8 characters."
+LOGIN_PROBLEM_PASSWORD_LONG = "That password is too long - use at most 128 characters."
+LOGIN_PROBLEM_PASSWORD_SPACES = "Passwords can't start or end with a space."
+LOGIN_PROBLEM_MISMATCH = "Those two passwords don't match."
+
+LOGIN_SAVE_BUTTON = "Save login"
+
+CHANGE_TITLE = "Change login"
+CHANGE_LEDE = (
+    "Change the username and/or password every app uses. You'll need your current password."
+)
+CHANGE_CURRENT_LABEL = "Current password"
+CHANGE_NEW_PASSWORD_HINT = "Leave both boxes blank to keep your password."
+CHANGE_PROBLEM_CURRENT_BLANK = "Enter your current password to change it."
+CHANGE_PROBLEM_WRONG_CURRENT = "That's not your current password."
+CHANGE_PROBLEM_NOTHING = "Change the username or password - or both - before saving."
+CHANGE_SAVE_BUTTON = "Save changes"
+
+
+def hub_login_summary(username: str) -> str:
+    return f"Your apps' login: {username}"
+
+
+HUB_LOGIN_CHANGE_LINK = "Change login"
+HUB_LOGIN_FORGOT_LINK = "Forgot your password?"
+
+
+def hub_login_line_putting(name: str) -> str:
+    return f"Putting your login on {name}…"
+
+
+def hub_login_line_restarting(name: str) -> str:
+    return f"Restarting {name} with your login…"
+
+
+HUB_LOGIN_APPLYING = "Putting your login on your apps…"
+
+
+def hub_login_pending(names: _Sequence[str]) -> str:
+    """Names every app still waiting for the saved login, the same "never a
+    bare count" rule `wiring_finale_note` follows - a reader has to be able
+    to act on this line without opening Diagnostics first.
+    """
+    lines = list(names)
+    if len(lines) == 1:
+        return f"{lines[0]} is still waiting for your login. Try again below."
+    joined = ", ".join(lines)
+    return f"{joined} are still waiting for your login. Try again below."
+
+
+LOGIN_TRY_AGAIN = "Try again"
+
+HUB_LOGIN_RESET_REMINDER = (
+    "You reset your apps' login with the MARRQUEE_RESET_LOGIN line in your compose "
+    "configuration. Delete that line and Redeploy once you're signed in with your "
+    "new login."
+)
+
+HUB_LOGIN_BUSY = "Marrquee is already working on your login. Wait for it to finish."
+
+HUB_INSTALL_LOGIN_FIRST = "Choose your apps' login first, before adding another app."
+HUB_INSTALL_BUSY_LOGIN = (
+    "Marrquee is putting your login on your apps. Wait for it to finish, then add another."
+)
+
+REFUSAL_NO_LOGIN = "Choose your apps' login before deploying."
+
+FINALE_SIGN_IN = "Sign in with the username and password you chose."
+
+CROSS_SITE_REFUSED = "Marrquee refused this request: it didn't come from this site."
+
+_LOGIN_WORDS: tuple[str, ...] = (
+    "WIZARD_STEP_LOGIN",
+    "LOGIN_STEP_TITLE",
+    "LOGIN_STEP_LEDE",
+    "LOGIN_PLEX_NOTE",
+    "LOGIN_RESET_TITLE",
+    "LOGIN_RESET_LEDE",
+    "LOGIN_USERNAME_LABEL",
+    "LOGIN_USERNAME_HINT",
+    "LOGIN_PASSWORD_LABEL",
+    "LOGIN_PASSWORD_HINT",
+    "LOGIN_PASSWORD_AGAIN_LABEL",
+    "LOGIN_PROBLEM_USERNAME",
+    "LOGIN_PROBLEM_PASSWORD_SHORT",
+    "LOGIN_PROBLEM_PASSWORD_LONG",
+    "LOGIN_PROBLEM_PASSWORD_SPACES",
+    "LOGIN_PROBLEM_MISMATCH",
+    "LOGIN_SAVE_BUTTON",
+    "CHANGE_TITLE",
+    "CHANGE_LEDE",
+    "CHANGE_CURRENT_LABEL",
+    "CHANGE_NEW_PASSWORD_HINT",
+    "CHANGE_PROBLEM_CURRENT_BLANK",
+    "CHANGE_PROBLEM_WRONG_CURRENT",
+    "CHANGE_PROBLEM_NOTHING",
+    "CHANGE_SAVE_BUTTON",
+    "hub_login_summary",
+    "HUB_LOGIN_CHANGE_LINK",
+    "HUB_LOGIN_FORGOT_LINK",
+    "hub_login_line_putting",
+    "hub_login_line_restarting",
+    "HUB_LOGIN_APPLYING",
+    "hub_login_pending",
+    "LOGIN_TRY_AGAIN",
+    "HUB_LOGIN_RESET_REMINDER",
+    "HUB_LOGIN_BUSY",
+    "HUB_INSTALL_LOGIN_FIRST",
+    "HUB_INSTALL_BUSY_LOGIN",
+    "REFUSAL_NO_LOGIN",
+    "FINALE_SIGN_IN",
+    "CROSS_SITE_REFUSED",
+)
+
+# =============================================================================
+# end One login section
+# =============================================================================
+
 # The full review surface: every public name above, in one tuple. A later
 # feature area adds its own fenced section above this line, then extends
 # this tuple with its own `_..._WORDS` name - never editing an earlier
@@ -1113,4 +1264,5 @@ WORDS_INVENTORY: tuple[str, ...] = (
     *_HUB_WORDS,
     *_HUB_LINK_WORDS,
     *_HUB_INSTALL_WORDS,
+    *_LOGIN_WORDS,
 )

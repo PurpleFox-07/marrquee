@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+
+{% block title %}{{ words.LOGIN_STEP_TITLE }} &middot; Marrquee{% endblock %}
+
+{% block head %}
+<link rel="stylesheet" href="{{ url_for('static', path='css/wizard.css') }}">
+{% endblock %}
+
+{% block content %}
+<div class="wrap wizard">
+  <p class="eyebrow">{{ words.WIZARD_EYEBROW }}</p>
+  {% include "partials/steps.html" %}
+
+  <h1>{{ words.LOGIN_STEP_TITLE }}</h1>
+  <p class="lede">{{ words.LOGIN_STEP_LEDE }}</p>
+
+  {% include "partials/platform_warning.html" %}
+
+  <form method="post" action="/setup/login">
+    <input type="hidden" name="apps" value="{{ apps_csv }}">
+    {% include "partials/app_questions.html" %}
+    <p>{{ words.LOGIN_PLEX_NOTE }}</p>
+
+    <div class="actions">
+      <a class="btn-ghost" href="{{ back_url }}">{{ words.QUESTIONS_BACK }}</a>
+      <button type="submit" class="btn-primary">{{ words.LOGIN_SAVE_BUTTON }}</button>
+    </div>
+  </form>
+</div>
+{% endblock %}

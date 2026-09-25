@@ -152,7 +152,9 @@ class DockerEngine(Protocol):
     async def image_present(self, reference: str) -> bool: ...
     async def connect_network(self, network: str, container: str) -> NetworkConnectResult: ...
     async def logs(self, name: str, tail: int = 50) -> str: ...
-    async def compose_up(self, project: str, compose_file: Path, service: str) -> ComposeResult: ...
+    async def compose_up(
+        self, project: str, compose_file: Path, service: str, *, recreate: bool = False
+    ) -> ComposeResult: ...
     async def self_container_id(self) -> str | None: ...
     async def remove_container(self, name: str) -> ContainerRemoveResult: ...
 
@@ -299,7 +301,16 @@ class SocketDockerEngine:
 
         return _demultiplex_docker_stream(response.content)
 
-    async def compose_up(self, project: str, compose_file: Path, service: str) -> ComposeResult:
+    async def compose_up(
+        self, project: str, compose_file: Path, service: str, *, recreate: bool = False
+    ) -> ComposeResult:
+        # `--no-recreate` is what keeps a `compose up` on an already-running,
+        # unchanged service a no-op - the default every caller except the
+        # login run wants. Dropping it (`recreate=True`) is the only way to
+        # let compose recreate a service whose compose file changed (an env
+        # var an app's own config.xml can't override until its container is
+        # recreated), and it still leaves an unchanged service alone -
+        # compose itself decides that, not this flag.
         argv = (
             str(self._compose_binary),
             "-p",
@@ -308,7 +319,7 @@ class SocketDockerEngine:
             str(compose_file),
             "up",
             "-d",
-            "--no-recreate",
+            *(() if recreate else ("--no-recreate",)),
             service,
         )
         # Deliberately minimal - built from scratch rather than inheriting
@@ -566,6 +577,42 @@ def _demultiplex_docker_stream(raw: bytes) -> str:
     return b"".join(chunks).decode("utf-8", errors="replace")
 
 
+def _service_config_signature(compose_file: Path, service: str) -> str | None:
+    """`service`'s own block of `compose_file`, or `None` when the file
+    can't be read or doesn't mention this service at all - `_model_recreate`
+    treats `None` as "changed", never as "unchanged".
+    """
+    try:
+        text = compose_file.read_text()
+    except OSError:
+        return None
+    return _service_config_block(text, service)
+
+
+def _service_config_block(compose_text: str, service: str) -> str | None:
+    """Slice out one service's own block from a rendered compose file.
+
+    Real Compose recreates only the services whose OWN resolved config
+    changed - comparing the whole file would recreate every service the
+    moment any one of them changed, which is not what a recreate fake needs
+    to prove. `render_compose` (`compose.py`) always writes a service's
+    block starting at `"  {service}:"` (2-space indent) with every line that
+    belongs to it indented 4 spaces or more (or blank), so the block ends at
+    the next 2-space-indented line - either the next service, or the
+    trailing `networks:` block.
+    """
+    marker = f"  {service}:"
+    lines = compose_text.splitlines()
+    try:
+        start = lines.index(marker)
+    except ValueError:
+        return None
+    end = start + 1
+    while end < len(lines) and (lines[end] == "" or lines[end].startswith("    ")):
+        end += 1
+    return "\n".join(lines[start:end])
+
+
 class FakeDockerEngine:
     """An in-memory DockerEngine, scripted with the answers a test wants.
 
@@ -602,6 +649,12 @@ class FakeDockerEngine:
         self._network_exists = network_exists
         self._self_container_id = self_container_id
         self.calls: list[tuple[str, tuple[object, ...]]] = []
+        # What a real Docker daemon uses to decide whether a recreate is a
+        # no-op: the service's own rendered config, as last seen. Tracked
+        # only for `recreate=True` calls - nothing about the plain
+        # `recreate=False` path (used everywhere else) changes.
+        self._service_signatures: dict[str, str] = {}
+        self._recreate_sequence = 0
 
     async def status(self) -> DockerStatus:
         self.calls.append(("status", ()))
@@ -634,15 +687,64 @@ class FakeDockerEngine:
         self.calls.append(("logs", (name, tail)))
         return ""
 
-    async def compose_up(self, project: str, compose_file: Path, service: str) -> ComposeResult:
-        self.calls.append(("compose_up", (project, str(compose_file), service)))
+    async def compose_up(
+        self, project: str, compose_file: Path, service: str, *, recreate: bool = False
+    ) -> ComposeResult:
+        # A distinct call name for a recreate run - never "compose_up" with
+        # an extra bool tucked on the end - so every existing `.calls`
+        # assertion written against the old (non-recreate-aware) signature
+        # stays untouched.
+        call_name = "compose_up_recreate" if recreate else "compose_up"
+        self.calls.append((call_name, (project, str(compose_file), service)))
         result = self._compose_results.get(service, ComposeResult(ok=True, exit_code=0, output=""))
-        if result.ok:
-            # Real compose creates the stack's network as a side effect of
-            # its first successful `up` - whichever service happens to be
-            # first - not before, and not conditional on which one it is.
-            self._network_exists = True
+        if not result.ok:
+            return result
+        # Real compose creates the stack's network as a side effect of its
+        # first successful `up` - whichever service happens to be first -
+        # not before, and not conditional on which one it is.
+        self._network_exists = True
+        # Tracked on EVERY successful call, recreate or not - a later
+        # recreate needs a genuine baseline to compare against, including
+        # one set by the plain `compose up --no-recreate` an initial deploy
+        # already ran for this same service.
+        changed = self._update_service_signature(compose_file, service)
+        if recreate:
+            self._model_recreate(service, changed=changed)
         return result
+
+    def _update_service_signature(self, compose_file: Path, service: str) -> bool:
+        """Record `service`'s current config signature and report whether it
+        differs from what was last seen. Unreadable or never-seen content
+        always reports "changed" - the safe default a recreate fake must
+        fail toward, never a silent no-op.
+        """
+        signature = _service_config_signature(compose_file, service)
+        previous = self._service_signatures.get(service)
+        if signature is not None:
+            self._service_signatures[service] = signature
+        return signature is None or signature != previous
+
+    def _model_recreate(self, service: str, *, changed: bool) -> None:
+        """Real Compose only replaces a container whose OWN rendered config
+        actually changed - an unchanged service is left running untouched,
+        never given a new container (per the project's own
+        docker-fakes-model-state rule).
+        """
+        if service in self._containers and not changed:
+            return  # an unchanged, already-known service is left exactly alone
+
+        self._recreate_sequence += 1
+        previous_container = self._containers.get(service)
+        self._containers[service] = ContainerSnapshot(
+            name=service,
+            exists=True,
+            state="running",
+            exit_code=None,
+            image=previous_container.image if previous_container is not None else None,
+            detail=None,
+            started_at=f"fake-recreated-{self._recreate_sequence}",
+            finished_at=None,
+        )
 
     async def self_container_id(self) -> str | None:
         self.calls.append(("self_container_id", ()))

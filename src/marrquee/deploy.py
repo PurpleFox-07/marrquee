@@ -37,6 +37,8 @@ from marrquee.compose import build_stack_plan, write_compose
 from marrquee.config import Settings
 from marrquee.docker_client import ComposeResult, DockerEngine
 from marrquee.install import with_app_added, with_app_removed
+from marrquee.login import SavedLogin, load_login, pending_app_ids, record_applied
+from marrquee.login_apply import LoginApplier, NoLoginApplier
 from marrquee.state import InstallState, load_state, save_state, write_json_atomic
 from marrquee.storage import (
     FreshnessCheck,
@@ -72,6 +74,8 @@ from marrquee.words import (
     failure_port_in_use,
     hub_cancel_failed,
     hub_line_connecting,
+    hub_login_line_putting,
+    hub_login_line_restarting,
     refusal_name_clash,
     refusal_not_a_folder,
     refusal_not_shared,
@@ -105,12 +109,16 @@ AddState = Literal["starting", "wiring", "error"]
 # app that is already `done` in `apps` - it never touches Docker at all.
 AddPurpose = Literal["add", "reconnect"]
 AddStart = Literal[
-    "started", "busy", "not_ready", "unknown_app", "already_installed", "unavailable"
+    "started", "busy", "not_ready", "no_login", "unknown_app", "already_installed", "unavailable"
 ]
+# The login run's own start-refusal table - "choose", "change" and "retry"
+# all share it, since all three ultimately call `apply_login()`.
+LoginStart = Literal["started", "busy", "not_ready", "no_login", "nothing_to_do"]
 
 _DEPLOY_FILE_NAME = "deploy.json"
 _DIAGNOSTICS_FILE_NAME = "last-failure.txt"
 _REDACTED_PLACEHOLDER = "<redacted-api-key>"
+_REDACTED_PASSWORD_PLACEHOLDER = "<redacted-password>"
 
 
 @dataclass(frozen=True)
@@ -290,6 +298,7 @@ class DeployManager:
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         wiring: WiringRunner = NoWiringYet(),
+        login: LoginApplier = NoLoginApplier(),
     ) -> None:
         self._settings = settings
         self._engine = engine
@@ -297,7 +306,13 @@ class DeployManager:
         self._clock = clock
         self._sleep = sleep
         self._wiring = wiring
+        self._login = login
         self._task: asyncio.Task[None] | None = None
+        # The login run's own in-memory progress line - never persisted and
+        # never resumed after a restart (the pending names plus Try again
+        # already cover that case), the same "server truth, no browser
+        # required" idea as `snapshot()` itself, just not part of it.
+        self._login_progress: str | None = None
         self._subscribers: list[asyncio.Queue[DeploySnapshot]] = []
         self._deploy_file = settings.config_dir / _DEPLOY_FILE_NAME
         self._diagnostics_file = settings.config_dir / _DIAGNOSTICS_FILE_NAME
@@ -408,12 +423,23 @@ class DeployManager:
         return self._task is not None and not self._task.done()
 
     def is_busy(self) -> bool:
-        """Whether a run (a full deploy, an add, a retry or a reconnect) is
-        actively going right now - the Hub's own "one thing at a time" flag,
-        as opposed to `adding is not None`, which also stays true while a
-        failed add just sits there waiting for "Try again" or "Cancel".
+        """Whether a run (a full deploy, an add, a retry, a reconnect or a
+        login run) is actively going right now - the Hub's own "one thing at
+        a time" flag, as opposed to `adding is not None`, which also stays
+        true while a failed add just sits there waiting for "Try again" or
+        "Cancel".
         """
         return self._is_running()
+
+    def login_progress(self) -> str | None:
+        """The login run's own current line ("Putting your login on
+        Sonarr…"), or `None` while no login run is going.
+
+        In memory only - a restart mid-run loses this line, but never the
+        truth: `login.json`'s own `applied` map is what the Hub reads to
+        name any app still pending, with its own "Try again".
+        """
+        return self._login_progress
 
     def return_to_ready(self) -> DeploySnapshot:
         """Bring back the Deploy button after new choices are saved.
@@ -450,6 +476,8 @@ class DeployManager:
         snapshot = self.snapshot()
         if install is None or snapshot.phase != "finale":
             return "not_ready"
+        if load_login(self._settings.config_dir).login is None:
+            return "no_login"
         if self._is_running() or snapshot.adding is not None:
             return "busy"
         try:
@@ -580,6 +608,33 @@ class DeployManager:
         )
         self._emit(replace(snapshot, adding=adding))
         self._task = asyncio.create_task(self._run_reconnect(app, install))
+        return "started"
+
+    # --- Choosing, changing or retrying the one saved login --------------
+
+    def apply_login(self) -> LoginStart:
+        """Start the login run: choose, change and retry all end up here.
+
+        Synchronous, and refuses in order before ever awaiting anything -
+        the same "nothing can slip between the checks and `create_task`"
+        shape `add_app` already uses. `install_state`/`login.json` are read
+        fresh on every call, so a login saved by one request is always seen
+        by the very next.
+        """
+        install = load_state(self._settings.config_dir)
+        snapshot = self.snapshot()
+        if install is None or snapshot.phase != "finale":
+            return "not_ready"
+        if self._is_running():
+            return "busy"
+        record = load_login(self._settings.config_dir)
+        if record.login is None:
+            return "no_login"
+        installed_ids = tuple(progress.app_id for progress in snapshot.apps)
+        targets = pending_app_ids(record, installed_ids)
+        if not targets:
+            return "nothing_to_do"
+        self._task = asyncio.create_task(self._run_login(install, record.login, targets))
         return "started"
 
     def _current_adding(self) -> AppAdd | None:
@@ -808,6 +863,13 @@ class DeployManager:
                 await self._fail(run_id, started_at, progresses, install, failure)
                 return
 
+        # Every app is up - put the saved login on each one now, in catalog
+        # order, before wiring ever runs. A login failure never fails the
+        # deploy itself: the apps are already up and done, and the Hub names
+        # any app still missing the login with its own "Try again".
+        for app in catalog_apps:
+            await self._put_login(app, install)
+
         await self._publish(
             DeploySnapshot(
                 run_id=run_id,
@@ -831,7 +893,7 @@ class DeployManager:
 
         def collect_wiring_step(step: WiringStep) -> None:
             if step.technical:
-                self._append_diagnostics(_redact_secrets(step.technical, install.api_keys))
+                self._append_diagnostics(self._redact(step.technical, install))
             wiring_rows[step.index] = replace(step, technical=None)
             self._emit(
                 DeploySnapshot(
@@ -927,6 +989,8 @@ class DeployManager:
         network: str,
         self_id: str,
         report: Callable[[AppState, str, str | None], Awaitable[None]],
+        *,
+        recreate: bool = False,
     ) -> Failure | None:
         api_key = install.api_keys.get(app.id)
         if api_key is None:
@@ -945,7 +1009,9 @@ class DeployManager:
         note: str | None = None
         await report("starting", line, note)
 
-        result = await self._engine.compose_up(self._settings.stack_project, compose_path, app.id)
+        result = await self._engine.compose_up(
+            self._settings.stack_project, compose_path, app.id, recreate=recreate
+        )
         if not result.ok:
             return _compose_failure(app, downloading, result)
 
@@ -1129,6 +1195,8 @@ class DeployManager:
             await self._fail_add(app, grown, failure, record_diagnostics)
             return
 
+        await self._put_login(app, grown, record_diagnostics=record_diagnostics)
+
         current = self._current_adding()
         if current is not None:
             self._emit(
@@ -1170,7 +1238,7 @@ class DeployManager:
 
         def collect_wiring_step(step: WiringStep) -> None:
             if step.technical:
-                record_diagnostics(_redact_secrets(step.technical, install.api_keys))
+                record_diagnostics(self._redact(step.technical, install))
             wiring_rows[step.index] = replace(step, technical=None)
             current = self._current_adding()
             if current is not None:
@@ -1233,7 +1301,7 @@ class DeployManager:
         failure: Failure,
         record_diagnostics: Callable[[str], None],
     ) -> None:
-        redacted = replace(failure, technical=_redact_secrets(failure.technical, install.api_keys))
+        redacted = replace(failure, technical=self._redact(failure.technical, install))
         record_diagnostics(f"{redacted.code}\n{redacted.technical}")
         logger.error("add failed (%s): %s", redacted.code, redacted.technical)
         current = self._current_adding()
@@ -1250,7 +1318,7 @@ class DeployManager:
         install: InstallState,
         failure: Failure,
     ) -> None:
-        redacted = replace(failure, technical=_redact_secrets(failure.technical, install.api_keys))
+        redacted = replace(failure, technical=self._redact(failure.technical, install))
         self._diagnostics_file.parent.mkdir(parents=True, exist_ok=True)
         self._diagnostics_file.write_text(f"{redacted.code}\n{redacted.technical}\n")
         logger.error("deploy failed (%s): %s", redacted.code, redacted.technical)
@@ -1272,6 +1340,140 @@ class DeployManager:
         self._diagnostics_file.parent.mkdir(parents=True, exist_ok=True)
         with self._diagnostics_file.open("a", encoding="utf-8") as handle:
             handle.write(text if text.endswith("\n") else f"{text}\n")
+
+    def _redact(self, text: str, install: InstallState) -> str:
+        """The one place every diagnostics write, snapshot failure and log
+        line in this class goes through - keys first, then the saved
+        password (read fresh, never cached, and never passed in by a
+        caller that might get it stale).
+        """
+        saved = load_login(self._settings.config_dir).login
+        passwords = (saved.password,) if saved is not None else ()
+        return _redact_secrets(text, install.api_keys, passwords=passwords)
+
+    # --- Putting the saved login on one app --------------------------------
+
+    async def _put_login(
+        self,
+        app: CatalogApp,
+        install: InstallState,
+        *,
+        record_diagnostics: Callable[[str], None] | None = None,
+    ) -> bool:
+        """Put the saved login on `app` right after it's ready - the one
+        call site both a full deploy and an add share.
+
+        Never raises. `False`, with no call to the applier at all, when
+        there is nothing to put (`app.login_kind == "none"`) or nothing
+        saved yet - the safe default that never locks an app out of a
+        login it was never given. A failure is written to diagnostics
+        through `record_diagnostics` when given (an add's own
+        first-write-replaces recorder), or `_append_diagnostics` otherwise
+        (a full deploy's own diagnostics file, already cleared by `start()`).
+        """
+        if app.login_kind == "none":
+            return False
+        record = load_login(self._settings.config_dir)
+        if record.login is None:
+            return False
+
+        result = await self._login.apply(app, install, record.login)
+        if result.ok:
+            record_applied(self._settings.config_dir, app.id, record.login.generation)
+            return True
+
+        write = record_diagnostics if record_diagnostics is not None else self._append_diagnostics
+        technical = result.technical or f"{app.id}: the saved login was not accepted"
+        redacted = self._redact(technical, install)
+        write(redacted)
+        logger.error("could not put the saved login on %s: %s", app.id, redacted)
+        return False
+
+    # --- The login run: choose, change and retry all share this ------------
+
+    def _login_reporter(self) -> Callable[[AppState, str, str | None], Awaitable[None]]:
+        """`_bring_up_app`'s own `report` callback for the login run's phase
+        2 - it only ever updates `login_progress`, since the login run has
+        no `DeploySnapshot` of its own to publish into.
+        """
+
+        async def report(state: AppState, line: str, note: str | None) -> None:
+            self._login_progress = line
+
+        return report
+
+    async def _run_login(
+        self, install: InstallState, login: SavedLogin, target_ids: tuple[str, ...]
+    ) -> None:
+        record_diagnostics = self._diagnostics_recorder()
+        try:
+            await self._run_login_steps(install, login, target_ids, record_diagnostics)
+        except Exception as error:  # the background task must never die silently
+            logger.exception("login run crashed unexpectedly")
+            record_diagnostics(
+                self._redact(f"login run crashed: {type(error).__name__}: {error}", install)
+            )
+        finally:
+            self._login_progress = None
+
+    async def _run_login_steps(
+        self,
+        install: InstallState,
+        login: SavedLogin,
+        target_ids: tuple[str, ...],
+        record_diagnostics: Callable[[str], None],
+    ) -> None:
+        """Phase 1 puts the login on every target through its own API.
+        Phase 2 recreates - one at a time - only the apps that accepted it,
+        so an app that refused the login is never left asking for one it
+        doesn't have.
+        """
+        targets = apps_in_order(target_ids)
+        accepted: list[CatalogApp] = []
+        for app in targets:
+            self._login_progress = hub_login_line_putting(app.name)
+            result = await self._login.apply(app, install, login)
+            if result.ok:
+                accepted.append(app)
+            else:
+                technical = result.technical or f"{app.id}: the saved login was not accepted"
+                redacted = self._redact(technical, install)
+                record_diagnostics(redacted)
+                logger.error("login run: %s did not accept the login: %s", app.id, redacted)
+
+        if not accepted:
+            return
+
+        docker_status = await self._engine.status()
+        if not docker_status.connected:
+            record_diagnostics(
+                self._redact(
+                    "login run: Docker did not answer "
+                    f"({docker_status.detail or 'no further detail'})",
+                    install,
+                )
+            )
+            return
+
+        plan = build_stack_plan(install)
+        compose_path = write_compose(self._settings, plan)
+        self_id = await self._engine.self_container_id()
+        if self_id is None:
+            record_diagnostics("login run: could not identify Marrquee's own container")
+            return
+
+        report = self._login_reporter()
+        for app in accepted:
+            self._login_progress = hub_login_line_restarting(app.name)
+            failure = await self._bring_up_app(
+                app, install, compose_path, plan.network, self_id, report, recreate=True
+            )
+            if failure is None:
+                record_applied(self._settings.config_dir, app.id, login.generation)
+            else:
+                redacted = self._redact(failure.technical, install)
+                record_diagnostics(redacted)
+                logger.error("login run: %s could not be restarted: %s", app.id, redacted)
 
 
 def read_last_failure(config_dir: Path) -> str | None:
@@ -1433,19 +1635,24 @@ def _compose_failure(app: CatalogApp, downloading: bool, result: ComposeResult) 
     )
 
 
-def _redact_secrets(text: str, api_keys: Mapping[str, str]) -> str:
-    """Replace every known API key with a placeholder before it reaches a log
-    line, a diagnostics file or a snapshot's failure detail.
+def _redact_secrets(text: str, api_keys: Mapping[str, str], passwords: Iterable[str] = ()) -> str:
+    """Replace every known API key, then every known password, with a
+    placeholder before text reaches a log line, a diagnostics file or a
+    snapshot's failure detail.
 
     Docker or an app's own error output could echo back an environment
-    value we set ourselves - redacting by value here is what keeps "API keys
-    never appear in a log or a diagnostics file" true even if a future log
-    line surprises us.
+    value we set ourselves - redacting by value here is what keeps "a secret
+    never appears in a log or a diagnostics file" true even if a future log
+    line surprises us. Passwords are redacted after keys so a password that
+    happened to also look like a key still comes out right either way.
     """
     redacted = text
     for key in api_keys.values():
         if key:
             redacted = redacted.replace(key, _REDACTED_PLACEHOLDER)
+    for password in passwords:
+        if password:
+            redacted = redacted.replace(password, _REDACTED_PASSWORD_PLACEHOLDER)
     return redacted
 
 

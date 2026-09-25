@@ -14,6 +14,7 @@ which state, the root's own attributes) is read with the stdlib
 from __future__ import annotations
 
 import dataclasses
+import re
 import time
 from datetime import UTC, datetime, timedelta
 from html.parser import HTMLParser
@@ -23,6 +24,7 @@ import pytest
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from jinja2 import Environment, FileSystemLoader
+from test_deploy_login import _already_finale_manager
 
 from marrquee import questions as questions_module
 from marrquee import words
@@ -31,7 +33,10 @@ from marrquee.config import Settings
 from marrquee.deploy import AppAdd, AppProgress, DeployManager, DeploySnapshot, Failure, WiringGap
 from marrquee.docker_client import ContainerSnapshot, DockerStatus, FakeDockerEngine
 from marrquee.health import FakeLinkProbe
+from marrquee.hub import LOGIN_HELP_URL
 from marrquee.links import LINK_COUNT_MAX, LinkCard, load_links, save_links
+from marrquee.login import load_login, save_login
+from marrquee.login_apply import FakeLoginApplier
 from marrquee.main import create_app
 from marrquee.questions import QuestionCheck, QuestionField, QuestionStep
 from marrquee.routes.wizard import router as wizard_router
@@ -944,6 +949,7 @@ def test_install_pane_is_truthful(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     save_state(settings.config_dir, _install_state(("prowlarr", "sonarr", "radarr")))
     _write_snapshot(settings, _finale_snapshot(("prowlarr", "sonarr", "radarr")))
+    save_login(settings.config_dir, "owner", "s3cret-password-1", honor_reset=None)
     all_done_client = _client(settings)
 
     all_done = all_done_client.get("/?panel=install")
@@ -953,6 +959,7 @@ def test_install_pane_is_truthful(tmp_path: Path) -> None:
     partial_settings = _settings(tmp_path / "partial")
     save_state(partial_settings.config_dir, _install_state(("sonarr",)))
     _write_snapshot(partial_settings, _finale_snapshot(("sonarr",)))
+    save_login(partial_settings.config_dir, "owner", "s3cret-password-1", honor_reset=None)
     partial_client = _client(partial_settings)
 
     partial = partial_client.get("/?panel=install")
@@ -1297,6 +1304,7 @@ def test_no_js_install_pane_hides_every_control_and_shows_the_noscript_sentence(
     settings = _settings(tmp_path)
     save_state(settings.config_dir, _install_state(("prowlarr", "sonarr")))
     _write_snapshot(settings, _finale_snapshot(("prowlarr", "sonarr")))
+    save_login(settings.config_dir, "owner", "s3cret-password-1", honor_reset=None)
     client = _client(settings)
 
     response = client.get("/?panel=install")
@@ -1365,3 +1373,453 @@ def test_reconnect_re_runs_wiring_for_an_installed_app(tmp_path: Path) -> None:
     final = manager.snapshot()
     assert final.adding is None
     assert final.apps[0].line == app_line_done("Sonarr")
+
+
+# --- The one saved login: choose, change, retry, and the reset line ---------
+
+
+def _wait_until_idle(manager: DeployManager, *, budget: float = 2.0) -> None:
+    """Poll for a background run (an add, a reconnect, or a login run) to
+    finish - the login run's own version of the plain `time.sleep(0.05)`
+    every other background-task test in this file already uses, made into
+    a loop because a login run's phase 2 can genuinely take a few ticks
+    (a docker status read, a compose write, one recreate per app).
+    """
+    deadline = time.monotonic() + budget
+    while manager.is_busy():
+        if time.monotonic() > deadline:
+            raise AssertionError("background run did not finish in time")
+        time.sleep(0.01)
+
+
+def test_nas_with_no_login_shows_the_hub_not_the_wizard(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    _write_snapshot(settings, _finale_snapshot(("sonarr",)))
+    client = _client(settings)
+
+    page = client.get("/", follow_redirects=False)
+    assert page.status_code == 200
+
+    status = client.get("/api/hub/status")
+    assert status.json()["login_banner"] == "choose"
+
+
+def test_choose_saves_the_login_starts_the_run_and_redirects(tmp_path: Path) -> None:
+    manager, engine, config_dir = _already_finale_manager(
+        tmp_path, ("prowlarr",), login_applier=FakeLoginApplier()
+    )
+    settings = Settings(host_mount=tmp_path / "host", config_dir=config_dir)
+    app = create_app(settings=settings, engine=engine, manager=manager)
+    client = TestClient(app)
+
+    response = client.post(
+        "/hub/login",
+        data={"username": "Owner", "password": "s3cret-pass-1", "password_again": "s3cret-pass-1"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/"
+    record = load_login(config_dir)
+    assert record.login is not None
+    # `check_step`'s own rule lowercases the username - what's saved is
+    # what every app's own API will see, not the raw keystrokes.
+    assert record.login.username == "owner"
+
+    # A fake applier and a fake Docker engine never actually await anything,
+    # so the background run may already be done by the time this checks -
+    # `_wait_until_idle` is a no-op in that case, and the real proof either
+    # way is `applied` landing for the one installed app.
+    _wait_until_idle(manager)
+    assert load_login(config_dir).applied.get("prowlarr") == record.login.generation
+
+
+def test_a_refused_choose_writes_nothing_and_keeps_the_username(tmp_path: Path) -> None:
+    manager, engine, config_dir = _already_finale_manager(
+        tmp_path, ("prowlarr",), login_applier=FakeLoginApplier()
+    )
+    settings = Settings(host_mount=tmp_path / "host", config_dir=config_dir)
+    app = create_app(settings=settings, engine=engine, manager=manager)
+    client = TestClient(app)
+
+    response = client.post(
+        "/hub/login",
+        data={"username": "Owner", "password": "short", "password_again": "short"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 200
+    assert load_login(config_dir).login is None
+    assert manager.is_busy() is False
+    # The username is kept in the box (lowercased, the same rule a saved
+    # login is normalised by), the refusal names the field, and the
+    # password boxes are never re-filled with what was typed.
+    assert 'value="owner"' in response.text
+    assert words.LOGIN_PROBLEM_PASSWORD_SHORT in response.text
+    assert 'value="short"' not in response.text
+
+
+def test_change_with_a_wrong_current_password_changes_nothing(tmp_path: Path) -> None:
+    manager, engine, config_dir = _already_finale_manager(
+        tmp_path, ("prowlarr",), login_applier=FakeLoginApplier()
+    )
+    settings = Settings(host_mount=tmp_path / "host", config_dir=config_dir)
+    save_login(config_dir, "owner", "right-password-1", honor_reset=None)
+    before = (config_dir / "login.json").read_bytes()
+    app = create_app(settings=settings, engine=engine, manager=manager)
+    client = TestClient(app)
+
+    response = client.post(
+        "/hub/login/change",
+        data={
+            "current_password": "nope-nope-1",
+            "username": "owner",
+            "password": "new-password-1",
+            "password_again": "new-password-1",
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 200
+    assert (config_dir / "login.json").read_bytes() == before
+    assert manager.is_busy() is False
+
+
+def test_a_blank_new_password_keeps_it_and_changes_only_the_username(tmp_path: Path) -> None:
+    manager, engine, config_dir = _already_finale_manager(
+        tmp_path, ("prowlarr",), login_applier=FakeLoginApplier()
+    )
+    settings = Settings(host_mount=tmp_path / "host", config_dir=config_dir)
+    original = save_login(config_dir, "owner", "first-password-1", honor_reset=None)
+    app = create_app(settings=settings, engine=engine, manager=manager)
+    client = TestClient(app)
+
+    response = client.post(
+        "/hub/login/change",
+        data={
+            "current_password": "first-password-1",
+            "username": "new-owner",
+            "password": "",
+            "password_again": "",
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    record = load_login(config_dir)
+    assert record.login is not None
+    assert record.login.username == "new-owner"
+    assert record.login.password == "first-password-1"
+    assert record.login.generation == original.generation + 1
+
+
+def test_reset_is_one_shot_and_the_reminder_shows_while_the_line_stays(tmp_path: Path) -> None:
+    manager, engine, config_dir = _already_finale_manager(
+        tmp_path, ("prowlarr",), login_applier=FakeLoginApplier()
+    )
+    reset_value = "forgot-my-password-2026"
+    settings = Settings(
+        host_mount=tmp_path / "host", config_dir=config_dir, reset_login=reset_value
+    )
+    save_login(config_dir, "owner", "old-password-1", honor_reset=None)
+    app = create_app(settings=settings, engine=engine, manager=manager)
+    client = TestClient(app)
+
+    before_reset = client.get("/api/hub/status")
+    assert before_reset.json()["login_banner"] == "reset"
+
+    # No current password required while a reset is outstanding.
+    response = client.post(
+        "/hub/login",
+        data={
+            "username": "owner",
+            "password": "second-password-1",
+            "password_again": "second-password-1",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+
+    record = load_login(config_dir)
+    assert record.reset_honored == reset_value
+
+    after_reset = client.get("/api/hub/status")
+    # `record_applied` hasn't landed yet (a background run just started),
+    # so the honest banner right after saving is "applying", not "none" -
+    # what matters here is that it is never "reset" again for this value.
+    assert after_reset.json()["login_banner"] != "reset"
+
+    _wait_until_idle(manager)
+
+    # Restarting the app (a new `create_app`, the same `reset_login` value
+    # already honoured) must never reset a second time.
+    second_app = create_app(settings=settings, engine=engine, manager=manager)
+    second_client = TestClient(second_app)
+    still_set = second_client.get("/api/hub/status")
+    assert still_set.json()["login_banner"] == "none"
+
+
+def test_retry_starts_a_run_only_when_something_is_pending(tmp_path: Path) -> None:
+    applier = FakeLoginApplier(results={"sonarr": False})
+    manager, engine, config_dir = _already_finale_manager(
+        tmp_path, ("prowlarr", "sonarr"), login_applier=applier
+    )
+    settings = Settings(host_mount=tmp_path / "host", config_dir=config_dir)
+    save_login(config_dir, "owner", "s3cret-password-1", honor_reset=None)
+    app = create_app(settings=settings, engine=engine, manager=manager)
+    client = TestClient(app)
+
+    first = client.post("/hub/login/retry", follow_redirects=False)
+    assert first.status_code == 303
+    _wait_until_idle(manager)
+
+    # The applier was actually called for both pending apps - proof the
+    # retry started a real run, not a silent no-op.
+    assert {call[0] for call in applier.calls} == {"prowlarr", "sonarr"}
+    record = load_login(config_dir)
+    assert record.login is not None
+    assert record.applied.get("prowlarr") == record.login.generation
+    assert record.applied.get("sonarr") != record.login.generation
+
+    # A second retry while sonarr is still pending calls the applier again.
+    second = client.post("/hub/login/retry", follow_redirects=False)
+    assert second.status_code == 303
+    _wait_until_idle(manager)
+    assert len(applier.calls) > 2
+
+
+def test_status_json_carries_login_banner_and_never_a_password(tmp_path: Path) -> None:
+    manager, engine, config_dir = _already_finale_manager(
+        tmp_path, ("prowlarr",), login_applier=FakeLoginApplier()
+    )
+    settings = Settings(host_mount=tmp_path / "host", config_dir=config_dir)
+    save_login(config_dir, "owner", "s3cret-password-1", honor_reset=None)
+    app = create_app(settings=settings, engine=engine, manager=manager)
+    client = TestClient(app)
+
+    response = client.get("/api/hub/status")
+
+    assert response.status_code == 200
+    assert "login_banner" in response.json()
+    assert "s3cret-password-1" not in response.text
+
+
+# --- The one saved login: the Hub's own markup, for every state -------------
+
+
+def test_every_login_hook_exists_for_its_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FIRST TEST - every login hook the page promises exists on a real
+    render of the state that should draw it: `data-login-banner` always
+    carries the current banner, `data-role="login-banner"` wraps the
+    choose/reset form and the applying line, `data-role="login-pending"`
+    names the apps still waiting, `data-role="login-summary"` and
+    `data-panel-open="login"` appear once a login is set, and
+    `data-panel-pane="login"` (the Change pane's own div) is on every
+    render, whatever the state.
+    """
+    # choose: nothing saved yet.
+    choose_root = tmp_path / "choose"
+    manager, engine, config_dir = _already_finale_manager(
+        choose_root, ("prowlarr",), login_applier=FakeLoginApplier()
+    )
+    settings = Settings(host_mount=choose_root / "host", config_dir=config_dir)
+    choose_page = (
+        TestClient(create_app(settings=settings, engine=engine, manager=manager)).get("/").text
+    )
+    assert 'data-login-banner="choose"' in choose_page
+    assert 'data-role="login-banner"' in choose_page
+    assert 'action="/hub/login"' in choose_page
+    assert 'data-panel-pane="login"' in choose_page
+    assert 'data-role="login-summary"' not in choose_page
+
+    # reset: saved, but the current MARRQUEE_RESET_LOGIN value is new.
+    reset_root = tmp_path / "reset"
+    manager, engine, config_dir = _already_finale_manager(
+        reset_root, ("prowlarr",), login_applier=FakeLoginApplier()
+    )
+    save_login(config_dir, "owner", "old-password-1", honor_reset=None)
+    settings = Settings(
+        host_mount=reset_root / "host", config_dir=config_dir, reset_login="forgot-2026"
+    )
+    reset_page = (
+        TestClient(create_app(settings=settings, engine=engine, manager=manager)).get("/").text
+    )
+    assert 'data-login-banner="reset"' in reset_page
+    assert 'data-role="login-banner"' in reset_page
+    assert 'action="/hub/login"' in reset_page
+
+    # applying: a login run is going right now.
+    applying_root = tmp_path / "applying"
+    manager, engine, config_dir = _already_finale_manager(
+        applying_root, ("prowlarr",), login_applier=FakeLoginApplier()
+    )
+    save_login(config_dir, "owner", "s3cret-password-1", honor_reset=None)
+    monkeypatch.setattr(manager, "login_progress", lambda: "Putting your login on Prowlarr…")
+    settings = Settings(host_mount=applying_root / "host", config_dir=config_dir)
+    applying_page = (
+        TestClient(create_app(settings=settings, engine=engine, manager=manager)).get("/").text
+    )
+    assert 'data-login-banner="applying"' in applying_page
+    assert 'data-role="login-banner"' in applying_page
+    assert 'data-role="login-line"' in applying_page
+    assert "Putting your login on Prowlarr…" in applying_page
+
+    # pending: saved, but sonarr never received it.
+    pending_root = tmp_path / "pending"
+    manager, engine, config_dir = _already_finale_manager(
+        pending_root,
+        ("prowlarr", "sonarr"),
+        login_applier=FakeLoginApplier(results={"sonarr": False}),
+    )
+    settings = Settings(host_mount=pending_root / "host", config_dir=config_dir)
+    client = TestClient(create_app(settings=settings, engine=engine, manager=manager))
+    client.post(
+        "/hub/login",
+        data={
+            "username": "owner",
+            "password": "s3cret-password-1",
+            "password_again": "s3cret-password-1",
+        },
+    )
+    _wait_until_idle(manager)
+    pending_page = client.get("/").text
+    assert 'data-login-banner="pending"' in pending_page
+    assert 'data-role="login-pending"' in pending_page
+    assert 'action="/hub/login/retry"' in pending_page
+
+    # set: every installed app has it - the summary and its Change/Forgot
+    # links replace every banner, and the pane behind them is on the page.
+    set_root = tmp_path / "set"
+    manager, engine, config_dir = _already_finale_manager(
+        set_root, ("prowlarr",), login_applier=FakeLoginApplier()
+    )
+    settings = Settings(host_mount=set_root / "host", config_dir=config_dir)
+    client = TestClient(create_app(settings=settings, engine=engine, manager=manager))
+    client.post(
+        "/hub/login",
+        data={
+            "username": "owner",
+            "password": "s3cret-password-1",
+            "password_again": "s3cret-password-1",
+        },
+    )
+    _wait_until_idle(manager)
+    set_page = client.get("/").text
+    assert 'data-login-banner="none"' in set_page
+    assert 'data-role="login-summary"' in set_page
+    assert 'data-panel-open="login"' in set_page
+    assert 'data-panel-pane="login"' in set_page
+    assert 'data-role="login-banner"' not in set_page
+    assert 'data-role="login-pending"' not in set_page
+
+
+def test_choose_banner_shows_rules_hints_and_the_plex_note_with_no_password_value(
+    tmp_path: Path,
+) -> None:
+    manager, engine, config_dir = _already_finale_manager(
+        tmp_path, ("prowlarr",), login_applier=FakeLoginApplier()
+    )
+    settings = Settings(host_mount=tmp_path / "host", config_dir=config_dir)
+    client = TestClient(create_app(settings=settings, engine=engine, manager=manager))
+
+    page = client.get("/").text
+    start = page.index('data-role="login-banner"')
+    banner = page[start : page.index("</section>", start)]
+
+    assert words.LOGIN_USERNAME_HINT in banner
+    assert words.LOGIN_PASSWORD_HINT in banner
+    assert words.LOGIN_PLEX_NOTE in banner
+    password_inputs = re.findall(r"<input[^>]*type=\"password\"[^>]*>", banner)
+    assert len(password_inputs) == 2
+    assert all("value=" not in field for field in password_inputs)
+
+
+def test_pending_banner_names_sonarr_and_offers_try_again(tmp_path: Path) -> None:
+    manager, engine, config_dir = _already_finale_manager(
+        tmp_path,
+        ("prowlarr", "sonarr"),
+        login_applier=FakeLoginApplier(results={"sonarr": False}),
+    )
+    settings = Settings(host_mount=tmp_path / "host", config_dir=config_dir)
+    client = TestClient(create_app(settings=settings, engine=engine, manager=manager))
+    client.post(
+        "/hub/login",
+        data={
+            "username": "owner",
+            "password": "s3cret-password-1",
+            "password_again": "s3cret-password-1",
+        },
+    )
+    _wait_until_idle(manager)
+
+    page = client.get("/").text
+
+    assert 'data-role="login-pending"' in page
+    start = page.index('data-role="login-pending"')
+    pending = page[start : page.index("</div>", start)]
+
+    assert words.hub_login_pending(("Sonarr",)) in pending
+    assert words.LOGIN_TRY_AGAIN in pending
+    assert 'action="/hub/login/retry"' in pending
+
+
+def test_reset_reminder_links_to_the_readme_section(tmp_path: Path) -> None:
+    reset_value = "forgot-my-password-2026"
+    manager, engine, config_dir = _already_finale_manager(
+        tmp_path, ("prowlarr",), login_applier=FakeLoginApplier()
+    )
+    settings = Settings(
+        host_mount=tmp_path / "host", config_dir=config_dir, reset_login=reset_value
+    )
+    client = TestClient(create_app(settings=settings, engine=engine, manager=manager))
+    client.post(
+        "/hub/login",
+        data={
+            "username": "owner",
+            "password": "s3cret-password-1",
+            "password_again": "s3cret-password-1",
+        },
+    )
+    _wait_until_idle(manager)
+
+    page = client.get("/").text
+
+    # Scoped to the reminder's own element - `LOGIN_HELP_URL` also appears
+    # in the footer summary once a login is set, so a bare "is it on the
+    # page anywhere" check would pass even if the reminder itself linked
+    # nowhere.
+    start = page.index('data-role="login-reset-reminder"')
+    reminder = page[start : page.index("</div>", start)]
+
+    assert words.HUB_LOGIN_RESET_REMINDER.replace("'", "&#39;") in reminder
+    assert f'href="{LOGIN_HELP_URL}"' in reminder
+
+
+def test_a_refused_change_reopens_the_login_pane_with_focus_on_the_field(tmp_path: Path) -> None:
+    manager, engine, config_dir = _already_finale_manager(
+        tmp_path, ("prowlarr",), login_applier=FakeLoginApplier()
+    )
+    settings = Settings(host_mount=tmp_path / "host", config_dir=config_dir)
+    save_login(config_dir, "owner", "right-password-1", honor_reset=None)
+    client = TestClient(create_app(settings=settings, engine=engine, manager=manager))
+
+    response = client.post(
+        "/hub/login/change",
+        data={
+            "current_password": "nope-nope-1",
+            "username": "owner",
+            "password": "new-password-1",
+            "password_again": "new-password-1",
+        },
+    )
+
+    assert response.status_code == 200
+    assert 'data-panel-mode="login"' in response.text
+    assert words.CHANGE_PROBLEM_WRONG_CURRENT.replace("'", "&#39;") in response.text
+    assert "new-password-1" not in response.text
+    assert "nope-nope-1" not in response.text
+    match = re.search(r'id="q-marrquee-current_password"[^>]*autofocus', response.text)
+    assert match is not None, "expected autofocus on the current-password field"

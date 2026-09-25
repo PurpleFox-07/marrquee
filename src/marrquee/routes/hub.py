@@ -30,7 +30,17 @@ from marrquee.config import Settings
 from marrquee.deploy import DeployManager
 from marrquee.docker_client import DockerEngine
 from marrquee.health import LinkProbe, read_health, read_link_health
-from marrquee.hub import HUB_ADD_POLL_MS, HUB_POLL_MS, HubPanel, HubView, hub_panel, hub_view
+from marrquee.hub import (
+    HUB_ADD_POLL_MS,
+    HUB_POLL_MS,
+    LOGIN_HELP_URL,
+    HubPanel,
+    HubView,
+    LoginFormState,
+    hub_panel,
+    hub_view,
+    login_view,
+)
 from marrquee.links import (
     LINK_COUNT_MAX,
     LINK_ID_RE,
@@ -41,6 +51,16 @@ from marrquee.links import (
     new_link_id,
     save_links,
 )
+from marrquee.login import (
+    CHANGE_STEP,
+    LOGIN_RESET_STEP,
+    LOGIN_STEP,
+    load_login,
+    login_status,
+    password_matches,
+    save_login,
+)
+from marrquee.questions import check_step
 from marrquee.state import load_state
 
 router = APIRouter()
@@ -91,6 +111,13 @@ async def read_hub_view(request: Request) -> HubView:
         read_link_health(link_probe, links),
     )
 
+    login = login_view(
+        load_login(settings.config_dir),
+        reset_value=settings.reset_login,
+        installed=app_ids,
+        running_line=manager.login_progress(),
+    )
+
     return hub_view(
         app_ids,
         healths,
@@ -102,6 +129,7 @@ async def read_hub_view(request: Request) -> HubView:
         adding=snapshot.adding,
         wiring_gaps=snapshot.wiring_gaps,
         busy=manager.is_busy(),
+        login=login,
     )
 
 
@@ -122,15 +150,32 @@ async def get_hub(request: Request) -> Response:
 
 
 def _hub_response(
-    request: Request, view: HubView, panel: HubPanel, *, status_code: int = 200
+    request: Request,
+    view: HubView,
+    panel: HubPanel,
+    *,
+    status_code: int = 200,
+    login_form: LoginFormState | None = None,
+    change_form: LoginFormState | None = None,
 ) -> Response:
     templates: Jinja2Templates = request.app.state.templates
+    # The choose banner and the reset banner ask the same three questions
+    # through the same `check_step` - only the step's title/lede change, so
+    # the template never has to choose between the two itself.
+    login_step = (
+        LOGIN_RESET_STEP if view.login is not None and view.login.banner == "reset" else LOGIN_STEP
+    )
     context = {
         "view": view,
         "words": words,
         "poll_ms": HUB_POLL_MS,
         "add_poll_ms": HUB_ADD_POLL_MS,
         "panel": panel,
+        "login_form": login_form,
+        "change_form": change_form,
+        "login_step": login_step,
+        "change_step": CHANGE_STEP,
+        "login_help_url": LOGIN_HELP_URL,
     }
     return templates.TemplateResponse(request, "hub.html", context, status_code=status_code)
 
@@ -210,6 +255,152 @@ async def post_hub_link_remove(link_id: str, request: Request) -> Response:
     remaining = tuple(card for card in links if card.id != link_id)
     if len(remaining) != len(links):
         save_links(settings.config_dir, remaining)
+    return RedirectResponse("/", status_code=303)
+
+
+# --- The one saved login: choose, change and retry ---------------------------
+
+
+async def _login_choose_refusal(
+    request: Request, *, username: str, problem: str, problem_field: str | None
+) -> Response:
+    """Re-render the live Hub with the choose/reset banner's own refusal -
+    the username kept, every password box left blank, and nothing saved.
+    """
+    view = await read_hub_view(request)
+    settings: Settings = request.app.state.settings
+    links = load_links(settings.config_dir)
+    panel = hub_panel(request.query_params.get("panel"), request.query_params.get("link"), links)
+    login_form = LoginFormState(
+        answers={"username": username}, problem=problem, problem_field=problem_field
+    )
+    return _hub_response(request, view, panel, login_form=login_form)
+
+
+async def _login_change_refusal(
+    request: Request, *, username: str, problem: str, problem_field: str | None
+) -> Response:
+    """Re-render the live Hub with the panel forced open on the login pane
+    - a Change refusal always comes from that pane, whatever `?panel=` the
+    request itself carried.
+    """
+    view = await read_hub_view(request)
+    change_form = LoginFormState(
+        answers={"username": username}, problem=problem, problem_field=problem_field
+    )
+    panel = HubPanel(mode="login", edit=None, label="", url="", error=None)
+    return _hub_response(request, view, panel, change_form=change_form)
+
+
+@router.post("/hub/login", response_class=HTMLResponse)
+async def post_hub_login(request: Request) -> Response:
+    """Choose the login for the first time, or answer an outstanding reset -
+    the same step (`LOGIN_STEP`) either way, since neither one needs an old
+    password to check against.
+    """
+    form = await request.form()
+    settings: Settings = request.app.state.settings
+    manager: DeployManager = request.app.state.deploy
+
+    record = load_login(settings.config_dir)
+    if login_status(record, settings.reset_login) not in ("none", "reset"):
+        return RedirectResponse("/", status_code=303)
+
+    if manager.is_busy():
+        return await _login_choose_refusal(
+            request,
+            username=_form_value(form, "username"),
+            problem=words.HUB_LOGIN_BUSY,
+            problem_field=None,
+        )
+
+    posted = {field.name: _form_value(form, field.name) for field in LOGIN_STEP.fields}
+    check = check_step(LOGIN_STEP, posted, {})
+    if not check.ok:
+        return await _login_choose_refusal(
+            request,
+            username=check.answers.get("username", _form_value(form, "username")),
+            problem=check.problem or "",
+            problem_field=check.field,
+        )
+
+    save_login(
+        settings.config_dir,
+        check.answers["username"],
+        check.answers["password"],
+        honor_reset=settings.reset_login,
+    )
+    manager.apply_login()
+    return RedirectResponse("/", status_code=303)
+
+
+@router.post("/hub/login/change", response_class=HTMLResponse)
+async def post_hub_login_change(request: Request) -> Response:
+    """Change the username and/or password - the current password is
+    required, and a blank new password (and confirmation) keeps the one
+    already saved.
+    """
+    form = await request.form()
+    settings: Settings = request.app.state.settings
+    manager: DeployManager = request.app.state.deploy
+
+    record = load_login(settings.config_dir)
+    if login_status(record, settings.reset_login) != "set" or record.login is None:
+        return RedirectResponse("/", status_code=303)
+
+    if manager.is_busy():
+        return await _login_change_refusal(
+            request,
+            username=_form_value(form, "username"),
+            problem=words.HUB_LOGIN_BUSY,
+            problem_field=None,
+        )
+
+    posted = {field.name: _form_value(form, field.name) for field in CHANGE_STEP.fields}
+    check = check_step(CHANGE_STEP, posted, {})
+    if not check.ok:
+        return await _login_change_refusal(
+            request,
+            username=check.answers.get("username", _form_value(form, "username")),
+            problem=check.problem or "",
+            problem_field=check.field,
+        )
+
+    if not password_matches(record.login, check.answers["current_password"]):
+        return await _login_change_refusal(
+            request,
+            username=check.answers.get("username", _form_value(form, "username")),
+            problem=words.CHANGE_PROBLEM_WRONG_CURRENT,
+            problem_field="current_password",
+        )
+
+    new_username = check.answers["username"]
+    new_password = check.answers["password"]
+    if new_username == record.login.username and new_password == "":
+        return await _login_change_refusal(
+            request,
+            username=new_username,
+            problem=words.CHANGE_PROBLEM_NOTHING,
+            problem_field=None,
+        )
+
+    save_login(
+        settings.config_dir,
+        new_username,
+        new_password or record.login.password,
+        honor_reset=None,
+    )
+    manager.apply_login()
+    return RedirectResponse("/", status_code=303)
+
+
+@router.post("/hub/login/retry")
+async def post_hub_login_retry(request: Request) -> Response:
+    settings: Settings = request.app.state.settings
+    manager: DeployManager = request.app.state.deploy
+    record = load_login(settings.config_dir)
+    if login_status(record, settings.reset_login) == "set" and not manager.is_busy():
+        manager.apply_login()
     return RedirectResponse("/", status_code=303)
 
 

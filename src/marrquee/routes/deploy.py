@@ -20,6 +20,7 @@ from marrquee.addresses import authority_from_headers
 from marrquee.config import Settings
 from marrquee.deploy import DeployManager
 from marrquee.deploy_screen import deploy_view
+from marrquee.login import load_login
 from marrquee.state import load_state
 from marrquee.wizard import step_number, wizard_steps
 
@@ -63,12 +64,21 @@ async def post_deploy(request: Request) -> Response:
 
     With nothing saved there is nothing to start; `DeployManager.start()`
     itself is the guard against a double-click starting a second run while
-    one is already going.
+    one is already going. With no saved login, a fresh install has no
+    business reaching a real deploy at all - sent back to the login step
+    instead (or, on the unlikely chance the Hub already exists, home).
     """
     settings: Settings = request.app.state.settings
-    if load_state(settings.config_dir) is None:
+    state = load_state(settings.config_dir)
+    if state is None:
         return RedirectResponse("/setup/apps", status_code=303)
 
     manager: DeployManager = request.app.state.deploy
+    if load_login(settings.config_dir).login is None:
+        if manager.snapshot().phase == "finale":
+            return RedirectResponse("/", status_code=303)
+        apps_csv = ",".join(state.app_ids)
+        return RedirectResponse(f"/setup/login?apps={apps_csv}", status_code=303)
+
     manager.start()
     return RedirectResponse("/deploy", status_code=303)

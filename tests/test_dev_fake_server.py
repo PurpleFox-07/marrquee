@@ -17,7 +17,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 from marrquee.deploy import DeploySnapshot, read_last_failure
+from marrquee.login import load_login
 from tools.dev_fake_server import HUB_SCENES, SCENES, build_app
+
+_DEMO_APP_IDS = ("prowlarr", "sonarr", "radarr")
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _README_PATH = _REPO_ROOT / "README.md"
@@ -115,6 +118,20 @@ async def test_the_dev_server_writes_nothing_outside_its_temporary_directory(
     assert set(tmp_path.iterdir()) == siblings_before | {root}
 
 
+async def test_a_deploy_scene_seeds_a_login_and_puts_it_on_every_app(tmp_path: Path) -> None:
+    """Without a seeded login, pressing Deploy on the demo's own page would
+    just redirect to the login step - `_seed_install` seeds one, and the
+    wired-in `FakeLoginApplier` (never a real `HttpLoginApplier`, which
+    would try to reach the network) puts it on every app as it comes up.
+    """
+    _history, config_dir = await _play_scene("happy", tmp_path)
+
+    record = load_login(config_dir)
+    assert record.login is not None
+    assert record.login.username == "demo"
+    assert set(record.applied) == set(_DEMO_APP_IDS)
+
+
 # --- The Hub scenes: no deploy ever runs for these -------------------------
 
 
@@ -128,6 +145,20 @@ def test_the_hub_scene_serves_the_hub_at_the_front_door(tmp_path: Path) -> None:
     assert response.status_code == 200
     assert "data-hub" in response.text
     assert response.text.count('data-state="up"') == 3
+
+
+def test_the_hub_scenes_show_no_pending_login_banner(tmp_path: Path) -> None:
+    """A Hub scene means "already fully set up" - `_seed_hub_deploy` records
+    every app as already carrying the seeded login, so the front door shows
+    no "choose" or "pending" banner cluttering an otherwise-clean demo.
+    """
+    clock = _FakeClock()
+    app = build_app(scene="hub", root=tmp_path, clock=clock.time, sleep=clock.sleep)
+    client = TestClient(app)
+
+    response = client.get("/")
+
+    assert 'data-login-banner="none"' in response.text
 
 
 def test_the_hub_stopped_scene_shows_a_down_radarr_with_a_last_seen_line(

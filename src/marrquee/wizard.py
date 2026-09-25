@@ -70,14 +70,17 @@ class WizardStep:
 def wizard_steps(app_ids: Iterable[str]) -> tuple[WizardStep, ...]:
     """The full progress row for a wizard run that has ticked `app_ids`.
 
-    Always "Your apps" first, then one pill per registered question step
-    those apps carry (in `question_steps_for`'s own catalog-then-declared
-    order), then "Your drive" and "Deploy". No catalog app has a question
-    yet, so today this is byte-identical to the three fixed pills the
-    wizard has always shown - a later app's question step inserts itself
-    here without either screen changing.
+    Always "Your apps" then "Your login" first, then one pill per
+    registered question step those apps carry (in `question_steps_for`'s
+    own catalog-then-declared order), then "Your drive" and "Deploy". No
+    catalog app has a question yet, so today this is byte-identical to the
+    four fixed pills the wizard always shows - a later app's question step
+    inserts itself here without either screen changing.
     """
-    steps = [WizardStep(number=1, label=words.WIZARD_STEP_APPS, key="apps")]
+    steps = [
+        WizardStep(number=1, label=words.WIZARD_STEP_APPS, key="apps"),
+        WizardStep(number=2, label=words.WIZARD_STEP_LOGIN, key="login"),
+    ]
     for step in question_steps_for(app_ids):
         steps.append(
             WizardStep(

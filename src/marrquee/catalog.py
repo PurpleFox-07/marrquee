@@ -36,6 +36,13 @@ class AppRule:
     reason: str
 
 
+# What kind of login an app takes, so login.py knows which apps to put the
+# saved username and password on. "none" is the default and the fail-safe
+# value - an app that has it wrongly just never gets a login pushed to it,
+# it never ends up locked out of one it doesn't have.
+LoginKind = Literal["arr", "none"]
+
+
 @dataclass(frozen=True)
 class CatalogApp:
     """Everything Marrquee needs to know about one arr app before it exists."""
@@ -54,6 +61,7 @@ class CatalogApp:
     default_ticked: bool = True
     web_page: bool = True
     rules: tuple[AppRule, ...] = ()
+    login_kind: LoginKind = "none"
 
 
 # Prowlarr, Sonarr and Radarr only - no qBittorrent, because the downloader
@@ -71,6 +79,7 @@ CATALOG: tuple[CatalogApp, ...] = (
         needs_data_mount=False,
         glyph="PR",
         order=0,
+        login_kind="arr",
     ),
     CatalogApp(
         id="sonarr",
@@ -84,6 +93,7 @@ CATALOG: tuple[CatalogApp, ...] = (
         needs_data_mount=True,
         glyph="SN",
         order=1,
+        login_kind="arr",
     ),
     CatalogApp(
         id="radarr",
@@ -97,6 +107,7 @@ CATALOG: tuple[CatalogApp, ...] = (
         needs_data_mount=True,
         glyph="RD",
         order=2,
+        login_kind="arr",
     ),
 )
 

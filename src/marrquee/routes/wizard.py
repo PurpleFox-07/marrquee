@@ -27,6 +27,7 @@ from marrquee.config import Settings
 from marrquee.deploy import DeployManager
 from marrquee.docker_client import DockerEngine, detect_host_kind
 from marrquee.install import install_apps
+from marrquee.login import LOGIN_STEP, LoginRecord, load_login, save_login
 from marrquee.questions import (
     QuestionStep,
     check_step,
@@ -158,7 +159,108 @@ async def post_setup_apps(request: Request) -> Response:
         return templates.TemplateResponse(request, "wizard_apps.html", context)
 
     apps_csv = ",".join(selected)
-    first_question = question_steps_for(selected)
+    return RedirectResponse(f"/setup/login?apps={apps_csv}", status_code=303)
+
+
+# --- Screen one-point-five: the one login every app will use -----------------
+#
+# Not a registered `QuestionStep` (it isn't per-app), so it gets its own
+# pair of routes rather than living behind `/setup/questions/...` - but it
+# shares the exact same `check_step`/`app_questions.html` machinery every
+# per-app question step already uses.
+
+
+def _saved_login_answers(record: LoginRecord) -> Mapping[str, str]:
+    """`check_step`'s `saved` argument for the login step: a blank password
+    or confirmation on a return visit keeps whatever is already chosen,
+    the same "keep" rule every password field in this codebase follows.
+    Username is a `text` field, so it is never auto-kept this way - it's
+    just pre-filled below, in `answers`, so a returning owner doesn't have
+    to retype it.
+    """
+    if record.login is None:
+        return {}
+    return {
+        "username": record.login.username,
+        "password": record.login.password,
+        "password_again": record.login.password,
+    }
+
+
+async def _login_context(
+    request: Request,
+    *,
+    app_ids: tuple[str, ...],
+    answers: Mapping[str, str],
+    problem: str | None,
+    problem_field: str | None,
+) -> dict[str, object]:
+    apps_csv = ",".join(app_ids)
+    steps = wizard_steps(app_ids)
+    return {
+        "steps": steps,
+        "current_step": step_number(steps, "login"),
+        "step": LOGIN_STEP,
+        "answers": answers,
+        "problem": problem,
+        "problem_field": problem_field,
+        "apps_csv": apps_csv,
+        "back_url": f"/setup/apps?apps={apps_csv}",
+        "warning": await _platform_warning(request),
+        "words": words,
+    }
+
+
+@router.get("/setup/login", response_class=HTMLResponse)
+async def get_setup_login(request: Request) -> Response:
+    if _hub_exists(request):
+        return RedirectResponse("/", status_code=303)
+    settings: Settings = request.app.state.settings
+    templates: Jinja2Templates = request.app.state.templates
+
+    app_ids = parse_app_ids(request.query_params.get("apps", ""))
+    record = load_login(settings.config_dir)
+    context = await _login_context(
+        request,
+        app_ids=app_ids,
+        answers=_saved_login_answers(record),
+        problem=None,
+        problem_field=None,
+    )
+    return templates.TemplateResponse(request, "wizard_login.html", context)
+
+
+@router.post("/setup/login", response_class=HTMLResponse)
+async def post_setup_login(request: Request) -> Response:
+    if _hub_exists(request):
+        return RedirectResponse("/", status_code=303)
+    settings: Settings = request.app.state.settings
+    templates: Jinja2Templates = request.app.state.templates
+    form = await request.form()
+
+    app_ids = parse_app_ids(_form_value(form, "apps"))
+    record = load_login(settings.config_dir)
+    posted = {field.name: _form_value(form, field.name) for field in LOGIN_STEP.fields}
+    check = check_step(LOGIN_STEP, posted, _saved_login_answers(record))
+    if not check.ok:
+        context = await _login_context(
+            request,
+            app_ids=app_ids,
+            answers=check.answers,
+            problem=check.problem,
+            problem_field=check.field,
+        )
+        return templates.TemplateResponse(request, "wizard_login.html", context)
+
+    save_login(
+        settings.config_dir,
+        check.answers["username"],
+        check.answers["password"],
+        honor_reset=settings.reset_login,
+    )
+
+    apps_csv = ",".join(app_ids)
+    first_question = question_steps_for(app_ids)
     if first_question:
         step = first_question[0]
         return RedirectResponse(
@@ -304,6 +406,20 @@ def _drive_back_url(app_ids: tuple[str, ...], apps_csv: str) -> str:
     return f"/setup/apps?apps={apps_csv}"
 
 
+def _login_missing_redirect(settings: Settings, app_ids: tuple[str, ...]) -> Response | None:
+    """A 303 to the login step when nothing is saved yet, else `None`.
+
+    Checked before `_missing_step_redirect` on both `/setup/drive` handlers
+    - an app's own question can wait, but no fresh install may ever reach
+    `install_apps` (and, from there, a real deploy) without a login already
+    chosen.
+    """
+    if load_login(settings.config_dir).login is not None:
+        return None
+    apps_csv = ",".join(app_ids)
+    return RedirectResponse(f"/setup/login?apps={apps_csv}", status_code=303)
+
+
 def _missing_step_redirect(settings: Settings, app_ids: tuple[str, ...]) -> Response | None:
     """A 303 to the first unanswered question step, or `None` when every
     registered step for `app_ids` already has its answers saved.
@@ -364,6 +480,10 @@ async def get_setup_drive(request: Request) -> Response:
     if not app_ids:
         return RedirectResponse("/setup/apps", status_code=303)
 
+    login_blocked = _login_missing_redirect(settings, app_ids)
+    if login_blocked is not None:
+        return login_blocked
+
     blocked = _missing_step_redirect(settings, app_ids)
     if blocked is not None:
         return blocked
@@ -394,6 +514,10 @@ async def post_setup_drive(request: Request) -> Response:
     app_ids = parse_app_ids(_form_value(form, "apps"))
     if not app_ids:
         return RedirectResponse("/setup/apps", status_code=303)
+
+    login_blocked = _login_missing_redirect(settings, app_ids)
+    if login_blocked is not None:
+        return login_blocked
 
     blocked = _missing_step_redirect(settings, app_ids)
     if blocked is not None:

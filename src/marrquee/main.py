@@ -19,11 +19,13 @@ from marrquee.config import Settings
 from marrquee.deploy import DeployManager, HttpReadinessProbe, ReadinessProbe
 from marrquee.docker_client import DockerEngine, SocketDockerEngine
 from marrquee.health import HttpLinkProbe, LinkProbe
+from marrquee.login_apply import HttpLoginApplier, LoginApplier
 from marrquee.routes.alive import router as alive_router
 from marrquee.routes.api import router as api_router
 from marrquee.routes.deploy import router as deploy_router
 from marrquee.routes.hub import router as hub_router
 from marrquee.routes.wizard import router as wizard_router
+from marrquee.same_origin import SameOriginGuard
 from marrquee.wiring import WiringRunner
 from marrquee.wiring.engine import WiringEngine
 
@@ -43,6 +45,7 @@ def create_app(
     probe: ReadinessProbe | None = None,
     wiring: WiringRunner | None = None,
     link_probe: LinkProbe | None = None,
+    login_applier: LoginApplier | None = None,
 ) -> FastAPI:
     """Build the Marrquee app.
 
@@ -55,6 +58,8 @@ def create_app(
     real `WiringEngine` here, at the one place the live app is assembled -
     `DeployManager`'s own default stays the do-nothing `NoWiringYet`, so a
     test that builds a `DeployManager` directly never touches the network.
+    `login_applier=None` builds a real `HttpLoginApplier` the same way -
+    `DeployManager`'s own default stays the honest `NoLoginApplier`.
     `link_probe=None` builds a real `HttpLinkProbe`, the same pattern as
     `probe` - a Hub test passes a `FakeLinkProbe` so no test ever reaches
     the network to check a link card.
@@ -73,6 +78,7 @@ def create_app(
             engine,
             probe=probe if probe is not None else HttpReadinessProbe(),
             wiring=wiring if wiring is not None else WiringEngine(),
+            login=login_applier if login_applier is not None else HttpLoginApplier(),
         )
     if link_probe is None:
         link_probe = HttpLinkProbe()
@@ -83,6 +89,7 @@ def create_app(
         yield
 
     app = FastAPI(title="Marrquee", lifespan=lifespan)
+    app.add_middleware(SameOriginGuard)
     app.state.settings = settings
     app.state.docker_engine = engine
     app.state.deploy = manager

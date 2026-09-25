@@ -222,6 +222,46 @@ _EXPECTED_INVENTORY = (
     "QUESTIONS_BACK",
     "wizard_app_unavailable",
     "HUB_SETUP_DONE_REFUSAL",
+    "WIZARD_STEP_LOGIN",
+    "LOGIN_STEP_TITLE",
+    "LOGIN_STEP_LEDE",
+    "LOGIN_PLEX_NOTE",
+    "LOGIN_RESET_TITLE",
+    "LOGIN_RESET_LEDE",
+    "LOGIN_USERNAME_LABEL",
+    "LOGIN_USERNAME_HINT",
+    "LOGIN_PASSWORD_LABEL",
+    "LOGIN_PASSWORD_HINT",
+    "LOGIN_PASSWORD_AGAIN_LABEL",
+    "LOGIN_PROBLEM_USERNAME",
+    "LOGIN_PROBLEM_PASSWORD_SHORT",
+    "LOGIN_PROBLEM_PASSWORD_LONG",
+    "LOGIN_PROBLEM_PASSWORD_SPACES",
+    "LOGIN_PROBLEM_MISMATCH",
+    "LOGIN_SAVE_BUTTON",
+    "CHANGE_TITLE",
+    "CHANGE_LEDE",
+    "CHANGE_CURRENT_LABEL",
+    "CHANGE_NEW_PASSWORD_HINT",
+    "CHANGE_PROBLEM_CURRENT_BLANK",
+    "CHANGE_PROBLEM_WRONG_CURRENT",
+    "CHANGE_PROBLEM_NOTHING",
+    "CHANGE_SAVE_BUTTON",
+    "hub_login_summary",
+    "HUB_LOGIN_CHANGE_LINK",
+    "HUB_LOGIN_FORGOT_LINK",
+    "hub_login_line_putting",
+    "hub_login_line_restarting",
+    "HUB_LOGIN_APPLYING",
+    "hub_login_pending",
+    "LOGIN_TRY_AGAIN",
+    "HUB_LOGIN_RESET_REMINDER",
+    "HUB_LOGIN_BUSY",
+    "HUB_INSTALL_LOGIN_FIRST",
+    "HUB_INSTALL_BUSY_LOGIN",
+    "REFUSAL_NO_LOGIN",
+    "FINALE_SIGN_IN",
+    "CROSS_SITE_REFUSED",
 )
 
 _DEPLOY_ENGINE_WORD_COUNT = 40
@@ -231,6 +271,7 @@ _DEPLOY_SCREEN_WORD_COUNT = 28
 _HUB_WORD_COUNT = 26
 _HUB_LINK_WORD_COUNT = 31
 _HUB_INSTALL_WORD_COUNT = 24
+_LOGIN_WORD_COUNT = 40
 
 
 def test_words_inventory_is_pinned() -> None:
@@ -421,9 +462,10 @@ def test_the_hub_links_section_is_last() -> None:
     assert "HUB_INSTALL_LEDE" not in link_names
 
 
-def test_the_hub_install_section_is_last() -> None:
-    """Hub: install an app is the newest section, so its slice is
-    open-ended - later chunks in this story append more names to it.
+def test_the_hub_install_section_precedes_the_login_section() -> None:
+    """Hub: install an app used to be the newest section - One login now
+    follows it, so this slice is closed the same move Story 2 made against
+    Story 1.
     """
     install_start = (
         _DEPLOY_ENGINE_WORD_COUNT
@@ -433,13 +475,40 @@ def test_the_hub_install_section_is_last() -> None:
         + _HUB_WORD_COUNT
         + _HUB_LINK_WORD_COUNT
     )
+    install_end = install_start + _HUB_INSTALL_WORD_COUNT
 
-    install_names = words.WORDS_INVENTORY[install_start:]
+    install_names = words.WORDS_INVENTORY[install_start:install_end]
 
-    assert install_names == _EXPECTED_INVENTORY[install_start:]
+    assert install_names == _EXPECTED_INVENTORY[install_start:install_end]
     assert install_names[0] == "HUB_INSTALL_LEDE"
     assert install_names[-1] == "HUB_SETUP_DONE_REFUSAL"
     assert "HUB_LINK_LABEL_FIELD" not in install_names
+    assert "WIZARD_STEP_LOGIN" not in install_names
+
+
+def test_the_login_section_is_last() -> None:
+    """One login is the newest section, and words.py is the only file this
+    story touches - so unlike every earlier "is last" test, this slice is
+    closed for good: nothing later in this story appends to it.
+    """
+    login_start = (
+        _DEPLOY_ENGINE_WORD_COUNT
+        + _WIZARD_WORD_COUNT
+        + _WIRING_WORD_COUNT
+        + _DEPLOY_SCREEN_WORD_COUNT
+        + _HUB_WORD_COUNT
+        + _HUB_LINK_WORD_COUNT
+        + _HUB_INSTALL_WORD_COUNT
+    )
+
+    login_names = words.WORDS_INVENTORY[login_start:]
+
+    assert login_names == _EXPECTED_INVENTORY[login_start:]
+    assert login_names[0] == "WIZARD_STEP_LOGIN"
+    assert login_names[-1] == "CROSS_SITE_REFUSED"
+    assert len(words.WORDS_INVENTORY) == len(_EXPECTED_INVENTORY)
+    assert len(login_names) == _LOGIN_WORD_COUNT
+    assert "HUB_INSTALL_LEDE" not in login_names
 
 
 def test_wizard_headline_tuples_carry_the_gradient_word_in_the_middle() -> None:

@@ -95,16 +95,18 @@ def test_rendered_file_parses_and_carries_our_keys_and_one_shared_data_root() ->
 
     prowlarr_env = _environment(services["prowlarr"])
     assert prowlarr_env["PROWLARR__AUTH__APIKEY"] == _PROWLARR_KEY
-    assert prowlarr_env["PROWLARR__AUTH__METHOD"] == "External"
-    assert prowlarr_env["PROWLARR__AUTH__REQUIRED"] == "DisabledForLocalAddresses"
+    assert prowlarr_env["PROWLARR__AUTH__METHOD"] == "Forms"
+    assert prowlarr_env["PROWLARR__AUTH__REQUIRED"] == "Enabled"
 
     sonarr_env = _environment(services["sonarr"])
     assert sonarr_env["SONARR__AUTH__APIKEY"] == _SONARR_KEY
-    assert sonarr_env["SONARR__AUTH__METHOD"] == "External"
+    assert sonarr_env["SONARR__AUTH__METHOD"] == "Forms"
+    assert sonarr_env["SONARR__AUTH__REQUIRED"] == "Enabled"
 
     radarr_env = _environment(services["radarr"])
     assert radarr_env["RADARR__AUTH__APIKEY"] == _RADARR_KEY
-    assert radarr_env["RADARR__AUTH__METHOD"] == "External"
+    assert radarr_env["RADARR__AUTH__METHOD"] == "Forms"
+    assert radarr_env["RADARR__AUTH__REQUIRED"] == "Enabled"
 
     sonarr_volumes = _volumes(services["sonarr"])
     radarr_volumes = _volumes(services["radarr"])
@@ -117,6 +119,25 @@ def test_rendered_file_parses_and_carries_our_keys_and_one_shared_data_root() ->
     marrquee_network = networks["marrquee"]
     assert isinstance(marrquee_network, dict)
     assert marrquee_network["name"] == "marrquee"
+
+
+# --- every arr app always asks for the one saved login -----------------------
+
+
+def test_every_arr_app_always_asks_no_external_anywhere_in_the_rendered_text() -> None:
+    """diverges-from-existing: this story replaces the LAN-open defaults
+    with a login that is always required - the rendered text itself, not
+    just the plan object, must never carry the old values.
+    """
+    state = _fixture_state()
+    plan = compose.build_stack_plan(state)
+
+    text = compose.render_compose(plan)
+
+    assert "External" not in text
+    assert "DisabledForLocalAddresses" not in text
+    assert text.count('"Forms"') == 3
+    assert text.count('"Enabled"') == 3
 
 
 # --- Prowlarr touches no media -----------------------------------------------

@@ -20,8 +20,19 @@ from marrquee import words
 from marrquee.catalog import CATALOG, AppRule
 from marrquee.deploy import AppAdd, Failure, WiringGap
 from marrquee.health import AppHealth, HubState, LinkHealth, LinkState
-from marrquee.hub import HUB_POLL_MS, HubPanel, HubTile, InstallRow, LinkTile, hub_panel, hub_view
+from marrquee.hub import (
+    HUB_POLL_MS,
+    HubPanel,
+    HubTile,
+    InstallRow,
+    LinkTile,
+    LoginView,
+    hub_panel,
+    hub_view,
+    login_view,
+)
 from marrquee.links import LinkCard
+from marrquee.login import LoginRecord, SavedLogin
 from marrquee.questions import QuestionCheck, QuestionField, QuestionStep
 
 _NOW = datetime(2026, 9, 23, 12, 0, 0, tzinfo=UTC)
@@ -735,6 +746,135 @@ def test_install_block_reports_busy_or_a_waiting_failed_add_or_nothing() -> None
     assert waiting_failed.install_block == words.hub_install_resolve_first("Radarr")
     assert idle.busy is False
     assert busy.busy is True
+
+
+def _saved_login(
+    username: str = "owner", generation: int = 1, password: str = "s3cret-pass"
+) -> SavedLogin:
+    return SavedLogin(username=username, generation=generation, password=password)
+
+
+def test_login_view_banner_precedence_choose_reset_pending_applying_and_none() -> None:
+    none_record = LoginRecord(login=None, applied={}, reset_honored=None)
+    none_view = login_view(none_record, reset_value=None, installed=(), running_line=None)
+    assert none_view.status == "none"
+    assert none_view.banner == "choose"
+    assert none_view.username is None
+
+    reset_record = LoginRecord(login=_saved_login(), applied={"sonarr": 1}, reset_honored=None)
+    reset_view = login_view(
+        reset_record, reset_value="forgot-2026", installed=("sonarr",), running_line=None
+    )
+    assert reset_view.status == "reset"
+    assert reset_view.banner == "reset"
+
+    pending_record = LoginRecord(login=_saved_login(), applied={"prowlarr": 1}, reset_honored=None)
+    pending_view = login_view(
+        pending_record, reset_value=None, installed=("prowlarr", "sonarr"), running_line=None
+    )
+    assert pending_view.banner == "pending"
+    # Catalog order, not installed-tuple order - `pending_app_ids` already
+    # guarantees this; this asserts `login_view` doesn't re-sort it away.
+    assert pending_view.pending_names == ("Sonarr",)
+
+    settled_record = LoginRecord(
+        login=_saved_login(), applied={"prowlarr": 1, "sonarr": 1}, reset_honored=None
+    )
+    settled_view = login_view(
+        settled_record, reset_value=None, installed=("prowlarr", "sonarr"), running_line=None
+    )
+    assert settled_view.banner == "none"
+    assert settled_view.username == "owner"
+
+    applying_view = login_view(
+        pending_record,
+        reset_value=None,
+        installed=("prowlarr", "sonarr"),
+        running_line="Putting your login on Sonarr…",
+    )
+    assert applying_view.banner == "applying"
+    assert applying_view.line == "Putting your login on Sonarr…"
+    # A line only ever means something on the "applying" banner - it's
+    # cleared everywhere else so a stale line can never mislabel another
+    # banner.
+    assert none_view.line is None
+    assert pending_view.line is None
+
+
+def test_login_view_carries_the_reset_reminder_only_once_honored() -> None:
+    honored = LoginRecord(login=_saved_login(), applied={}, reset_honored="forgot-2026")
+    view = login_view(honored, reset_value="forgot-2026", installed=(), running_line=None)
+    assert view.reset_reminder is True
+    assert view.status == "set"
+
+    outstanding = LoginRecord(login=_saved_login(), applied={}, reset_honored=None)
+    still_reset = login_view(
+        outstanding, reset_value="forgot-2026", installed=(), running_line=None
+    )
+    assert still_reset.reset_reminder is False
+    assert still_reset.status == "reset"
+
+
+def test_install_block_prioritizes_login_over_an_app_being_added() -> None:
+    login_none = LoginView(
+        status="none",
+        banner="choose",
+        username=None,
+        pending_names=(),
+        line=None,
+        reset_reminder=False,
+    )
+    no_login_yet = hub_view(
+        ["sonarr"],
+        [_health("sonarr")],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        login=login_none,
+    )
+    assert no_login_yet.install_block == words.HUB_INSTALL_LOGIN_FIRST
+
+    login_set = LoginView(
+        status="set",
+        banner="none",
+        username="owner",
+        pending_names=(),
+        line=None,
+        reset_reminder=False,
+    )
+    busy_with_no_add = hub_view(
+        ["sonarr"],
+        [_health("sonarr")],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        login=login_set,
+        busy=True,
+    )
+    assert busy_with_no_add.install_block == words.HUB_INSTALL_BUSY_LOGIN
+
+    # Once the login itself is settled, a failed or in-flight add still
+    # drives `install_block` exactly as it did with no login in the
+    # picture at all.
+    adding_busy = hub_view(
+        ["sonarr"],
+        [_health("sonarr")],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        login=login_set,
+        adding=_adding(app_id="radarr"),
+        busy=True,
+    )
+    assert adding_busy.install_block == words.hub_install_busy("Radarr")
+
+    # `login=None` (no keyword passed) is how every poster-only call above
+    # in this file builds a view - it must draw exactly as it always has.
+    no_login_param = hub_view(
+        ["sonarr"], [_health("sonarr")], authority=_AUTHORITY, proxied=False, now=_NOW, busy=True
+    )
+    assert no_login_param.install_block is None
+    assert no_login_param.login is None
 
 
 def test_hub_panel_prefills_the_stored_url_not_a_re_derived_one() -> None:

@@ -34,6 +34,7 @@ from marrquee.deploy import (
     FakeReadinessProbe,
 )
 from marrquee.docker_client import ComposeResult, DockerStatus, FakeDockerEngine
+from marrquee.login import load_login, save_login
 from marrquee.main import create_app
 from marrquee.questions import QuestionCheck, QuestionStep
 from marrquee.state import STATE_VERSION, InstallState, save_state, write_json_atomic
@@ -76,6 +77,14 @@ def _install_state(
 
 
 def _client(settings: Settings, status: DockerStatus | None = None) -> TestClient:
+    """A client whose config folder already has a saved login.
+
+    This module is about the Deploy screen, not the login guard in front
+    of `POST /deploy` (that guard has its own tests) - so the seed happens
+    once, here, rather than as a line every individual test would
+    otherwise have to repeat.
+    """
+    save_login(settings.config_dir, "owner", "s3cret-password-1", honor_reset=None)
     if status is None:
         status = DockerStatus(connected=True, version="27.3.1")
     app = create_app(settings=settings, engine=FakeDockerEngine(status))
@@ -420,10 +429,63 @@ def test_posting_deploy_without_a_saved_install_starts_nothing_and_redirects_to_
     assert response.headers["location"] == "/setup/apps"
 
 
+def test_posting_deploy_without_a_login_redirects_to_the_login_step(tmp_path: Path) -> None:
+    """`_client` seeds a login by default (see its own docstring); this test
+    builds its own app instead so nothing is saved.
+    """
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("prowlarr", "radarr")))
+    app = create_app(settings=settings, engine=FakeDockerEngine(DockerStatus(connected=True)))
+    client = TestClient(app)
+    assert load_login(settings.config_dir).login is None
+
+    response = client.post("/deploy", follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/setup/login?apps=prowlarr,radarr"
+    assert app.state.deploy.snapshot().phase == "ready"  # nothing started
+
+
+def test_posting_deploy_at_finale_with_no_login_redirects_home_instead_of_the_login_step(
+    tmp_path: Path,
+) -> None:
+    """The narrow edge the Hub itself already owns: a stale "Deploy again"
+    submit against a finale that somehow still has no saved login (the
+    Cycle-1-shaped NAS, mid-upgrade) never sends the owner into the wizard
+    - the Hub's own banner is where that gets chosen instead.
+    """
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("prowlarr",)))
+    _write_snapshot(
+        settings,
+        DeploySnapshot(
+            run_id="run-1",
+            phase="finale",
+            apps=(),
+            headline="Now showing",
+            detail=None,
+            failure=None,
+            started_at="2026-09-19T00:00:00+00:00",
+            finished_at="2026-09-19T00:05:00+00:00",
+            wiring=(),
+        ),
+    )
+    app = create_app(settings=settings, engine=FakeDockerEngine(DockerStatus(connected=True)))
+    client = TestClient(app)
+    assert load_login(settings.config_dir).login is None
+
+    response = client.post("/deploy", follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/"
+    assert app.state.deploy.snapshot().phase == "finale"  # untouched, nothing started
+
+
 def test_posting_deploy_starts_a_run_and_comes_back_to_the_page(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     root = _fresh_root(settings)
     save_state(settings.config_dir, _install_state(("prowlarr",), storage_root=str(root)))
+    save_login(settings.config_dir, "owner", "s3cret-password-1", honor_reset=None)
 
     engine = FakeDockerEngine(
         DockerStatus(connected=True),
@@ -628,6 +690,7 @@ def test_the_finale_renders_the_badge_the_headline_and_the_hub_call_to_action(
     assert words.FINALE_BADGE in response.text
     assert words.FINALE_HEADLINE in response.text
     assert words.FINALE_SUB in response.text
+    assert words.FINALE_SIGN_IN in response.text
     assert f">{words.FINALE_CTA}<" in response.text
     assert 'href="/"' in response.text
 

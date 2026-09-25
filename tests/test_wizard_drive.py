@@ -25,6 +25,7 @@ from marrquee import wizard, words
 from marrquee.config import Settings
 from marrquee.deploy import AppProgress, DeployPhase, DeploySnapshot
 from marrquee.docker_client import DockerStatus, FakeDockerEngine
+from marrquee.login import save_login
 from marrquee.main import create_app
 from marrquee.questions import QuestionCheck, QuestionField, QuestionStep
 from marrquee.state import STATE_VERSION, InstallState, load_state, save_state, write_json_atomic
@@ -39,6 +40,14 @@ def _settings(tmp_path: Path) -> Settings:
 
 
 def _client(settings: Settings) -> TestClient:
+    """A client whose config folder already has a saved login.
+
+    Every test in this module is about the drive screen, not the login
+    guard in front of it (that guard has its own tests, in
+    `test_wizard_login.py`) - so the seed happens once, here, rather than
+    as a line every individual test would otherwise have to repeat.
+    """
+    save_login(settings.config_dir, "owner", "s3cret-password-1", honor_reset=None)
     status = DockerStatus(connected=True, version="27.3.1")
     app = create_app(settings=settings, engine=FakeDockerEngine(status))
     return TestClient(app)

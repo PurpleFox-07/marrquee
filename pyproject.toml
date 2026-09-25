@@ -64,4 +64,8 @@ select = ["E", "F", "I", "UP", "B"]
 # instance itself), so sharing one instance across every DeployManager that
 # doesn't override the parameter is safe - the exact shape B008 exists to
 # rule out for mutable defaults.
-extend-immutable-calls = ["marrquee.deploy.HttpReadinessProbe", "marrquee.wiring.NoWiringYet"]
+extend-immutable-calls = [
+    "marrquee.deploy.HttpReadinessProbe",
+    "marrquee.wiring.NoWiringYet",
+    "marrquee.login_apply.NoLoginApplier",
+]

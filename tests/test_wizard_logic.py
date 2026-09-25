@@ -79,19 +79,20 @@ def test_platform_warning_only_fires_for_docker_desktop() -> None:
     assert wizard.platform_warning("unknown") is None
 
 
-def test_wizard_steps_are_numbered_one_through_three_in_order() -> None:
-    assert [step.number for step in wizard.WIZARD_STEPS] == [1, 2, 3]
+def test_wizard_steps_are_numbered_one_through_four_in_order() -> None:
+    assert [step.number for step in wizard.WIZARD_STEPS] == [1, 2, 3, 4]
     assert [step.label for step in wizard.WIZARD_STEPS] == [
         words.WIZARD_STEP_APPS,
+        words.WIZARD_STEP_LOGIN,
         words.WIZARD_STEP_DRIVE,
         words.WIZARD_STEP_DEPLOY,
     ]
 
 
-# --- wizard_steps / step_number: today's three pills, plus a growing row ----
+# --- wizard_steps / step_number: today's four pills, plus a growing row -----
 
 
-def test_wizard_steps_matches_the_three_fixed_pills_when_nothing_is_registered() -> None:
+def test_wizard_steps_matches_the_four_fixed_pills_when_nothing_is_registered() -> None:
     every_subset = (
         (),
         ("prowlarr",),
@@ -102,13 +103,14 @@ def test_wizard_steps_matches_the_three_fixed_pills_when_nothing_is_registered()
         steps = wizard.wizard_steps(app_ids)
         assert [(step.number, step.label, step.key) for step in steps] == [
             (1, words.WIZARD_STEP_APPS, "apps"),
-            (2, words.WIZARD_STEP_DRIVE, "drive"),
-            (3, words.WIZARD_STEP_DEPLOY, "deploy"),
+            (2, words.WIZARD_STEP_LOGIN, "login"),
+            (3, words.WIZARD_STEP_DRIVE, "drive"),
+            (4, words.WIZARD_STEP_DEPLOY, "deploy"),
         ]
     assert wizard.WIZARD_STEPS == wizard.wizard_steps(())
 
 
-def test_wizard_steps_inserts_a_ticked_apps_question_step_between_apps_and_drive(
+def test_wizard_steps_inserts_a_ticked_apps_question_step_between_login_and_drive(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fixture_step = QuestionStep(
@@ -125,9 +127,10 @@ def test_wizard_steps_inserts_a_ticked_apps_question_step_between_apps_and_drive
 
     assert [(step.number, step.label, step.key) for step in steps] == [
         (1, words.WIZARD_STEP_APPS, "apps"),
-        (2, "Fixture questions", "q:radarr:fixture"),
-        (3, words.WIZARD_STEP_DRIVE, "drive"),
-        (4, words.WIZARD_STEP_DEPLOY, "deploy"),
+        (2, words.WIZARD_STEP_LOGIN, "login"),
+        (3, "Fixture questions", "q:radarr:fixture"),
+        (4, words.WIZARD_STEP_DRIVE, "drive"),
+        (5, words.WIZARD_STEP_DEPLOY, "deploy"),
     ]
 
 
@@ -135,8 +138,9 @@ def test_step_number_finds_the_matching_pill_and_raises_for_an_unknown_key() -> 
     steps = wizard.wizard_steps(())
 
     assert wizard.step_number(steps, "apps") == 1
-    assert wizard.step_number(steps, "drive") == 2
-    assert wizard.step_number(steps, "deploy") == 3
+    assert wizard.step_number(steps, "login") == 2
+    assert wizard.step_number(steps, "drive") == 3
+    assert wizard.step_number(steps, "deploy") == 4
     with pytest.raises(KeyError):
         wizard.step_number(steps, "not-a-real-key")
 

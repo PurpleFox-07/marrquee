@@ -44,6 +44,33 @@ def test_the_catalog_is_unchanged_in_value() -> None:
         assert app.rules == ()
 
 
+def test_the_three_arr_apps_take_the_login() -> None:
+    kinds = {app.id: app.login_kind for app in CATALOG}
+
+    assert kinds == {"prowlarr": "arr", "sonarr": "arr", "radarr": "arr"}
+
+
+def test_login_kind_default_is_none_the_fail_safe_value() -> None:
+    """An app that forgets to set `login_kind` just never gets a login
+    pushed to it - it never ends up locked out of one it doesn't have.
+    """
+    app = CatalogApp(
+        id="stub",
+        name="Stub",
+        description="a stub app for this test only",
+        image="example/stub:latest",
+        port=1234,
+        env_prefix="STUB",
+        api_base="api/v1",
+        media_folders=(),
+        needs_data_mount=False,
+        glyph="ST",
+        order=99,
+    )
+
+    assert app.login_kind == "none"
+
+
 def _with_rules(app_id: str, rules: tuple[AppRule, ...]) -> CatalogApp:
     return dataclasses.replace(get_app(app_id), rules=rules)
 

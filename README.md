@@ -154,6 +154,31 @@ Open `http://<your NAS's address>:7788/diagnostics`. If a deploy went
 wrong, the **Last problem** section there has a **Copy** button -
 press it and send what it copies.
 
+## Forgot your apps' password?
+
+This resets the one username and password every app uses (Prowlarr,
+Sonarr, Radarr) - it never touches Marrquee's own Hub, which has no
+login of its own. Everything below is done in the Ugreen Docker app,
+the same screen you use to update Marrquee - nothing to paste into a
+Terminal or an SSH session.
+
+1. Open the Ugreen **Docker** app, go to **Project**, open `marrquee`
+   and go to its compose configuration.
+2. Find the `MARRQUEE_RESET_LOGIN: ""` line. (If your file was pasted
+   before this line existed, add two lines under `restart:
+   unless-stopped`, indented the same way: `environment:` on its own
+   line, then `MARRQUEE_RESET_LOGIN: ""` on the line under it.)
+3. Type any word between the quotes - for example `MARRQUEE_RESET_LOGIN:
+   "reset"`.
+4. Choose **Redeploy**.
+5. Go to your Hub. It now shows **Choose a new login** - fill it in and
+   save it.
+6. Go back to the compose configuration, empty the quotes again
+   (`MARRQUEE_RESET_LOGIN: ""`), and choose **Redeploy** once more. The
+   Hub only accepts each word in that line once, so leaving it filled
+   in wouldn't reset your login again, but emptying it keeps the file
+   ready for next time.
+
 ## Update Marrquee and deploy from your browser
 
 Everything below is done in a web browser - nothing to paste into a
@@ -178,41 +203,48 @@ Terminal or an SSH session.
    or say nothing has gone wrong. Either is fine.
 4. **Go through the wizard.** Go to
    `http://<your NAS's address>:7788/setup/apps`. Leave Prowlarr,
-   Sonarr and Radarr ticked and press **Continue**. Type your big
-   drive's folder, check the time zone, and press **Continue to
-   Deploy**.
-5. **Read the ticket.** The Deploy screen lists your three apps and
+   Sonarr and Radarr ticked and press **Continue**.
+5. **Choose your login on your Hub.** The next screen asks for one
+   username and password - every app you install uses it, and your
+   browser can remember it so you only type it once per device. Plex
+   is the exception: it always uses your own Plex account. Fill it in
+   and press **Save login**.
+6. **Point it at your big drive.** Type your big drive's folder, check
+   the time zone, and press **Continue to Deploy**.
+7. **Read the ticket.** The Deploy screen lists your three apps and
    the folders it will build. The paths should be on your drive
    (starting with your folder), never `/data`. If something is wrong,
    press **Back**.
-6. **Press "Deploy your media server"** and watch. Each poster lights
+8. **Press "Deploy your media server"** and watch. Each poster lights
    up gold, then turns green, one at a time. The first time can take a
    few minutes while the apps download. A note saying an app "is
    taking a little longer than usual" is normal. Then the wiring steps
    play, with a gold outline on the apps being connected, and finally
    "Now showing: your media server".
-7. **Open Prowlarr from the finale.** Press **Open Prowlarr**. In
-   Prowlarr, open **Settings -> Apps**. Sonarr and Radarr should
-   already be listed. Nobody typed a key or an address.
-8. **If anything turns red**, press **See the technical details**,
-   then **Copy** in the Last problem section, and paste it to me. Also
-   tell me whether Copy worked or whether it asked you to press
-   Ctrl+C.
-9. **Visit your Hub.**
+9. **Open Prowlarr from the finale.** Press **Open Prowlarr**. Prowlarr
+   asks you to sign in with the username and password you chose - tick
+   **Remember me** so this browser won't ask again. In Prowlarr, open
+   **Settings -> Apps**. Sonarr and Radarr should already be listed.
+   Nobody typed a key or an address.
+10. **If anything turns red**, press **See the technical details**,
+    then **Copy** in the Last problem section, and paste it to me. Also
+    tell me whether Copy worked or whether it asked you to press
+    Ctrl+C.
+11. **Visit your Hub.**
 
-   - 9a. Press **Go to your Hub**. You should see three purple
-     posters, each saying **Status: Up** with a green dot.
-   - 9b. On your **phone**, on the same Wi-Fi, open
-     `http://<your NAS's address>:7788`. You should land straight on
-     the Hub. Tap **Sonarr** and it should open in a new tab. *If it
-     doesn't, write down exactly what the address bar says.*
-   - 9c. Restart Marrquee from the Ugreen **Docker** app, then open
-     the address again. You should still land on the Hub.
-   - 9d. In the Ugreen **Docker** app, **stop** the Radarr container.
-     Within about 15 seconds the Radarr poster should grey out and
-     say **Status: Down** with a red dot and "Radarr stopped - last
-     seen just now." Start it again, and it should go back to
-     **Status: Up** by itself.
+    - 11a. Press **Go to your Hub**. You should see three purple
+      posters, each saying **Status: Up** with a green dot.
+    - 11b. On your **phone**, on the same Wi-Fi, open
+      `http://<your NAS's address>:7788`. You should land straight on
+      the Hub. Tap **Sonarr** and it should open in a new tab. *If it
+      doesn't, write down exactly what the address bar says.*
+    - 11c. Restart Marrquee from the Ugreen **Docker** app, then open
+      the address again. You should still land on the Hub.
+    - 11d. In the Ugreen **Docker** app, **stop** the Radarr container.
+      Within about 15 seconds the Radarr poster should grey out and
+      say **Status: Down** with a red dot and "Radarr stopped - last
+      seen just now." Start it again, and it should go back to
+      **Status: Up** by itself.
 
 ## Developing Marrquee
 

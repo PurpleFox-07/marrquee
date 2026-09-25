@@ -38,8 +38,9 @@ from marrquee.deploy import (
     FailureCode,
 )
 from marrquee.health import HubState, LinkState
-from marrquee.hub import HubTile, LinkTile
+from marrquee.hub import HubTile, LinkTile, LoginBanner
 from marrquee.install import install_apps
+from marrquee.login import LOGIN_STEP, load_login, save_login
 from marrquee.questions import (
     QuestionCheck,
     check_step,
@@ -53,9 +54,11 @@ from marrquee.storage import StorageCheck, check_storage_root
 from marrquee.wiring import WiringStep, WiringStepState
 from marrquee.words import (
     HUB_INSTALL_ALREADY,
+    HUB_INSTALL_LOGIN_FIRST,
     HUB_INSTALL_NOT_READY,
     HUB_INSTALL_UNKNOWN,
     HUB_SETUP_DONE_REFUSAL,
+    REFUSAL_NO_LOGIN,
     REFUSAL_NOTHING_CHOSEN,
     hub_install_busy,
     hub_install_unavailable,
@@ -79,6 +82,8 @@ _MAX_APP_COUNT = 50
 _MAX_ANSWER_FIELD_NAME_LENGTH = 64
 _MAX_ANSWER_FIELD_VALUE_LENGTH = 4096
 _MAX_ANSWER_FIELD_COUNT = 50
+_MAX_LOGIN_USERNAME_LENGTH = 256
+_MAX_LOGIN_PASSWORD_LENGTH = 4096
 
 
 # --- Request bodies: validated before a single line of business logic runs --
@@ -90,6 +95,21 @@ class StorageCheckRequest(BaseModel):
     path: str = Field(max_length=_MAX_PATH_LENGTH)
 
 
+class LoginIn(BaseModel):
+    """The wire shape for the one login `/api/install` requires.
+
+    Only bounds the size of what's accepted - the actual 8-128 password
+    rule (and the username's own shape) is `LOGIN_STEP.check`'s job, so a
+    refusal is always the plain sentence that rule already owns, never a
+    pydantic 422 body (which can echo the submitted value straight back).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    username: str = Field(max_length=_MAX_LOGIN_USERNAME_LENGTH)
+    password: str = Field(max_length=_MAX_LOGIN_PASSWORD_LENGTH)
+
+
 class InstallRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -97,6 +117,7 @@ class InstallRequest(BaseModel):
     app_ids: list[Annotated[str, Field(max_length=_MAX_APP_ID_LENGTH)]] = Field(
         max_length=_MAX_APP_COUNT
     )
+    login: LoginIn
 
 
 # --- Response shapes: every field a screen is allowed to see, and no other -
@@ -214,6 +235,7 @@ class HubStatusOut(BaseModel):
     any_down: bool
     docker_unreachable: bool
     busy: bool
+    login_banner: LoginBanner | None
 
 
 class HubInstallRequest(BaseModel):
@@ -354,12 +376,42 @@ async def post_storage_check(body: StorageCheckRequest, request: Request) -> Sto
 
 @router.post("/install")
 async def post_install(body: InstallRequest, request: Request) -> InstallResponse:
+    """Save the storage choice and the login together - never one without
+    the other, so a fresh install can never reach a real deploy carrying
+    only one of the two.
+
+    Order matters: the login is checked (never saved) before
+    `install_apps` runs, and only saved once that installs succeeds - a
+    refused login writes nothing at all, and a refused install never
+    leaves a login saved with no storage choice to go with it.
+    """
     if _manager(request).snapshot().phase == "finale":
         raise HTTPException(status_code=409, detail=HUB_SETUP_DONE_REFUSAL)
-    result = install_apps(_settings(request), body.path, list(body.app_ids))
+    settings = _settings(request)
+
+    login_check = check_step(
+        LOGIN_STEP,
+        {
+            "username": body.login.username,
+            "password": body.login.password,
+            "password_again": body.login.password,
+        },
+        {},
+    )
+    if not login_check.ok:
+        raise HTTPException(status_code=400, detail=login_check.problem)
+
+    result = install_apps(settings, body.path, list(body.app_ids))
     if not result.ok:
         status_code = 400 if result.kind == "invalid_input" else 409
         raise HTTPException(status_code=status_code, detail=result.message)
+
+    save_login(
+        settings.config_dir,
+        login_check.answers["username"],
+        login_check.answers["password"],
+        honor_reset=settings.reset_login,
+    )
     return InstallResponse(saved=True)
 
 
@@ -375,6 +427,8 @@ async def post_deploy(request: Request, response: Response) -> DeploySnapshotOut
 
     if load_state(settings.config_dir) is None:
         raise HTTPException(status_code=409, detail=REFUSAL_NOTHING_CHOSEN)
+    if load_login(settings.config_dir).login is None:
+        raise HTTPException(status_code=409, detail=REFUSAL_NO_LOGIN)
 
     # Decided before calling start(): start() itself returns immediately,
     # before its background task has taken a single step, so its own return
@@ -455,6 +509,7 @@ async def get_hub_status(request: Request) -> HubStatusOut:
         any_down=view.any_down,
         docker_unreachable=view.docker_unreachable,
         busy=view.busy,
+        login_banner=view.login.banner if view.login is not None else None,
     )
 
 
@@ -465,6 +520,8 @@ def _add_start_refusal_message(result: AddStart, app: CatalogApp, manager: Deplo
     """
     if result == "busy":
         return hub_install_busy(app.name)
+    if result == "no_login":
+        return HUB_INSTALL_LOGIN_FIRST
     if result == "already_installed":
         return HUB_INSTALL_ALREADY
     if result == "unavailable":

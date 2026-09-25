@@ -31,6 +31,7 @@ from marrquee.deploy import (
     DeploySnapshot,
     FakeReadinessProbe,
     HttpReadinessProbe,
+    _redact_secrets,
     read_last_failure,
 )
 from marrquee.docker_client import (
@@ -40,6 +41,7 @@ from marrquee.docker_client import (
     DockerStatus,
     FakeDockerEngine,
     NetworkConnectResult,
+    _service_config_signature,
 )
 from marrquee.state import InstallState, save_state, write_json_atomic
 from marrquee.wiring import WiringStep, WiringStepState
@@ -129,6 +131,13 @@ class _StatefulEngine:
         self._network_exists = network_exists
         self._remove_results = remove_results or {}
         self.calls: list[tuple[str, tuple[object, ...]]] = []
+        # Mirrors `FakeDockerEngine`'s own recreate modelling (the
+        # project's docker-fakes-model-state rule): an unchanged service's
+        # container is left alone on a `recreate=True` call, exactly like
+        # real Compose - a distinct `started_at` per genuine service is
+        # what a test can tell that apart by.
+        self._service_signatures: dict[str, str] = {}
+        self._recreate_sequence = 0
 
     async def status(self) -> DockerStatus:
         self.calls.append(("status", ()))
@@ -157,13 +166,38 @@ class _StatefulEngine:
         self.calls.append(("logs", (name, tail)))
         return ""
 
-    async def compose_up(self, project: str, compose_file: Path, service: str) -> ComposeResult:
-        self.calls.append(("compose_up", (project, str(compose_file), service)))
+    async def compose_up(
+        self, project: str, compose_file: Path, service: str, *, recreate: bool = False
+    ) -> ComposeResult:
+        call_name = "compose_up_recreate" if recreate else "compose_up"
+        self.calls.append((call_name, (project, str(compose_file), service)))
         result = self._compose_results.get(service, ComposeResult(ok=True, exit_code=0, output=""))
-        if result.ok:
-            self._containers[service] = _running_container(service)
-            self._network_exists = True
+        if not result.ok:
+            return result
+        self._network_exists = True
+        # Tracked on EVERY successful call, recreate or not - a later
+        # recreate needs a genuine baseline to compare against, including
+        # one set by the plain `compose up --no-recreate` an initial deploy
+        # already ran for this same service.
+        changed = self._update_signature(compose_file, service)
+        if recreate and service in self._containers and not changed:
+            return result  # real compose leaves an unchanged service alone
+        self._recreate_sequence += 1
+        self._containers[service] = dataclasses.replace(
+            _running_container(service), started_at=f"fake-started-{self._recreate_sequence}"
+        )
         return result
+
+    def _update_signature(self, compose_file: Path, service: str) -> bool:
+        """Record `service`'s current config signature and report whether it
+        differs from what was last seen - unreadable or never-seen content
+        always reports "changed", never a silent no-op.
+        """
+        signature = _service_config_signature(compose_file, service)
+        previous = self._service_signatures.get(service)
+        if signature is not None:
+            self._service_signatures[service] = signature
+        return signature is None or signature != previous
 
     async def self_container_id(self) -> str | None:
         self.calls.append(("self_container_id", ()))
@@ -1495,3 +1529,31 @@ async def test_fake_readiness_probe_defaults_to_ready_with_no_scripting() -> Non
     probe = FakeReadinessProbe()
 
     assert await probe.check("radarr", 7878, "api/v3", "key") is True
+
+
+# --- _redact_secrets: keys, then passwords -------------------------------------
+
+
+def test_redact_secrets_replaces_both_api_keys_and_passwords() -> None:
+    text = "sonarr said: key=abc123 password=hunter2-secret is wrong"
+
+    redacted = _redact_secrets(text, {"sonarr": "abc123"}, passwords=("hunter2-secret",))
+
+    assert "abc123" not in redacted
+    assert "hunter2-secret" not in redacted
+    assert "<redacted-api-key>" in redacted
+    assert "<redacted-password>" in redacted
+
+
+def test_redact_secrets_ignores_blank_passwords_and_keys() -> None:
+    text = "nothing secret in here"
+
+    redacted = _redact_secrets(text, {"sonarr": ""}, passwords=("",))
+
+    assert redacted == text
+
+
+def test_redact_secrets_with_no_passwords_argument_behaves_exactly_as_before() -> None:
+    text = "key=abc123"
+
+    assert _redact_secrets(text, {"sonarr": "abc123"}) == "key=<redacted-api-key>"

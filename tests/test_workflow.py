@@ -285,6 +285,18 @@ def test_readme_wiring_check_is_look_only_and_adds_no_command_line_step() -> Non
     assert "curl" not in section.lower()
 
 
+def test_readme_walkthrough_mentions_signing_in_and_choosing_the_login() -> None:
+    readme = _README_PATH.read_text()
+    section = readme[
+        readme.index("## Update Marrquee and deploy from your browser") : readme.index(
+            "## Developing Marrquee"
+        )
+    ]
+    assert "Choose your login" in section
+    assert "sign in with the username and password you chose" in section.lower()
+    assert "Remember me" in section
+
+
 # --- stack-smoke: the real-Docker proof, and the guarantee it never gates ----
 
 
@@ -339,6 +351,32 @@ def test_stack_smoke_installs_two_apps_and_starts_a_deploy() -> None:
 
     start_step = _step_named(job, "start the deploy")
     assert "POST http://127.0.0.1:7788/api/deploy" in start_step["run"]
+
+
+def test_stack_smoke_generates_a_masked_throwaway_login_before_installing() -> None:
+    """`/api/install` now requires a login - generated fresh for this one
+    run, masked before it can ever reach the job log, and carried into the
+    install body through the environment rather than a literal in the
+    step's own text.
+    """
+    job = _stack_smoke_job()
+
+    login_step = _step_named(job, "throwaway login")
+    run = login_step["run"]
+    assert "openssl rand -hex 16" in run
+    assert "::add-mask::" in run
+    assert "MARRQUEE_CI_PASSWORD=" in run
+    assert "$GITHUB_ENV" in run
+
+    install_step = _step_named(job, "install two apps")
+    assert "login" in install_step["run"]
+    assert "marrquee-ci" in install_step["run"]
+    assert "${MARRQUEE_CI_PASSWORD}" in install_step["run"]
+
+    steps = _steps(job)
+    login_index = steps.index(login_step)
+    install_index = steps.index(install_step)
+    assert login_index < install_index
 
 
 def test_stack_smoke_polls_for_finale_with_a_bounded_loop() -> None:
@@ -621,6 +659,181 @@ def test_stack_smoke_wiring_and_second_deploy_steps_run_in_the_right_order() -> 
     dump_index = names.index(_step_named(job, "dump diagnostics")["name"])
 
     assert wiring_index < second_deploy_index < reassert_index < dump_index
+
+
+def test_stack_smoke_asserts_every_app_asks_for_the_one_login() -> None:
+    """The FIRST proof this job cannot get from reading source: real Sonarr,
+    Radarr and Prowlarr images actually take Marrquee's login through
+    `config/host`, and their own `/login` actually enforces it.
+    """
+    step = _step_named(_stack_smoke_job(), "assert every app asks for the one login")
+    run = step["run"]
+
+    assert "api/${api_version}/config/host" in run
+    assert 'assert_app_asks_for_the_login "Prowlarr" 9696 v1' in run
+    assert 'assert_app_asks_for_the_login "Sonarr" 8989 v3' in run
+    assert 'assert_app_asks_for_the_login "Radarr" 7878 v3' in run
+    assert 'authenticationMethod=="forms"' in run
+    assert 'authenticationRequired=="enabled"' in run
+    assert 'username=="marrquee-ci"' in run
+    assert "/login?returnUrl=%2F" in run
+    assert "loginFailed=true" in run
+    assert "MARRQUEE_CI_PASSWORD" in run
+    assert "--no-recreate" not in run
+    assert "did not take the one login" in run
+    assert run.count("::error::") >= 1
+
+
+def test_stack_smoke_login_assertion_never_echoes_the_password() -> None:
+    step = _step_named(_stack_smoke_job(), "assert every app asks for the one login")
+    run = step["run"]
+
+    for line in run.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("echo") or "::error::" in stripped:
+            assert "MARRQUEE_CI_PASSWORD" not in stripped, (
+                f"the CI password appears in an echoed line: {line!r}"
+            )
+
+
+def test_stack_smoke_login_assertion_runs_after_the_add_and_wiring_steps() -> None:
+    job = _stack_smoke_job()
+    names = [str(step.get("name", "")) for step in _steps(job)]
+
+    add_poll_index = names.index(_step_named(job, "poll", "radarr finishes adding")["name"])
+    wiring_index = names.index(_step_named(job, "assert", "wired together")["name"])
+    login_index = names.index(_step_named(job, "assert every app asks for the one login")["name"])
+    second_deploy_index = names.index(_step_named(job, "second", "deploy")["name"])
+
+    assert add_poll_index < wiring_index < login_index < second_deploy_index
+
+
+def test_stack_smoke_cycle1_switch_over_step_exists_between_login_and_second_deploy() -> None:
+    job = _stack_smoke_job()
+    names = [str(step.get("name", "")) for step in _steps(job)]
+
+    login_index = names.index(_step_named(job, "assert every app asks for the one login")["name"])
+    switch_index = names.index(_step_named(job, "cycle-1 app switches over")["name"])
+    second_deploy_index = names.index(_step_named(job, "second", "deploy")["name"])
+
+    assert login_index < switch_index < second_deploy_index
+
+
+def test_stack_smoke_cycle1_switch_over_never_edits_marrquees_own_compose_file() -> None:
+    """A `sed` output to a runner temp copy - Marrquee's real compose.yaml is
+    read from, never written to, by this step.
+    """
+    step = _step_named(_stack_smoke_job(), "cycle-1 app switches over")
+    run = step["run"]
+
+    assert "cycle1-compose.yaml" in run
+    assert '"$cycle1_compose"' in run
+    assert 'SONARR__AUTH__METHOD: "Forms"' in run
+    assert 'SONARR__AUTH__METHOD: "External"' in run
+    assert 'SONARR__AUTH__REQUIRED: "Enabled"' in run
+    assert 'SONARR__AUTH__REQUIRED: "DisabledForLocalAddresses"' in run
+    assert "docker compose -p marrquee-apps -f" in run
+    assert "up -d sonarr" in run
+    assert "--no-recreate" not in run
+
+
+def test_stack_smoke_cycle1_switch_over_deletes_login_json_and_reasserts_the_banner() -> None:
+    step = _step_named(_stack_smoke_job(), "cycle-1 app switches over")
+    run = step["run"]
+
+    assert "docker exec marrquee-stack-smoke rm -f /config/login.json" in run
+    assert "login_banner" in run
+    assert '"choose"' in run
+    assert "/hub/login" in run
+    assert "marrquee-ci" in run
+    assert "MARRQUEE_CI_PASSWORD" in run
+
+
+def test_stack_smoke_cycle1_switch_over_polls_bounded_for_the_run_to_finish() -> None:
+    step = _step_named(_stack_smoke_job(), "cycle-1 app switches over")
+    run = step["run"]
+
+    # 5 minute budget at a 2s cadence.
+    assert "seq 1 150" in run
+    assert "while true" not in run
+    assert ".busy" in run
+    assert '"pending"' in run
+    assert run.count("::error::") >= 2
+
+
+def test_stack_smoke_cycle1_switch_over_compares_all_three_container_ids() -> None:
+    step = _step_named(_stack_smoke_job(), "cycle-1 app switches over")
+    run = step["run"]
+
+    assert run.count("docker inspect -f '{{.Id}}'") >= 6  # before and after, x3 apps
+    assert "::error::Choosing the login recreated Prowlarr" in run
+    assert "::error::Choosing the login recreated Radarr" in run
+    assert "sonarr_before" in run
+    assert "sonarr_after" in run
+
+
+def test_stack_smoke_cycle1_switch_over_waits_for_sonarr_before_choosing_the_login() -> None:
+    """A freshly recreated Sonarr can take 10-30s to answer its own API -
+    far longer than the login applier's ~4s retry budget. Without a wait
+    here, phase 1 of the login run would race a container that just
+    restarted and hasn't come back yet, and the run would report Sonarr as
+    never having accepted the login.
+    """
+    step = _step_named(_stack_smoke_job(), "cycle-1 app switches over")
+    run = step["run"]
+
+    up_index = run.index("up -d sonarr")
+    login_post_index = run.index("http://127.0.0.1:7788/hub/login")
+    assert up_index < login_post_index
+
+    segment = run[up_index:login_post_index]
+    assert "api/v3/system/status" in segment
+    assert "::error::Sonarr never came back after the Cycle-1 recreate" in segment
+    assert "seq 1 " in segment  # bounded, never an unconditional `while true`
+    assert "while true" not in segment
+
+
+def test_stack_smoke_cycle1_switch_over_extracts_sonarr_key_only_once() -> None:
+    """The key is read once, right after the recreate, and reused for both
+    the readiness wait and the final config/host check - never re-extracted.
+    """
+    step = _step_named(_stack_smoke_job(), "cycle-1 app switches over")
+    run = step["run"]
+
+    assert run.count("SONARR__AUTH__APIKEY") == 1
+
+
+def test_stack_smoke_cycle1_switch_over_confirms_the_runner_compose_recreated_sonarr() -> None:
+    """A quick sanity check that the runner's own `docker compose up -d
+    sonarr` really did treat the env change as a diff, so the "before" id
+    used for the later switch-back comparison is genuinely the Cycle-1
+    container and not a stale read of the one before it.
+    """
+    step = _step_named(_stack_smoke_job(), "cycle-1 app switches over")
+    run = step["run"]
+
+    assert "sonarr_id_pre_switch" in run
+    assert "::error::Sonarr was not recreated by the Cycle-1 switch-over" in run
+
+
+def test_stack_smoke_cycle1_switch_over_checks_sonarr_reads_forms_again() -> None:
+    step = _step_named(_stack_smoke_job(), "cycle-1 app switches over")
+    run = step["run"]
+
+    assert "api/v3/config/host" in run
+    assert 'authenticationMethod=="forms"' in run
+
+
+def test_stack_smoke_cycle1_switch_over_never_echoes_the_password() -> None:
+    step = _step_named(_stack_smoke_job(), "cycle-1 app switches over")
+    run = step["run"]
+
+    for line in run.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("echo") or "::error::" in stripped:
+            assert "MARRQUEE_CI_PASSWORD" not in stripped, (
+                f"the CI password appears in an echoed line: {line!r}"
+            )
 
 
 def test_stack_smoke_hub_steps_run_last_after_the_second_deploy_reassert() -> None:

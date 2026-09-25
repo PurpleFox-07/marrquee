@@ -181,6 +181,26 @@
   display: block;
 }
 
+/* --- The one saved login: the choose/reset/applying banner and the
+ * "Your apps' login" summary above the footer link. Pending and the reset
+ * reminder reuse wizard.css's own `.warning-banner` - they're the same
+ * "something needs your attention" shape every other Hub banner already
+ * uses, just with their own `data-role` hooks. */
+
+.login-banner {
+  background: var(--surface);
+  border: 1px solid var(--border-accent);
+  border-radius: var(--radius-lg);
+  padding: var(--space-6);
+  margin-bottom: var(--space-8);
+}
+
+.hub-login-summary {
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  margin-top: var(--space-6);
+}
+
 /* --- The "+" tile: always the last poster, always useful ------------------
  * Its hit area comes entirely from the padding around its glyph - never a
  * `min-height`/`min-width` - so shrinking the glyph can never shrink the
@@ -302,7 +322,8 @@
 .hub-panel[data-panel-mode="choose"] [data-panel-pane="choose"],
 .hub-panel[data-panel-mode="install"] [data-panel-pane="install"],
 .hub-panel[data-panel-mode="link"] [data-panel-pane="link"],
-.hub-panel[data-panel-mode="edit"] [data-panel-pane="edit"] {
+.hub-panel[data-panel-mode="edit"] [data-panel-pane="edit"],
+.hub-panel[data-panel-mode="login"] [data-panel-pane="login"] {
   display: block;
 }
 

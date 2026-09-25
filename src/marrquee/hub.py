@@ -18,7 +18,7 @@ the whole page be proven with no HTML and no Docker.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Final, Literal
@@ -28,6 +28,7 @@ from marrquee.catalog import CATALOG, CatalogApp, apps_in_order, get_app, unavai
 from marrquee.deploy import AddState, AppAdd, WiringGap
 from marrquee.health import AppHealth, HubState, LinkHealth, LinkState
 from marrquee.links import LinkCard, link_address, link_glyph
+from marrquee.login import LoginRecord, LoginStatus, login_status, pending_app_ids, reset_reminder
 from marrquee.questions import QuestionStep, question_steps_for
 from marrquee.words import (
     HUB_ALL_UP,
@@ -37,6 +38,8 @@ from marrquee.words import (
     HUB_CHIP_STARTING,
     HUB_CHIP_UNKNOWN,
     HUB_CHIP_UP,
+    HUB_INSTALL_BUSY_LOGIN,
+    HUB_INSTALL_LOGIN_FIRST,
     HUB_LINK_LINE_DOWN,
     HUB_LINKS_ALL_UP,
     HUB_NOTHING_SET_UP,
@@ -70,6 +73,13 @@ HUB_POLL_MS: Final = 15000
 # lag. Read from `data-add-poll-ms`, the same way `HUB_POLL_MS` is read from
 # `data-poll-ms`.
 HUB_ADD_POLL_MS: Final = 2000
+
+# Where the Change pane's "Forgot your password?" link and the reset
+# reminder both point - the README's own GUI-only steps for the NAS-side
+# `MARRQUEE_RESET_LOGIN` line. Pinned as the repo's real remote so the
+# anchor (GitHub's own slug for "## Forgot your apps' password?") stays
+# correct without a second, hand-typed copy of it anywhere else.
+LOGIN_HELP_URL: Final = "https://github.com/PurpleFox-07/marrquee#forgot-your-apps-password"
 
 _CHIP_BY_STATE: dict[HubState, str] = {
     "up": HUB_CHIP_UP,
@@ -162,9 +172,72 @@ class HubView:
     docker_unreachable: bool
     proxied: bool
     empty: bool
+    login: LoginView | None = None
 
 
-PanelMode = Literal["closed", "choose", "install", "link", "edit"]
+LoginBanner = Literal["none", "choose", "reset", "applying", "pending"]
+
+
+@dataclass(frozen=True)
+class LoginView:
+    """What the Hub should draw about the one saved login: which banner (if
+    any), the summary's username, which installed apps are still waiting
+    for the current generation, the login run's own progress line, and
+    whether the reset-line reminder belongs on the page.
+    """
+
+    status: LoginStatus
+    banner: LoginBanner
+    username: str | None
+    pending_names: tuple[str, ...]
+    line: str | None
+    reset_reminder: bool
+
+
+def login_view(
+    record: LoginRecord,
+    *,
+    reset_value: str | None,
+    installed: Sequence[str],
+    running_line: str | None,
+) -> LoginView:
+    """Pure: everything the Hub needs to draw about the login, built from
+    the saved record, `MARRQUEE_RESET_LOGIN`'s current value, which apps
+    are installed, and the login run's own in-memory progress line.
+
+    Banner precedence puts a running line first - while a login run is
+    going, the page always says so, even mid-run when the record itself
+    would otherwise still read as `pending` or `reset`. Then "nothing saved
+    yet", then a still-outstanding reset, then any app still waiting for
+    the current generation, and only once every one of those is settled
+    does the banner disappear.
+    """
+    status = login_status(record, reset_value)
+    pending_names = tuple(get_app(app_id).name for app_id in pending_app_ids(record, installed))
+
+    banner: LoginBanner
+    if running_line is not None:
+        banner = "applying"
+    elif status == "none":
+        banner = "choose"
+    elif status == "reset":
+        banner = "reset"
+    elif pending_names:
+        banner = "pending"
+    else:
+        banner = "none"
+
+    return LoginView(
+        status=status,
+        banner=banner,
+        username=record.login.username if record.login is not None else None,
+        pending_names=pending_names,
+        line=running_line if banner == "applying" else None,
+        reset_reminder=reset_reminder(record, reset_value),
+    )
+
+
+PanelMode = Literal["closed", "choose", "install", "link", "edit", "login"]
 
 
 @dataclass(frozen=True)
@@ -188,6 +261,22 @@ class HubPanel:
     error: str | None
 
 
+@dataclass(frozen=True)
+class LoginFormState:
+    """What the choose-login banner's form (or the panel's Change pane)
+    should show back after a post - never the boxes it started from.
+
+    `answers` holds ONLY `username` - a password is never worth echoing
+    back, right or wrong, so there is no key for one here at all. A pass
+    redirects instead of reaching this type; every `LoginFormState` a
+    template ever sees is a refusal.
+    """
+
+    answers: Mapping[str, str]
+    problem: str | None
+    problem_field: str | None
+
+
 def hub_view(
     app_ids: Sequence[str],
     healths: Sequence[AppHealth],
@@ -200,6 +289,7 @@ def hub_view(
     adding: AppAdd | None = None,
     wiring_gaps: Sequence[WiringGap] = (),
     busy: bool = False,
+    login: LoginView | None = None,
 ) -> HubView:
     healths_by_id = {health.app_id: health for health in healths}
     gaps_by_id = {gap.app_id: gap for gap in wiring_gaps}
@@ -250,7 +340,11 @@ def hub_view(
     )
 
     install_block: str | None = None
-    if adding is not None:
+    if login is not None and login.status == "none":
+        install_block = HUB_INSTALL_LOGIN_FIRST
+    elif login is not None and busy and adding is None:
+        install_block = HUB_INSTALL_BUSY_LOGIN
+    elif adding is not None:
         name = get_app(adding.app_id).name
         if busy:
             install_block = hub_install_busy(name)
@@ -270,6 +364,7 @@ def hub_view(
         and all(tile.state == "unknown" for tile in regular_tiles),
         proxied=proxied,
         empty=not regular_tiles,
+        login=login,
     )
 
 
@@ -490,6 +585,8 @@ def hub_panel(panel: str | None, link_id: str | None, links: Sequence[LinkCard])
         return HubPanel(mode="install", edit=None, label="", url="", error=None)
     if panel == "link":
         return HubPanel(mode="link", edit=None, label="", url="", error=None)
+    if panel == "login":
+        return HubPanel(mode="login", edit=None, label="", url="", error=None)
     if panel == "edit":
         card = next((link for link in links if link.id == link_id), None)
         if card is not None:

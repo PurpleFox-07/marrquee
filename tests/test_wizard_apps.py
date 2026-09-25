@@ -187,7 +187,9 @@ def test_an_unknown_id_in_the_query_string_is_dropped_not_a_500(tmp_path: Path) 
 # --- POST /setup/apps: catalog-ordered csv, or a 200 refusal ----------------
 
 
-def test_posting_a_subset_redirects_with_a_catalog_ordered_csv(tmp_path: Path) -> None:
+def test_posting_a_subset_redirects_to_the_login_step_with_a_catalog_ordered_csv(
+    tmp_path: Path,
+) -> None:
     client = _client(_settings(tmp_path))
 
     response = client.post(
@@ -197,7 +199,7 @@ def test_posting_a_subset_redirects_with_a_catalog_ordered_csv(tmp_path: Path) -
     )
 
     assert response.status_code == 303
-    assert response.headers["location"] == "/setup/drive?apps=prowlarr,radarr"
+    assert response.headers["location"] == "/setup/login?apps=prowlarr,radarr"
 
 
 def test_posting_nothing_rerenders_at_200_with_refusal_and_every_checkbox(

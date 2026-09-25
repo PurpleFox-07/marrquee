@@ -29,7 +29,15 @@
   // all four lists against `HubStatusOut` / `HubTileOut` / `LinkTileOut` /
   // `HubInstallOut` in `routes/api.py`, so a field this script does not
   // actually use has no reason to be listed here.
-  var STATUS_FIELDS = ["apps", "links", "announce", "any_down", "docker_unreachable", "busy"];
+  var STATUS_FIELDS = [
+    "apps",
+    "links",
+    "announce",
+    "any_down",
+    "docker_unreachable",
+    "busy",
+    "login_banner",
+  ];
   var APP_FIELDS = ["app_id", "state", "chip", "line", "url", "aria", "add_state", "note", "actions"];
   // No "url" here: a link card's `href` is set once, by the server, and
   // stays put - the light is only ever a hint, so a poll never touches it.
@@ -189,11 +197,14 @@
   // An app appearing (a clean add finishing), disappearing (a Cancel) or
   // gaining/losing its retry/reconnect buttons is a shape the live layer
   // never tries to redraw itself - it reloads the page once instead, so
-  // the owner always sees the server's own fully-rendered truth.
+  // the owner always sees the server's own fully-rendered truth. A change
+  // in the saved login's own banner (choose/reset/applying/pending/none)
+  // swaps in a whole different section of markup the same way, so it's
+  // folded into the same signature rather than given its own guard.
 
   function reloadIfStructureChanged(payload) {
-    var incoming = actionsSignature(payload.apps || []);
-    if (incoming === actionsSignature(pageApps())) {
+    var incoming = structureSignature(actionsSignature(payload.apps || []), payload.login_banner);
+    if (incoming === structureSignature(actionsSignature(pageApps()), root.dataset.loginBanner)) {
       return false;
     }
     if (window.sessionStorage.getItem(RELOAD_GUARD_KEY) === incoming) {
@@ -204,6 +215,10 @@
     window.sessionStorage.setItem(RELOAD_GUARD_KEY, incoming);
     window.location.reload();
     return true;
+  }
+
+  function structureSignature(actions, loginBanner) {
+    return actions + "|" + (loginBanner || "");
   }
 
   function pageApps() {

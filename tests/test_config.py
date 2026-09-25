@@ -83,6 +83,18 @@ def test_a_marrquee_port_out_of_range_raises_value_error(bad_port: str) -> None:
     assert bad_port in message
 
 
+def test_marrquee_reset_login_blank_or_unset_reads_as_none() -> None:
+    assert Settings.from_env({}).reset_login is None
+    assert Settings.from_env({"MARRQUEE_RESET_LOGIN": ""}).reset_login is None
+    assert Settings.from_env({"MARRQUEE_RESET_LOGIN": "   "}).reset_login is None
+
+
+def test_marrquee_reset_login_non_blank_is_stripped() -> None:
+    settings = Settings.from_env({"MARRQUEE_RESET_LOGIN": "  forgot-2026  "})
+
+    assert settings.reset_login == "forgot-2026"
+
+
 def test_ensure_config_dir_creates_a_missing_folder_and_reports_ok(tmp_path: Path) -> None:
     target = tmp_path / "nested" / "config"
 

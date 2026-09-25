@@ -18,6 +18,7 @@
   data-stale="false"
   data-poll-ms="{{ poll_ms }}"
   data-add-poll-ms="{{ add_poll_ms }}"
+  data-login-banner="{{ view.login.banner if view.login else 'none' }}"
 >
   <p class="eyebrow">{{ words.HUB_EYEBROW }}</p>
   <h1>{{ words.HUB_HEADLINE[0] }}<br><span class="accent">{{ words.HUB_HEADLINE[1] }}</span></h1>
@@ -36,6 +37,46 @@
     <span class="warning-banner__glyph" aria-hidden="true">&#9888;</span>
     <p>{{ words.HUB_DOCKER_BANNER }}</p>
   </div>
+
+  {% if view.login %}
+  {% if view.login.banner in ("choose", "reset") %}
+  <section class="login-banner" id="choose-login" data-role="login-banner">
+    <form method="post" action="/hub/login">
+      {% set step = login_step %}
+      {% set answers = login_form.answers if login_form else {} %}
+      {% set problem = login_form.problem if login_form else none %}
+      {% set problem_field = login_form.problem_field if login_form else none %}
+      {% include "partials/app_questions.html" %}
+      <p>{{ words.LOGIN_PLEX_NOTE }}</p>
+      <button type="submit" class="btn-primary">{{ words.LOGIN_SAVE_BUTTON }}</button>
+    </form>
+  </section>
+  {% elif view.login.banner == "applying" %}
+  <section class="login-banner" id="choose-login" data-role="login-banner">
+    <p role="status" data-role="login-line">{{ view.login.line }}</p>
+  </section>
+  {% endif %}
+
+  {% if view.login.banner == "pending" %}
+  <div class="warning-banner" role="status" data-role="login-pending">
+    <span class="warning-banner__glyph" aria-hidden="true">&#9888;</span>
+    <p>{{ words.hub_login_pending(view.login.pending_names) }}</p>
+    <form method="post" action="/hub/login/retry">
+      <button type="submit" class="btn-primary">{{ words.LOGIN_TRY_AGAIN }}</button>
+    </form>
+  </div>
+  {% endif %}
+
+  {% if view.login.reset_reminder %}
+  <div class="warning-banner" role="status" data-role="login-reset-reminder">
+    <span class="warning-banner__glyph" aria-hidden="true">&#9888;</span>
+    <p>
+      {{ words.HUB_LOGIN_RESET_REMINDER }}
+      <a href="{{ login_help_url }}" target="_blank" rel="noopener noreferrer">{{ words.HUB_LOGIN_FORGOT_LINK }}</a>
+    </p>
+  </div>
+  {% endif %}
+  {% endif %}
 
   {% if view.empty %}
   <p data-role="empty-note">{{ words.HUB_NOTHING_SET_UP }}</p>
@@ -135,6 +176,16 @@
   <p data-role="stale-note">{{ words.HUB_STALE_NOTE }}</p>
 
   <noscript><p>{{ words.HUB_NOSCRIPT_NOTE }}</p></noscript>
+
+  {% if view.login and view.login.status == "set" %}
+  <p class="hub-login-summary" data-role="login-summary">
+    {{ words.hub_login_summary(view.login.username) }}
+    &middot;
+    <a class="hub-footer-link" href="/?panel=login#hub-panel" data-panel-open="login">{{ words.HUB_LOGIN_CHANGE_LINK }}</a>
+    &middot;
+    <a class="hub-footer-link" href="{{ login_help_url }}" target="_blank" rel="noopener noreferrer">{{ words.HUB_LOGIN_FORGOT_LINK }}</a>
+  </p>
+  {% endif %}
 
   <a class="hub-footer-link" href="/diagnostics">{{ words.HUB_DIAGNOSTICS_LINK }}</a>
 
@@ -303,6 +354,25 @@
         <p>{{ words.HUB_LINK_REMOVE_NOTE }}</p>
         <button type="submit" class="btn-ghost">{{ words.HUB_LINK_REMOVE_SUBMIT }}</button>
       </form>
+    </div>
+
+    <div data-panel-pane="login">
+      {% if view.login and view.login.status == "set" %}
+      {# Only drawn once a login is saved - while the choose/reset banner
+         above is still showing its own LOGIN_STEP form, this pane stays
+         empty so the two forms' `q-marrquee-*` field ids can never
+         collide, even hidden in the same page. #}
+      <form method="post" action="/hub/login/change">
+        {% set step = change_step %}
+        {% set answers = change_form.answers if change_form else {} %}
+        {% set problem = change_form.problem if change_form else none %}
+        {% set problem_field = change_form.problem_field if change_form else none %}
+        {% include "partials/app_questions.html" %}
+        <button type="submit" class="btn-primary">{{ words.CHANGE_SAVE_BUTTON }}</button>
+      </form>
+      <p>{{ words.LOGIN_PLEX_NOTE }}</p>
+      <a class="hub-footer-link" href="{{ login_help_url }}" target="_blank" rel="noopener noreferrer">{{ words.HUB_LOGIN_FORGOT_LINK }}</a>
+      {% endif %}
     </div>
   </dialog>
 </main>

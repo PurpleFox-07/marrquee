@@ -470,6 +470,60 @@ async def test_compose_up_runs_the_pinned_binary_against_our_socket(
     assert result.ok is True
 
 
+async def test_compose_up_recreate_drops_no_recreate_default_keeps_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FIRST TEST - the plan's weakest Docker assumption: does dropping
+    `--no-recreate` actually change the argv `compose_up` runs, and does the
+    default keep today's behaviour untouched?
+    """
+    recorded_argv: list[tuple[str, ...]] = []
+
+    class _FakeProcess:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"", b""
+
+    async def fake_create_subprocess_exec(*args: str, **kwargs: object) -> _FakeProcess:
+        recorded_argv.append(args)
+        return _FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    engine = SocketDockerEngine(
+        socket_path=Path("/var/run/docker.sock"),
+        compose_binary=Path("/usr/local/bin/docker-compose"),
+    )
+
+    await engine.compose_up(
+        "marrquee-apps", Path("/host/vol/marrquee/compose.yaml"), "sonarr", recreate=True
+    )
+    await engine.compose_up("marrquee-apps", Path("/host/vol/marrquee/compose.yaml"), "sonarr")
+
+    recreate_call, default_call = recorded_argv
+    assert recreate_call == (
+        "/usr/local/bin/docker-compose",
+        "-p",
+        "marrquee-apps",
+        "-f",
+        "/host/vol/marrquee/compose.yaml",
+        "up",
+        "-d",
+        "sonarr",
+    )
+    assert default_call == (
+        "/usr/local/bin/docker-compose",
+        "-p",
+        "marrquee-apps",
+        "-f",
+        "/host/vol/marrquee/compose.yaml",
+        "up",
+        "-d",
+        "--no-recreate",
+        "sonarr",
+    )
+
+
 async def test_compose_up_never_leaves_home_or_path_empty_even_if_the_parent_lacks_them(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -750,6 +804,25 @@ async def test_a_failed_compose_up_does_not_create_the_network() -> None:
     result = await fake.connect_network("marrquee", "abc")
 
     assert result.ok is False
+
+
+async def test_the_fake_records_a_recreate_call_under_its_own_name() -> None:
+    """A distinct call name for `recreate=True` - never `compose_up` with an
+    extra bool tucked on the end - so every existing `.calls` assertion
+    written against the old signature stays untouched.
+    """
+    fake = FakeDockerEngine(
+        DockerStatus(connected=True),
+        compose_results={"sonarr": ComposeResult(ok=True, exit_code=0, output="")},
+    )
+
+    await fake.compose_up("marrquee", Path("/tmp/compose.yaml"), "sonarr")
+    await fake.compose_up("marrquee", Path("/tmp/compose.yaml"), "sonarr", recreate=True)
+
+    assert fake.calls == [
+        ("compose_up", ("marrquee", "/tmp/compose.yaml", "sonarr")),
+        ("compose_up_recreate", ("marrquee", "/tmp/compose.yaml", "sonarr")),
+    ]
 
 
 async def test_network_exists_can_be_pre_seeded_for_a_resume_scenario() -> None:

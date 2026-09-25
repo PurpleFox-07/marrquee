@@ -55,7 +55,9 @@ class _CountingDockerEngine:
     async def logs(self, name: str, tail: int = 50) -> str:
         raise NotImplementedError("the alive page never fetches logs")
 
-    async def compose_up(self, project: str, compose_file: Path, service: str) -> ComposeResult:
+    async def compose_up(
+        self, project: str, compose_file: Path, service: str, *, recreate: bool = False
+    ) -> ComposeResult:
         raise NotImplementedError("the alive page never runs compose")
 
     async def self_container_id(self) -> str | None:
@@ -86,7 +88,9 @@ class _ExplodingDockerEngine:
     async def logs(self, name: str, tail: int = 50) -> str:
         raise RuntimeError("healthz must never call the Docker engine")
 
-    async def compose_up(self, project: str, compose_file: Path, service: str) -> ComposeResult:
+    async def compose_up(
+        self, project: str, compose_file: Path, service: str, *, recreate: bool = False
+    ) -> ComposeResult:
         raise RuntimeError("healthz must never call the Docker engine")
 
     async def self_container_id(self) -> str | None:

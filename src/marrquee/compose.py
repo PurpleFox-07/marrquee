@@ -111,15 +111,20 @@ def _service_plan(app: CatalogApp, state: InstallState, root: PurePosixPath) -> 
     except KeyError:
         raise ValueError(f"no API key has been generated yet for {app.id!r}") from None
 
-    environment = (
+    environment: list[tuple[str, str]] = [
         ("PUID", str(state.puid)),
         ("PGID", str(state.pgid)),
         ("TZ", state.timezone),
         ("UMASK", state.umask),
         (f"{app.env_prefix}__AUTH__APIKEY", api_key),
-        (f"{app.env_prefix}__AUTH__METHOD", "External"),
-        (f"{app.env_prefix}__AUTH__REQUIRED", "DisabledForLocalAddresses"),
-    )
+    ]
+    if app.login_kind == "arr":
+        # Every app that takes the one saved login always asks for it - the
+        # owner's env-set choice, not something an app's own config.xml can
+        # override (`ConfigFileProvider` reads these before anything on
+        # disk). The exact case matters: `Enum.TryParse` is case-sensitive.
+        environment.append((f"{app.env_prefix}__AUTH__METHOD", "Forms"))
+        environment.append((f"{app.env_prefix}__AUTH__REQUIRED", "Enabled"))
 
     config_mount = f"{root / 'marrquee' / 'apps' / app.id}{_CONFIG_MOUNT_SUFFIX}"
     volumes = [config_mount]
@@ -136,7 +141,7 @@ def _service_plan(app: CatalogApp, state: InstallState, root: PurePosixPath) -> 
         container_name=app.id,
         host_port=app.port,
         container_port=app.port,
-        environment=environment,
+        environment=tuple(environment),
         volumes=tuple(volumes),
         comment=app.description,
     )

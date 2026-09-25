@@ -28,7 +28,7 @@ from test_deploy import (
     _StatefulEngine,
 )
 
-from marrquee.catalog import AppRule, get_app
+from marrquee.catalog import AppRule, CatalogApp, get_app
 from marrquee.config import Settings
 from marrquee.deploy import (
     AppAdd,
@@ -39,6 +39,8 @@ from marrquee.deploy import (
     WiringGap,
 )
 from marrquee.docker_client import ComposeResult
+from marrquee.login import SavedLogin, load_login, save_login
+from marrquee.login_apply import FakeLoginApplier, LoginApplyResult
 from marrquee.state import InstallState, load_state, save_state, write_json_atomic
 from marrquee.storage import read_marker
 from marrquee.wiring import WiringStep
@@ -76,7 +78,11 @@ def _error_step(line: str, technical: str | None = None) -> WiringStep:
 
 
 async def _deployed_to_finale(
-    tmp_path: Path, app_ids: tuple[str, ...] = ("prowlarr", "sonarr"), **engine_kwargs: object
+    tmp_path: Path,
+    app_ids: tuple[str, ...] = ("prowlarr", "sonarr"),
+    *,
+    with_login: bool = True,
+    **engine_kwargs: object,
 ) -> tuple[DeployManager, _StatefulEngine, Settings]:
     """A manager already at `finale` for `app_ids`, on the same stateful
     engine an add is then driven against.
@@ -85,11 +91,18 @@ async def _deployed_to_finale(
     in `app_ids`) - a test scripting `compose_results` for the app it is
     about to add is testing that failure, not an incidental "downloading"
     one caused by the fixture itself.
+
+    `with_login=True` (the default) saves a login before deploying and
+    hands the manager a `FakeLoginApplier` that always accepts it - every
+    add test that isn't specifically about the login itself never has to
+    think about it. `with_login=False` is for the tests that are.
     """
     settings = _settings(tmp_path)
     root = _fresh_root(settings)
     install = _install_state(app_ids, root)
     save_state(settings.config_dir, install)
+    if with_login:
+        save_login(settings.config_dir, "owner", "s3cret-password-1", honor_reset=None)
 
     engine_kwargs.setdefault(
         "images", {get_app(app_id).image for app_id in ("prowlarr", "sonarr", "radarr")}
@@ -97,7 +110,14 @@ async def _deployed_to_finale(
     engine = _StatefulEngine(app_ids, **engine_kwargs)  # type: ignore[arg-type]
     probe = FakeReadinessProbe(default=True)
     clock = _FakeClock()
-    manager = DeployManager(settings, engine, probe=probe, clock=clock.time, sleep=clock.sleep)
+    manager = DeployManager(
+        settings,
+        engine,
+        probe=probe,
+        clock=clock.time,
+        sleep=clock.sleep,
+        login=FakeLoginApplier(),
+    )
     manager.start()
     history = await _run_to_terminal(manager)
     assert history[-1].phase == "finale"
@@ -157,6 +177,43 @@ async def test_an_add_runs_one_compose_up_and_never_leaves_finale(tmp_path: Path
     assert [app.app_id for app in final.apps] == ["prowlarr", "sonarr", "radarr"]
     assert final.apps[-1].state == "done"
     assert wiring.calls == ["radarr"]
+
+
+async def test_an_add_puts_the_login_on_the_app_before_its_wiring(tmp_path: Path) -> None:
+    """`_put_login` runs right after `_bring_up_app` succeeds and strictly
+    before `_run_wiring_for_add` - proven here by recording the ORDER the
+    login applier and the wiring runner are each called in, not merely
+    that both eventually ran.
+    """
+    order: list[str] = []
+
+    class _OrderedLoginApplier:
+        async def apply(
+            self, app: CatalogApp, install: InstallState, login: SavedLogin
+        ) -> LoginApplyResult:
+            order.append(f"login:{app.id}")
+            return LoginApplyResult(ok=True, technical=None)
+
+    class _OrderedWiringRunner(_RecordingWiringRunner):
+        async def run(
+            self, state: InstallState, emit: object, *, only_app: str | None = None
+        ) -> None:
+            order.append(f"wiring:{only_app}")
+            await super().run(state, emit, only_app=only_app)
+
+    manager, engine, settings = await _deployed_to_finale(tmp_path)
+    manager._login = _OrderedLoginApplier()  # type: ignore[attr-defined]
+    manager._wiring = _OrderedWiringRunner()  # type: ignore[attr-defined]
+
+    result = manager.add_app("radarr")
+    assert result == "started"
+    await _finish_add(manager)
+
+    assert order == ["login:radarr", "wiring:radarr"]
+
+    record = load_login(settings.config_dir)
+    assert record.login is not None
+    assert record.applied.get("radarr") == record.login.generation
 
 
 async def test_the_grown_install_keeps_old_keys_marker_and_compose_list_all_three(
@@ -509,6 +566,15 @@ async def test_add_app_refuses_not_ready_before_finale(tmp_path: Path) -> None:
     engine = _happy_engine(())
     manager = DeployManager(settings, engine)
     assert manager.add_app("radarr") == "not_ready"
+
+
+async def test_add_app_refuses_no_login(tmp_path: Path) -> None:
+    """Right after `not_ready` in the refusal order - a "+" with no saved
+    login must never create a Forms app with no user, locked by
+    construction.
+    """
+    manager, engine, settings = await _deployed_to_finale(tmp_path, with_login=False)
+    assert manager.add_app("radarr") == "no_login"
 
 
 async def test_add_app_refuses_unavailable_via_a_catalog_rule(
