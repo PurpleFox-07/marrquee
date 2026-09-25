@@ -197,6 +197,8 @@
   border: 2px dashed var(--border-strong);
   border-radius: var(--radius-2xl);
   color: var(--text-secondary);
+  /* A link's default underline would draw a stray line under the "+". */
+  text-decoration: none;
   font-size: var(--text-3xl);
   line-height: var(--leading-none);
   transition:
@@ -221,6 +223,27 @@
 
 .hub-link-item {
   position: relative;
+}
+
+/* --- Every app poster and link card the same size ------------------------ */
+/* Rows share one height (the tallest card's), and each card fills its cell
+ * instead of shrinking to its own text - so a link card with a short address
+ * lines up with an app poster that has a longer description. Scoped to the
+ * Hub; the "+" tile keeps its own centred, smaller shape. */
+
+.hub-stage .poster-grid {
+  grid-auto-rows: 1fr;
+}
+
+.hub-app-item,
+.hub-link-item {
+  display: flex;
+  flex-direction: column;
+}
+
+.hub-app-item > .hub-poster,
+.hub-link-item > .hub-poster {
+  flex: 1;
 }
 
 .hub-link-edit {

@@ -145,3 +145,24 @@ def test_a_down_link_card_is_never_dimmed() -> None:
     body = _block_for(_HUB_CSS.read_text(), '.hub-link[data-state="down"]::before')
 
     assert "filter: none" in body
+
+
+def test_the_plus_tile_shows_no_link_underline() -> None:
+    # A link's default underline drew a stray dash under the "+" on the NAS.
+    body = _block_for(_HUB_CSS.read_text(), ".hub-plus")
+    assert "text-decoration: none" in body
+
+
+def test_every_hub_row_is_the_same_height() -> None:
+    body = _block_for(_HUB_CSS.read_text(), ".hub-stage .poster-grid")
+    assert "grid-auto-rows: 1fr" in body
+
+
+def test_app_posters_and_link_cards_fill_their_grid_cell() -> None:
+    css = _HUB_CSS.read_text()
+    # One shared rule block lists both item selectors.
+    item_body = _block_for(css, ".hub-app-item")
+    assert "display: flex" in item_body
+    assert "flex-direction: column" in item_body
+    assert "flex: 1" in _block_for(css, ".hub-app-item > .hub-poster")
+    assert "flex: 1" in _block_for(css, ".hub-link-item > .hub-poster")
