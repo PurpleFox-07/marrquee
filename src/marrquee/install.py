@@ -10,11 +10,12 @@ and never one that regenerates an API key an app is already using.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal
 
-from marrquee.catalog import CATALOG, apps_in_order
+from marrquee.catalog import CATALOG, apps_in_order, get_app
 from marrquee.config import Settings
 from marrquee.state import InstallState, load_state, new_api_key, save_state
 from marrquee.storage import check_fresh_start, check_storage_root, derive_ids
@@ -112,3 +113,33 @@ def install_apps(
     )
     save_state(settings.config_dir, state)
     return InstallResult(ok=True, kind="ok", message="", state=state)
+
+
+def with_app_added(state: InstallState, app_id: str) -> InstallState:
+    """The `InstallState` after adding one more app.
+
+    Every existing app's key is kept verbatim; a fresh one is generated
+    only for the app that didn't have one yet - the same rule
+    `install_apps` already follows on a repost, so growing the state one
+    app at a time behaves identically to re-running the whole wizard.
+    Raises `KeyError` for an id not in the catalog (the same as
+    `catalog.get_app`), so a typo'd app id fails loudly here too instead of
+    silently growing `app_ids` with an app Marrquee doesn't know how to
+    deploy.
+    """
+    get_app(app_id)  # raises KeyError for an unknown id
+    grown_ids = tuple(app.id for app in apps_in_order((*state.app_ids, app_id)))
+    api_keys = {aid: state.api_keys.get(aid, new_api_key()) for aid in grown_ids}
+    return dataclasses.replace(state, app_ids=grown_ids, api_keys=api_keys)
+
+
+def with_app_removed(state: InstallState, app_id: str) -> InstallState:
+    """The `InstallState` after dropping one app from `app_ids`.
+
+    The app's API key is kept, never dropped - a cancelled add or a later
+    re-add should never need a fresh key. Raises `KeyError` for an id not
+    in the catalog, the same as `with_app_added`.
+    """
+    get_app(app_id)  # raises KeyError for an unknown id
+    shrunk_ids = tuple(aid for aid in state.app_ids if aid != app_id)
+    return dataclasses.replace(state, app_ids=shrunk_ids)

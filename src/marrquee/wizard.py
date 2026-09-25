@@ -20,6 +20,7 @@ from marrquee import words
 from marrquee.catalog import CATALOG, apps_in_order
 from marrquee.config import Settings
 from marrquee.docker_client import HostKind
+from marrquee.questions import question_steps_for
 from marrquee.state import InstallState
 from marrquee.storage import (
     FreshnessCheck,
@@ -30,7 +31,11 @@ from marrquee.storage import (
     shared_roots,
 )
 
-DEFAULT_APP_IDS: tuple[str, ...] = tuple(app.id for app in CATALOG)
+# Only the apps that default to ticked - a later catalog entry with
+# `default_ticked=False` (a new app arriving mid-cycle) shows up in the
+# wizard's grid unticked, the same way an already-installed NAS only ever
+# offers it through the Hub's "+" panel.
+DEFAULT_APP_IDS: tuple[str, ...] = tuple(app.id for app in CATALOG if app.default_ticked)
 
 
 def parse_app_ids(raw: str | Iterable[str]) -> tuple[str, ...]:
@@ -49,17 +54,58 @@ def parse_app_ids(raw: str | Iterable[str]) -> tuple[str, ...]:
 
 @dataclass(frozen=True)
 class WizardStep:
-    """One pill in the three-step progress row both screens share."""
+    """One pill in the progress row every wizard screen shares.
+
+    `key` names which screen a pill stands for - "apps", "drive", "deploy",
+    or "q:<app_id>:<step_id>" for one app's own question step - so a route
+    can find its current pill number without hardcoding where in the list
+    it falls.
+    """
 
     number: int
     label: str
+    key: str = ""
 
 
-WIZARD_STEPS: tuple[WizardStep, ...] = (
-    WizardStep(1, words.WIZARD_STEP_APPS),
-    WizardStep(2, words.WIZARD_STEP_DRIVE),
-    WizardStep(3, words.WIZARD_STEP_DEPLOY),
-)
+def wizard_steps(app_ids: Iterable[str]) -> tuple[WizardStep, ...]:
+    """The full progress row for a wizard run that has ticked `app_ids`.
+
+    Always "Your apps" first, then one pill per registered question step
+    those apps carry (in `question_steps_for`'s own catalog-then-declared
+    order), then "Your drive" and "Deploy". No catalog app has a question
+    yet, so today this is byte-identical to the three fixed pills the
+    wizard has always shown - a later app's question step inserts itself
+    here without either screen changing.
+    """
+    steps = [WizardStep(number=1, label=words.WIZARD_STEP_APPS, key="apps")]
+    for step in question_steps_for(app_ids):
+        steps.append(
+            WizardStep(
+                number=len(steps) + 1,
+                label=step.title,
+                key=f"q:{step.app_id}:{step.step_id}",
+            )
+        )
+    steps.append(WizardStep(number=len(steps) + 1, label=words.WIZARD_STEP_DRIVE, key="drive"))
+    steps.append(WizardStep(number=len(steps) + 1, label=words.WIZARD_STEP_DEPLOY, key="deploy"))
+    return tuple(steps)
+
+
+def step_number(steps: Sequence[WizardStep], key: str) -> int:
+    """The pill number matching `key`.
+
+    Raises `KeyError` for a key not in `steps` - every caller asks for a
+    key it either just built the list from or read straight off a
+    `QuestionStep`, so a miss here is a bug to surface, not a screen to
+    quietly mis-number.
+    """
+    for step in steps:
+        if step.key == key:
+            return step.number
+    raise KeyError(key)
+
+
+WIZARD_STEPS: tuple[WizardStep, ...] = wizard_steps(())
 
 
 def platform_warning(kind: HostKind) -> str | None:

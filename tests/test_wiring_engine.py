@@ -418,3 +418,125 @@ def test_app_sync_task_involved_order_is_subject_then_object() -> None:
     task = tasks["app-sync:sonarr"]
     assert isinstance(task, AppSyncTask)
     assert task.line == words.wiring_line_app_sync("Prowlarr", "Sonarr")
+
+
+# --- about / only_app -------------------------------------------------------
+
+# The unfiltered plan for every 1-, 2- and 3-app subset - pinned by hand so
+# a mutation in the only_app filter (applied even when only_app is None)
+# has something honest to fail against, not just "equals itself".
+_EXPECTED_KEYS: dict[tuple[str, ...], tuple[str, ...]] = {
+    (): (),
+    ("prowlarr",): ("prowlarr-alone",),
+    ("sonarr",): ("no-prowlarr:sonarr", "root-folder:sonarr"),
+    ("radarr",): ("no-prowlarr:radarr", "root-folder:radarr"),
+    ("prowlarr", "sonarr"): ("app-sync:sonarr", "root-folder:sonarr"),
+    ("prowlarr", "radarr"): ("app-sync:radarr", "root-folder:radarr"),
+    ("sonarr", "radarr"): (
+        "no-prowlarr:sonarr",
+        "no-prowlarr:radarr",
+        "root-folder:sonarr",
+        "root-folder:radarr",
+    ),
+    ("prowlarr", "sonarr", "radarr"): (
+        "app-sync:sonarr",
+        "app-sync:radarr",
+        "root-folder:sonarr",
+        "root-folder:radarr",
+    ),
+}
+
+
+def test_app_sync_and_root_folder_tasks_about_equals_involved() -> None:
+    tasks = {task.key: task for task in plan_wiring(_install_state(("prowlarr", "sonarr")))}
+
+    assert tasks["app-sync:sonarr"].about == tasks["app-sync:sonarr"].involved
+    assert tasks["root-folder:sonarr"].about == tasks["root-folder:sonarr"].involved
+
+
+def test_explain_task_about_names_the_app_even_though_nothing_is_involved() -> None:
+    """`involved` stays empty (there is nothing to prove ready, nothing gets
+    written) - but `about` still names the app, or a filtered plan would
+    silently drop the honest "nothing to sync yet" explanation.
+    """
+    no_prowlarr = {task.key: task for task in plan_wiring(_install_state(("sonarr",)))}
+    explain = no_prowlarr["no-prowlarr:sonarr"]
+    assert explain.involved == ()
+    assert explain.about == ("sonarr",)
+
+    prowlarr_alone = {task.key: task for task in plan_wiring(_install_state(("prowlarr",)))}
+    alone = prowlarr_alone["prowlarr-alone"]
+    assert alone.involved == ()
+    assert alone.about == ("prowlarr",)
+
+
+def test_only_app_keeps_the_steps_about_that_app() -> None:
+    three_apps = _install_state(("prowlarr", "sonarr", "radarr"))
+    assert [task.key for task in plan_wiring(three_apps)] == [
+        "app-sync:sonarr",
+        "app-sync:radarr",
+        "root-folder:sonarr",
+        "root-folder:radarr",
+    ]
+
+    assert [task.key for task in plan_wiring(three_apps, only_app="radarr")] == [
+        "app-sync:radarr",
+        "root-folder:radarr",
+    ]
+
+    two_apps = _install_state(("sonarr", "radarr"))
+    assert [task.key for task in plan_wiring(two_apps, only_app="sonarr")] == [
+        "no-prowlarr:sonarr",
+        "root-folder:sonarr",
+    ]
+
+
+@pytest.mark.parametrize("app_ids", list(_EXPECTED_KEYS))
+def test_only_app_none_is_byte_identical_to_todays_plan(app_ids: tuple[str, ...]) -> None:
+    state = _install_state(app_ids)
+
+    tasks = plan_wiring(state, only_app=None)
+
+    assert tuple(task.key for task in tasks) == _EXPECTED_KEYS[app_ids]
+    assert tuple(task.line for task in plan_wiring(state)) == tuple(task.line for task in tasks)
+
+
+async def test_an_empty_filtered_plan_emits_nothing_to_connect() -> None:
+    engine = WiringEngine(client=FakeArrClient({}))
+    steps: list[WiringStep] = []
+    state = _install_state(("prowlarr", "sonarr"))
+
+    await engine.run(state, steps.append, only_app="radarr")
+
+    assert len(steps) == 1
+    assert steps[0].key == "nothing-to-connect"
+    assert steps[0].state == "skipped"
+    assert steps[0].total == 1
+
+
+async def test_only_app_step_numbering_counts_the_filtered_list() -> None:
+    """ "Step N of M" has to describe what the owner is watching happen right
+    now - the filtered add, not the whole stack's plan - or a two-step add
+    would misleadingly claim to be "step 1 of 4".
+    """
+    fake = FakeArrClient(
+        {
+            ("GET", "http://prowlarr:9696", "api/v1/system/status"): [_ok(None)],
+            ("GET", "http://radarr:7878", "api/v3/system/status"): [_ok(None)],
+            ("GET", "http://prowlarr:9696", "api/v1/applications"): [_ok([])],
+            ("GET", "http://prowlarr:9696", "api/v1/applications/schema"): [_ok(_SCHEMA)],
+            ("POST", "http://prowlarr:9696", "api/v1/applications"): [_created({"id": 5})],
+            ("GET", "http://radarr:7878", "api/v3/rootfolder"): [
+                _ok([{"id": 2, "path": "/data/media/movies"}])
+            ],
+        }
+    )
+    engine = WiringEngine(client=fake)
+    steps: list[WiringStep] = []
+    state = _install_state(("prowlarr", "sonarr", "radarr"))
+
+    await engine.run(state, steps.append, only_app="radarr")
+
+    frames = _frames_by_key(steps)
+    assert set(frames) == {"app-sync:radarr", "root-folder:radarr"}
+    assert {frame.total for step_frames in frames.values() for frame in step_frames} == {2}

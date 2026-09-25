@@ -1,11 +1,13 @@
 /* The Hub - the home page a browser lands on once a deploy has finished.
  * Page chrome (wrap, eyebrow, h1, the gradient accent, the lede) is reused
- * from app.css, and the poster tile's shared structure and art layer from
- * poster.css; this file only ever adds what's specific to the Hub: the
- * clickable tile, its per-state colour and motion, the status dot, the
- * notes/banners that live in every page load and are shown or hidden by an
- * attribute on the root `<main>`, the "+" tile, the link card's Edit pill,
- * and the panel `<dialog>` the "+" tile and every Edit pill open.
+ * from app.css, and the poster tile's shared structure, art layer and
+ * starting spotlight from poster.css; this file only ever adds what's
+ * specific to the Hub: the clickable tile, its per-state colour and
+ * motion, the status dot, the notes/banners that live in every page load
+ * and are shown or hidden by an attribute on the root `<main>`, the "+"
+ * tile, the link card's Edit pill, the panel `<dialog>` the "+" tile and
+ * every Edit pill open, an adding/reconnecting tile's own amber note and
+ * extra action buttons, and the install pane's own rows.
  *
  * Every colour, spacing, type, radius and motion value here is a CSS
  * custom property from tokens.css - never a literal. The only literals
@@ -66,6 +68,12 @@
   border-color: var(--border);
 }
 
+/* A failed add's own tile - no art dim, unlike a Down poster: the failure
+ * headline and the Try again / Cancel buttons already say enough. */
+.poster[data-add-state="error"] {
+  border-color: var(--error);
+}
+
 /* --- Status row: a coloured dot plus the words, at full contrast ----------- */
 
 .hub-status {
@@ -106,6 +114,27 @@
 
 .hub-poster [data-role="line"]:empty {
   display: none;
+}
+
+/* An adding/reconnecting tile's own amber note - a wiring gap's plain
+ * sentence, or nothing at all (collapsed the same way an empty `line`
+ * already is). */
+.hub-note {
+  color: var(--warning);
+  font-size: var(--text-xs);
+  margin-top: var(--space-2);
+}
+
+.hub-note:empty {
+  display: none;
+}
+
+/* Try again / Cancel / Connect again - siblings of the poster's own link,
+ * never nested inside it (a form inside an `<a>` is invalid HTML). */
+.hub-tile-actions {
+  display: flex;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
 }
 
 /* --- Stage: today it holds one child, the poster grid ---------------------- */
@@ -287,6 +316,49 @@
  * monospace `.path-input` it shares every other rule with. */
 .hub-panel input[name="label"] {
   font-family: var(--font-sans);
+}
+
+/* --- The install pane's rows: a plain surface card, no tick - each row is
+ * a fact (available or not), never a choice to make right here. */
+
+.install-list {
+  list-style: none;
+  margin: 0 0 var(--space-4);
+  padding: 0;
+  display: grid;
+  gap: var(--space-3);
+}
+
+.install-row {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-4);
+}
+
+.install-row__name {
+  display: block;
+  font-size: var(--text-base);
+  font-weight: var(--weight-bold);
+  color: var(--text-primary);
+}
+
+.install-row__desc {
+  margin: var(--space-1) 0 var(--space-3);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+/* No opacity - an unavailable row's name and reason each get their own
+ * token so contrast stays measurable, never a faded-out guess. */
+.install-row[data-available="false"] .install-row__name {
+  color: var(--text-secondary);
+}
+
+.install-row__reason {
+  margin: var(--space-1) 0 0;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
 }
 
 /* Removing a link only takes its card off the Hub - the button still

@@ -13,12 +13,15 @@ substring/index checks instead.
 from __future__ import annotations
 
 import dataclasses
+import re
 import time
 from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath
 
+import pytest
 from fastapi.testclient import TestClient
 
+import marrquee.questions as questions_module
 from marrquee import words
 from marrquee.catalog import CATALOG, get_app
 from marrquee.config import Settings
@@ -32,6 +35,7 @@ from marrquee.deploy import (
 )
 from marrquee.docker_client import ComposeResult, DockerStatus, FakeDockerEngine
 from marrquee.main import create_app
+from marrquee.questions import QuestionCheck, QuestionStep
 from marrquee.state import STATE_VERSION, InstallState, save_state, write_json_atomic
 from marrquee.wiring import WiringStep
 from marrquee.words import (
@@ -220,6 +224,33 @@ def test_the_ready_page_shows_the_step_pills_and_a_back_link_the_running_page_sh
     running = _client(settings).get("/deploy")
     assert 'class="step-pills"' not in running.text
     assert 'href="/setup/drive?apps=prowlarr"' not in running.text
+
+
+def test_a_ticked_apps_registered_question_step_grows_the_ready_pages_pill_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture_step = QuestionStep(
+        app_id="prowlarr",
+        step_id="fixture",
+        title="Fixture questions",
+        lede="",
+        fields=(),
+        check=lambda answers: QuestionCheck(ok=True, answers=answers, problem=None, field=None),
+    )
+    monkeypatch.setattr(questions_module, "QUESTION_STEPS", (fixture_step,))
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("prowlarr",)))
+
+    response = _client(settings).get("/deploy")
+
+    assert response.status_code == 200
+    nav_match = re.search(r'<nav class="step-pills".*?</nav>', response.text, re.DOTALL)
+    assert nav_match is not None
+    nav = nav_match.group()
+    fixture_index = nav.index("Fixture questions")
+    drive_index = nav.index(words.WIZARD_STEP_DRIVE)
+    deploy_index = nav.rindex(words.WIZARD_STEP_DEPLOY)
+    assert fixture_index < drive_index < deploy_index
 
 
 # --- GET /deploy: the running and error frames, through the poster grid ------

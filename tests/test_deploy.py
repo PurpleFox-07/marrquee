@@ -35,6 +35,7 @@ from marrquee.deploy import (
 )
 from marrquee.docker_client import (
     ComposeResult,
+    ContainerRemoveResult,
     ContainerSnapshot,
     DockerStatus,
     FakeDockerEngine,
@@ -117,6 +118,7 @@ class _StatefulEngine:
         compose_results: dict[str, ComposeResult] | None = None,
         self_container_id: str | None = "marrquee",
         network_exists: bool = False,
+        remove_results: dict[str, bool] | None = None,
     ) -> None:
         self._images = (
             images if images is not None else {get_app(app_id).image for app_id in app_ids}
@@ -125,6 +127,7 @@ class _StatefulEngine:
         self._self_container_id = self_container_id
         self._containers: dict[str, ContainerSnapshot] = {}
         self._network_exists = network_exists
+        self._remove_results = remove_results or {}
         self.calls: list[tuple[str, tuple[object, ...]]] = []
 
     async def status(self) -> DockerStatus:
@@ -165,6 +168,15 @@ class _StatefulEngine:
     async def self_container_id(self) -> str | None:
         self.calls.append(("self_container_id", ()))
         return self._self_container_id
+
+    async def remove_container(self, name: str) -> ContainerRemoveResult:
+        self.calls.append(("remove_container", (name,)))
+        if not self._remove_results.get(name, True):
+            return ContainerRemoveResult(ok=False, detail=f"scripted failure removing {name!r}")
+        # A removed container must stop answering inspect - Cancel's own
+        # guarantee, modelled here the same way a real daemon would behave.
+        self._containers.pop(name, None)
+        return ContainerRemoveResult(ok=True, detail=None)
 
 
 def _happy_engine(app_ids: tuple[str, ...]) -> _StatefulEngine:
@@ -230,7 +242,7 @@ class _CountingWiringRunner:
     def __init__(self) -> None:
         self.calls = 0
 
-    async def run(self, state: InstallState, emit: object) -> None:
+    async def run(self, state: InstallState, emit: object, *, only_app: str | None = None) -> None:
         self.calls += 1
 
 
@@ -242,7 +254,7 @@ class _OneStepWiringRunner:
     def __init__(self, technical: str) -> None:
         self._technical = technical
 
-    async def run(self, state: InstallState, emit: object) -> None:
+    async def run(self, state: InstallState, emit: object, *, only_app: str | None = None) -> None:
         step = WiringStep(
             index=1,
             total=1,
@@ -270,7 +282,7 @@ class _ScriptedWiringRunner:
     def __init__(self, steps: Sequence[WiringStep]) -> None:
         self._steps = steps
 
-    async def run(self, state: InstallState, emit: object) -> None:
+    async def run(self, state: InstallState, emit: object, *, only_app: str | None = None) -> None:
         for step in self._steps:
             emit(step)  # type: ignore[operator]
             await asyncio.sleep(0)
@@ -761,7 +773,7 @@ async def test_a_wiring_failure_never_fails_the_deploy_and_its_detail_is_diagnos
 
 
 class _RaisingWiringRunner:
-    async def run(self, state: InstallState, emit: object) -> None:
+    async def run(self, state: InstallState, emit: object, *, only_app: str | None = None) -> None:
         raise RuntimeError(
             "a real WiringRunner must never do this, but the engine survives it anyway"
         )

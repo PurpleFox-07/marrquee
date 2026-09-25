@@ -70,7 +70,11 @@ class WiringTask(Protocol):
     Knows nothing about ordering, waiting, retrying or reporting - the
     engine owns all of that. `involved` doubles as the list of apps the
     engine proves ready before calling `apply`, in the order the mockup
-    expects the posters to light up in (subject, then object).
+    expects the posters to light up in (subject, then object). `about` is
+    a separate, wider list: every app this step concerns, whether or not
+    anything gets proven ready or written for it. Filtering on `involved`
+    would silently drop a graceful "nothing to sync yet" explanation, whose
+    `involved` is always empty.
     """
 
     # Declared as read-only properties, not plain attributes - every real
@@ -85,6 +89,9 @@ class WiringTask(Protocol):
     @property
     def involved(self) -> tuple[str, ...]: ...
 
+    @property
+    def about(self) -> tuple[str, ...]: ...
+
     async def apply(self, ctx: WiringContext) -> StepOutcome: ...
 
 
@@ -97,6 +104,10 @@ class AppSyncTask:
     involved: tuple[str, ...]
     prowlarr_id: str
     target_id: str
+
+    @property
+    def about(self) -> tuple[str, ...]:
+        return self.involved
 
     async def apply(self, ctx: WiringContext) -> StepOutcome:
         prowlarr = ctx.apps[self.prowlarr_id]
@@ -121,6 +132,10 @@ class RootFolderTask:
     media_folder: str
     host_path: PurePosixPath
 
+    @property
+    def about(self) -> tuple[str, ...]:
+        return self.involved
+
     async def apply(self, ctx: WiringContext) -> StepOutcome:
         app = ctx.apps[self.app_id]
         return await ensure_root_folder(
@@ -138,12 +153,15 @@ class ExplainTask:
 
     Covers the two graceful "nothing to sync yet" cases: a partner chosen
     without Prowlarr, and Prowlarr chosen with no partner. `involved` is
-    empty - there is no app to prove ready and nothing gets written.
+    empty - there is no app to prove ready and nothing gets written - but
+    `about` still names the app this explanation concerns, so filtering an
+    add to `only_app` keeps it instead of silently dropping it.
     """
 
     key: str
     line: str
     involved: tuple[str, ...]
+    about: tuple[str, ...]
     note: str
 
     async def apply(self, ctx: WiringContext) -> StepOutcome:
@@ -152,13 +170,18 @@ class ExplainTask:
         )
 
 
-def plan_wiring(state: InstallState) -> tuple[WiringTask, ...]:
+def plan_wiring(state: InstallState, *, only_app: str | None = None) -> tuple[WiringTask, ...]:
     """The honest list of steps the owner's chosen apps justify. Pure - no client.
 
     Application-sync steps (or their graceful explanations) come first, in
     catalog order; then one root-folder step per media folder of each
     chosen app, also in catalog order. Input order never matters, the same
     way `apps_in_order` already guarantees for folder creation and compose.
+
+    `only_app` narrows the result to the steps *about* that one app (used
+    by an add or a reconnect), keeping the same relative order. `None`
+    (the default) returns every step, unchanged from before this parameter
+    existed.
     """
     apps = apps_in_order(state.app_ids)
     prowlarr = next((app for app in apps if app.id == "prowlarr"), None)
@@ -184,6 +207,7 @@ def plan_wiring(state: InstallState) -> tuple[WiringTask, ...]:
                     key="prowlarr-alone",
                     line=WIRING_SKIP_PROWLARR_ALONE,
                     involved=(),
+                    about=("prowlarr",),
                     note=WIRING_SKIP_PROWLARR_ALONE,
                 )
             )
@@ -195,6 +219,7 @@ def plan_wiring(state: InstallState) -> tuple[WiringTask, ...]:
                     key=f"no-prowlarr:{partner.id}",
                     line=note,
                     involved=(),
+                    about=(partner.id,),
                     note=note,
                 )
             )
@@ -212,7 +237,9 @@ def plan_wiring(state: InstallState) -> tuple[WiringTask, ...]:
                 )
             )
 
-    return tuple(tasks)
+    if only_app is None:
+        return tuple(tasks)
+    return tuple(task for task in tasks if only_app in task.about)
 
 
 class WiringEngine:
@@ -245,8 +272,14 @@ class WiringEngine:
         self._attempts = attempts
         self._retry_delay = retry_delay
 
-    async def run(self, state: InstallState, emit: Callable[[WiringStep], None]) -> None:
-        tasks = plan_wiring(state)
+    async def run(
+        self,
+        state: InstallState,
+        emit: Callable[[WiringStep], None],
+        *,
+        only_app: str | None = None,
+    ) -> None:
+        tasks = plan_wiring(state, only_app=only_app)
         if not tasks:
             emit(
                 WiringStep(

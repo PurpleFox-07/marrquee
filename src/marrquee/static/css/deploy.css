@@ -1,22 +1,18 @@
 /* Styles unique to the Deploy screen: the ready ticket, the running
  * posters' per-state look, and the poster grid's own phase-scoped
- * visibility. Structure and typography shared with a later page live in
- * poster.css instead.
+ * visibility. Structure and typography shared with the Hub live in
+ * poster.css instead - including the starting tile's own spotlight, moved
+ * there so both pages draw it from one rule set.
  *
  * Every colour, spacing, type, radius, shadow and motion value here is a
  * CSS custom property from tokens.css - never a literal. The only literals
  * allowed are structural values with no matching token: 1px (the ticket's
- * perforation), 2px (the ticket's perforation width and the starting
- * tile's focus-adjacent outline math), 155deg (the waiting art's gradient
- * angle), -30% / 60% (the starting spotlight's radial inset and fade
- * stop), grayscale(.85) / brightness(.5) (the waiting art's dim),
- * brightness(1.12) (the Deploy button's hover), scale(.97) (the Deploy
- * button's press), scale(.9) / scale(1.05) (the spotlight's pulse),
- * translateY(-3px) (the starting tile's lift), .14 / .34 (the spotlight's
- * dip and resting opacity), 1.3s / 1s (the spotlight's and the spinner's
- * durations), 150px (the showtimes grid's minimum column width, the same
- * value the approved mockup used) and 640px (the one breakpoint every
- * stylesheet on this page shares).
+ * perforation), 2px (the ticket's perforation width), grayscale(.85) /
+ * brightness(.5) (the waiting art's dim), brightness(1.12) (the Deploy
+ * button's hover), scale(.97) (the Deploy button's press), 150px (the
+ * showtimes grid's minimum column width, the same value the approved
+ * mockup used) and 640px (the one breakpoint every stylesheet on this page
+ * shares).
  */
 
 .deploy-panel {
@@ -184,46 +180,10 @@
   flex-shrink: 0;
 }
 
-.poster[data-state="starting"] {
-  border-color: var(--spotlight);
-  transform: translateY(-3px);
-  box-shadow:
-    0 0 0 var(--space-1) color-mix(in srgb, var(--spotlight) 14%, transparent),
-    0 var(--space-3) var(--space-6) color-mix(in srgb, var(--spotlight) 50%, transparent);
-}
-
-.poster[data-state="starting"]::before {
-  filter: none;
-}
-
-/* The spotlight beam - a second pseudo-element so the dim art layer and
- * the beam can carry independent (and independently overridden) filters. */
-.poster[data-state="starting"]::after {
-  content: "";
-  position: absolute;
-  inset: -30%;
-  z-index: 0;
-  pointer-events: none;
-  background: radial-gradient(
-    circle,
-    color-mix(in srgb, var(--spotlight) 30%, var(--text-primary)),
-    transparent 60%
-  );
-  opacity: 0.34;
-  animation: poster-spotlight 1.3s ease-in-out infinite;
-}
-
-@keyframes poster-spotlight {
-  0%,
-  100% {
-    opacity: 0.34;
-    transform: scale(0.9);
-  }
-  50% {
-    opacity: 0.14;
-    transform: scale(1.05);
-  }
-}
+/* The starting tile's own border/lift/glow, its beam and the two
+ * animations they use all live in poster.css now, shared with the Hub's
+ * adding tile - only what's specific to this page's own poster markup
+ * (the status colour and which icon shows) stays here. */
 
 .poster[data-state="starting"] .poster-status {
   color: var(--spotlight);
@@ -236,12 +196,6 @@
 .poster-icon[data-icon="starting"] svg {
   animation: poster-spin 1s linear infinite;
   transform-origin: 50% 50%;
-}
-
-@keyframes poster-spin {
-  to {
-    transform: rotate(360deg);
-  }
 }
 
 .poster[data-state="done"] {
@@ -277,11 +231,8 @@
 }
 
 /* The gold "linking" outline - only ever true during the wiring phase, on
- * exactly the posters the current step involves. */
-.poster[data-linking="true"] {
-  outline: 2px solid var(--spotlight);
-  outline-offset: 2px;
-}
+ * exactly the posters the current step involves - lives in poster.css now,
+ * shared with the Hub's own reconnecting tile. */
 
 /* --- Wiring: the block, its count, text, note and per-state chip -------- */
 
@@ -513,15 +464,8 @@
   outline-offset: 2px;
 }
 
-/* Matches app.css's and wizard.css's own blocks - every stylesheet loaded
- * on this page switches motion off the same way, so none of them has to
- * assume another one already did. The starting tile's lift is a plain
- * state change, not a transition or an animation, so it needs its own
- * override here; the spotlight's pulse and the spinner's rotation are both
- * real animations and are already stopped by app.css's `!important` rule,
- * left holding the spotlight at its resting (bright) opacity. */
-@media (prefers-reduced-motion: reduce) {
-  .poster[data-state="starting"] {
-    transform: none;
-  }
-}
+/* The starting tile's own reduced-motion override (its lift is a plain
+ * state change, not a transition or an animation, so it needs one) now
+ * lives in poster.css alongside the spotlight itself - every other motion
+ * on this page is a real transition or animation, already stopped by
+ * app.css's `!important` rule. */

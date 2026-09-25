@@ -928,9 +928,8 @@ HUB_PANEL_CHOOSE_LINK_ONE_LINER = (
 
 # A partial install (the wizard allows choosing only some apps) makes "you
 # already have everything" untrue, so the install pane has to pick between
-# these two sentences rather than always showing one fixed line.
+# this sentence and the list of what's left to add.
 HUB_INSTALL_ALL_DONE = "Everything Marrquee offers is already installed."
-HUB_INSTALL_ARRIVING = "Installing these from your Hub arrives in the next Marrquee update."
 
 HUB_LINK_LABEL_FIELD = "Name on the card"
 HUB_LINK_LABEL_HINT = "Shown under the card's glyph, the same way the apps above it are."
@@ -971,7 +970,6 @@ _HUB_LINK_WORDS: tuple[str, ...] = (
     "HUB_PANEL_CHOOSE_LINK_TITLE",
     "HUB_PANEL_CHOOSE_LINK_ONE_LINER",
     "HUB_INSTALL_ALL_DONE",
-    "HUB_INSTALL_ARRIVING",
     "HUB_LINK_LABEL_FIELD",
     "HUB_LINK_LABEL_HINT",
     "HUB_LINK_URL_FIELD",
@@ -988,6 +986,121 @@ _HUB_LINK_WORDS: tuple[str, ...] = (
 # end Hub: your own links section
 # =============================================================================
 
+# =============================================================================
+# Hub: install an app - the "+" panel's install pane and the wizard's
+# question steps
+# =============================================================================
+
+HUB_INSTALL_LEDE = "Pick one of Marrquee's own apps to add to your Hub."
+HUB_INSTALL_NEEDS_JS = (
+    "Adding an app from here needs JavaScript. Switch it on, or add it from "
+    "your NAS's own Docker app instead."
+)
+
+
+def hub_install_button(name: str) -> str:
+    return f"Add {name}"
+
+
+def hub_install_unavailable(reason: str) -> str:
+    return f"Not available yet - {reason}"
+
+
+def hub_install_busy(name: str) -> str:
+    return f"Marrquee is already adding {name}. Wait for it to finish, then add another."
+
+
+def hub_install_resolve_first(name: str) -> str:
+    return f"{name} didn't finish installing. Sort that out first - its tile is above."
+
+
+HUB_INSTALL_ALREADY = "That app is already installed."
+HUB_INSTALL_NOT_READY = "Marrquee isn't ready to add an app yet. Finish setup first."
+HUB_INSTALL_UNKNOWN = "Marrquee doesn't know that app."
+
+HUB_CHIP_ADDING = "Adding…"
+HUB_CHIP_ADD_FAILED = "Didn't install"
+
+
+def hub_line_connecting(name: str) -> str:
+    return f"Connecting {name} to your other apps…"
+
+
+HUB_TRY_AGAIN = "Try again"
+HUB_CANCEL_ADD = "Cancel"
+HUB_CONNECT_AGAIN = "Connect again"
+
+
+def hub_wiring_gap_note(name: str, failed_lines: _Sequence[str]) -> str:
+    """`name` is up and reachable, but one or more of its wiring steps
+    didn't finish. Names every failed line, the same "never a bare count"
+    rule `wiring_finale_note` already follows, so the note stands on its
+    own without a reader having to open Diagnostics first.
+    """
+    lines = list(failed_lines)
+    if len(lines) == 1:
+        return f"{name} is up, but one connection didn't finish: {lines[0]}."
+    joined = ", ".join(lines)
+    return f"{name} is up, but these connections didn't finish: {joined}."
+
+
+def hub_cancel_failed(name: str) -> str:
+    return (
+        f"Marrquee couldn't remove {name}'s container. Try Cancel again, or remove it "
+        "yourself from your NAS's own Docker app."
+    )
+
+
+def hub_announce_adding(name: str) -> str:
+    return f"Adding {name}."
+
+
+def hub_announce_add_failed(name: str) -> str:
+    return f"{name} didn't install."
+
+
+QUESTION_PICK_ONE = "Pick one of the options."
+QUESTIONS_NEXT = "Next"
+QUESTIONS_BACK = "Back"
+
+
+def wizard_app_unavailable(name: str, reason: str) -> str:
+    return f"{name} isn't available yet - {reason}"
+
+
+HUB_SETUP_DONE_REFUSAL = "Marrquee is already set up. Add more apps from the + on your Hub."
+
+_HUB_INSTALL_WORDS: tuple[str, ...] = (
+    "HUB_INSTALL_LEDE",
+    "HUB_INSTALL_NEEDS_JS",
+    "hub_install_button",
+    "hub_install_unavailable",
+    "hub_install_busy",
+    "hub_install_resolve_first",
+    "HUB_INSTALL_ALREADY",
+    "HUB_INSTALL_NOT_READY",
+    "HUB_INSTALL_UNKNOWN",
+    "HUB_CHIP_ADDING",
+    "HUB_CHIP_ADD_FAILED",
+    "hub_line_connecting",
+    "HUB_TRY_AGAIN",
+    "HUB_CANCEL_ADD",
+    "HUB_CONNECT_AGAIN",
+    "hub_wiring_gap_note",
+    "hub_cancel_failed",
+    "hub_announce_adding",
+    "hub_announce_add_failed",
+    "QUESTION_PICK_ONE",
+    "QUESTIONS_NEXT",
+    "QUESTIONS_BACK",
+    "wizard_app_unavailable",
+    "HUB_SETUP_DONE_REFUSAL",
+)
+
+# =============================================================================
+# end Hub: install an app section
+# =============================================================================
+
 # The full review surface: every public name above, in one tuple. A later
 # feature area adds its own fenced section above this line, then extends
 # this tuple with its own `_..._WORDS` name - never editing an earlier
@@ -999,4 +1112,5 @@ WORDS_INVENTORY: tuple[str, ...] = (
     *_DEPLOY_SCREEN_WORDS,
     *_HUB_WORDS,
     *_HUB_LINK_WORDS,
+    *_HUB_INSTALL_WORDS,
 )

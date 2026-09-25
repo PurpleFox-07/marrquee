@@ -17,6 +17,7 @@ from marrquee import __version__, words
 from marrquee.config import Settings
 from marrquee.docker_client import (
     ComposeResult,
+    ContainerRemoveResult,
     ContainerSnapshot,
     DockerFailure,
     DockerStatus,
@@ -60,6 +61,9 @@ class _CountingDockerEngine:
     async def self_container_id(self) -> str | None:
         raise NotImplementedError("the alive page never looks up its own container")
 
+    async def remove_container(self, name: str) -> ContainerRemoveResult:
+        raise NotImplementedError("the alive page never removes a container")
+
 
 class _ExplodingDockerEngine:
     """A DockerEngine whose every method always raises.
@@ -86,6 +90,9 @@ class _ExplodingDockerEngine:
         raise RuntimeError("healthz must never call the Docker engine")
 
     async def self_container_id(self) -> str | None:
+        raise RuntimeError("healthz must never call the Docker engine")
+
+    async def remove_container(self, name: str) -> ContainerRemoveResult:
         raise RuntimeError("healthz must never call the Docker engine")
 
 

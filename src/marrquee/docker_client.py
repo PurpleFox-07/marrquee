@@ -113,6 +113,19 @@ class ComposeResult:
 
 
 @dataclass(frozen=True)
+class ContainerRemoveResult:
+    """The outcome of asking Docker to force-remove one container.
+
+    `detail` carries the status code and Docker's own message, for logs and
+    the diagnostics file only - same contract as every other `detail`-shaped
+    field in this codebase.
+    """
+
+    ok: bool
+    detail: str | None
+
+
+@dataclass(frozen=True)
 class NetworkConnectResult:
     """The outcome of asking Docker to join our own container to a network.
 
@@ -141,6 +154,7 @@ class DockerEngine(Protocol):
     async def logs(self, name: str, tail: int = 50) -> str: ...
     async def compose_up(self, project: str, compose_file: Path, service: str) -> ComposeResult: ...
     async def self_container_id(self) -> str | None: ...
+    async def remove_container(self, name: str) -> ContainerRemoveResult: ...
 
 
 class SocketDockerEngine:
@@ -353,6 +367,27 @@ class SocketDockerEngine:
             return "marrquee"
         return None
 
+    async def remove_container(self, name: str) -> ContainerRemoveResult:
+        try:
+            async with self._client() as client:
+                response = await client.delete(f"/containers/{name}?force=true")
+        except (httpx.TimeoutException, httpx.ConnectError) as error:
+            return ContainerRemoveResult(ok=False, detail=str(error))
+
+        return _classify_remove_response(response)
+
+
+def _classify_remove_response(response: httpx.Response) -> ContainerRemoveResult:
+    """204 means removed, 404 means already gone - Cancel treats both as
+    done. Anything else (409 "removal already in progress", for one) is a
+    genuine failure, carrying Docker's own message for the diagnostics file.
+    """
+    if response.status_code in (204, 404):
+        return ContainerRemoveResult(ok=True, detail=None)
+    return ContainerRemoveResult(
+        ok=False, detail=f"HTTP {response.status_code}: {_docker_error_message(response)}"
+    )
+
 
 def _parse_version_response(response: httpx.Response) -> DockerStatus:
     """Turn a `GET /version` response into a DockerStatus.
@@ -550,11 +585,13 @@ class FakeDockerEngine:
         network_connects: bool | None = None,
         network_exists: bool = False,
         self_container_id: str | None = "fake-marrquee-container",
+        remove_results: Mapping[str, bool] | None = None,
     ) -> None:
         self._status = status
         self._containers = dict(containers) if containers is not None else {}
         self._images = frozenset(images) if images is not None else frozenset()
         self._compose_results = dict(compose_results) if compose_results is not None else {}
+        self._remove_results = dict(remove_results) if remove_results is not None else {}
         # `None` (the default) models a real Docker daemon honestly: the
         # stack's network is created by compose's own first successful `up`,
         # not by anything before it - `network_exists` starts False (a
@@ -610,3 +647,14 @@ class FakeDockerEngine:
     async def self_container_id(self) -> str | None:
         self.calls.append(("self_container_id", ()))
         return self._self_container_id
+
+    async def remove_container(self, name: str) -> ContainerRemoveResult:
+        self.calls.append(("remove_container", (name,)))
+        ok = self._remove_results.get(name, True)
+        if ok:
+            # A removed container must stop answering inspect - an
+            # always-"yes" fake could never prove Cancel actually removed
+            # anything.
+            self._containers.pop(name, None)
+            return ContainerRemoveResult(ok=True, detail=None)
+        return ContainerRemoveResult(ok=False, detail=f"scripted failure removing {name!r}")

@@ -55,9 +55,20 @@ class WiringRunner(Protocol):
     a wiring problem is not a deploy failure, so every problem here has to
     become an emitted step with `state="error"` instead of an exception that
     could turn an otherwise-successful deploy into one that looks failed.
+
+    `only_app` narrows a run to the steps *about* one app - a full deploy's
+    finale, adding one app or reconnecting one app all share this one
+    method; `None` (a full run) is unchanged from before this parameter
+    existed.
     """
 
-    async def run(self, state: InstallState, emit: Callable[[WiringStep], None]) -> None: ...
+    async def run(
+        self,
+        state: InstallState,
+        emit: Callable[[WiringStep], None],
+        *,
+        only_app: str | None = None,
+    ) -> None: ...
 
 
 class NoWiringYet:
@@ -69,5 +80,11 @@ class NoWiringYet:
     `WiringEngine` instead.
     """
 
-    async def run(self, state: InstallState, emit: Callable[[WiringStep], None]) -> None:
+    async def run(
+        self,
+        state: InstallState,
+        emit: Callable[[WiringStep], None],
+        *,
+        only_app: str | None = None,
+    ) -> None:
         return None

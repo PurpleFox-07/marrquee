@@ -1,20 +1,28 @@
 /* The poster tile - shared structure and typography, reused by the Deploy
- * screen and, later, the Hub. Every colour, filter and per-state rule
- * (waiting/starting/done/error/linking) lives in the page's own stylesheet
- * instead - deploy.css here - so a page that reuses this file never
- * inherits state logic it doesn't have yet. The one exception is the art
- * layer's gradient below: it's the poster's identity, not a state, so both
- * pages draw the same picture and each page's own sheet only ever dims it.
+ * screen and the Hub. Most colour, filter and per-state rules (waiting,
+ * done, error) live in each page's own stylesheet instead - deploy.css and
+ * hub.css - so a page that reuses this file never inherits state logic it
+ * doesn't have yet. Two exceptions live here instead of being copied
+ * twice: the art layer's gradient below (the poster's identity, not a
+ * state - both pages draw the same picture and each page's own sheet only
+ * ever dims it), and the starting/linking spotlight further down (the
+ * Deploy screen's own mid-run tile and the Hub's adding/reconnecting tile
+ * are the same moment, just reached two different ways).
  *
- * Every colour, spacing, type, radius and shadow value here is a CSS
- * custom property from tokens.css - never a literal. The only literals
+ * Every colour, spacing, type, radius, shadow and motion value here is a
+ * CSS custom property from tokens.css - never a literal. The only literals
  * allowed are structural values with no matching token: 190px (the grid's
  * minimum column width), 640px / 420px (the same two breakpoints every
  * other stylesheet in this project uses), 2px (the tile's own border
- * width, transparent until a state gives it a colour), 155deg (the art
- * gradient's fixed angle) and 1px / -1px (the off-screen clip
- * `.visually-hidden` uses, the same technique the approved mockup itself
- * used).
+ * width, transparent until a state gives it a colour, and the starting
+ * tile's focus-adjacent outline math), 155deg (the art gradient's fixed
+ * angle), 1px / -1px (the off-screen clip `.visually-hidden` uses, the
+ * same technique the approved mockup itself used), -30% / 60% (the
+ * starting spotlight's radial inset and fade stop), 14% / 50% (the
+ * starting tile's own box-shadow tint), translateY(-3px) (the starting
+ * tile's lift), scale(.9) / scale(1.05) (the spotlight's pulse), .14 / .34
+ * (the spotlight's dip and resting opacity) and 1.3s / 1s (the spotlight's
+ * and the spinner's durations).
  */
 
 .poster-grid {
@@ -143,4 +151,76 @@
   clip: rect(0, 0, 0, 0);
   white-space: nowrap;
   border: 0;
+}
+
+/* --- The starting spotlight: one moment, reached two ways ------------------
+ *
+ * Moved here (not copied) from deploy.css, so the Deploy screen's own
+ * mid-run tile and the Hub's adding tile draw from one rule set.
+ * `:not(.hub-poster)` keeps a Hub tile Docker merely reports as restarting
+ * from picking up a beam meant for a brand-new add. */
+
+.poster[data-state="starting"]:not(.hub-poster),
+.poster[data-add-state="starting"] {
+  border-color: var(--spotlight);
+  transform: translateY(-3px);
+  box-shadow:
+    0 0 0 var(--space-1) color-mix(in srgb, var(--spotlight) 14%, transparent),
+    0 var(--space-3) var(--space-6) color-mix(in srgb, var(--spotlight) 50%, transparent);
+}
+
+.poster[data-state="starting"]:not(.hub-poster)::before,
+.poster[data-add-state="starting"]::before {
+  filter: none;
+}
+
+/* The spotlight beam - a second pseudo-element so the dim art layer and
+ * the beam can carry independent (and independently overridden) filters. */
+.poster[data-state="starting"]:not(.hub-poster)::after,
+.poster[data-add-state="starting"]::after {
+  content: "";
+  position: absolute;
+  inset: -30%;
+  z-index: 0;
+  pointer-events: none;
+  background: radial-gradient(
+    circle,
+    color-mix(in srgb, var(--spotlight) 30%, var(--text-primary)),
+    transparent 60%
+  );
+  opacity: 0.34;
+  animation: poster-spotlight 1.3s ease-in-out infinite;
+}
+
+@keyframes poster-spotlight {
+  0%,
+  100% {
+    opacity: 0.34;
+    transform: scale(0.9);
+  }
+  50% {
+    opacity: 0.14;
+    transform: scale(1.05);
+  }
+}
+
+@keyframes poster-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* The gold "linking" outline - the Deploy screen's own mid-wiring posters,
+ * and the Hub's own reconnecting/adding-wiring tile. */
+.poster[data-linking="true"],
+.poster[data-add-state="wiring"] {
+  outline: 2px solid var(--spotlight);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .poster[data-state="starting"]:not(.hub-poster),
+  .poster[data-add-state="starting"] {
+    transform: none;
+  }
 }

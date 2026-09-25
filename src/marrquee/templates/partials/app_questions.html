@@ -1,0 +1,62 @@
+{#
+  One `QuestionStep`, drawn the one way both the Hub's "+" panel (hub.html)
+  and the wizard's question page (wizard_questions.html, a later chunk)
+  include it - so the two can never quietly ask something different.
+
+  Expects, in scope: `step` (a QuestionStep), `answers` (a mapping of this
+  step's already-saved values, `{}` when there are none), `problem` (this
+  step's own refusal sentence, or `none`) and `problem_field` (the field
+  name that refusal names, or `none`).
+#}
+{% set step_key = step.app_id ~ ":" ~ step.step_id %}
+<fieldset class="question-step" data-question-step="{{ step_key }}">
+  <legend>{{ step.title }}</legend>
+  <p class="question-step__lede">{{ step.lede }}</p>
+
+  {% if problem %}
+  <div class="refusal-banner" role="alert">
+    <span class="refusal-banner__glyph" aria-hidden="true">&#10007;</span>
+    <p>{{ problem }}</p>
+  </div>
+  {% endif %}
+
+  {% for field in step.fields %}
+  {% set field_id = "q-" ~ step.app_id ~ "-" ~ field.name %}
+  {% set saved = answers.get(field.name, field.default) %}
+  {% if field.kind == "choice" %}
+  <div class="app-grid" role="radiogroup" aria-label="{{ field.label }}">
+    {% for option in field.options %}
+    <label class="app-card">
+      <input
+        type="radio"
+        id="{{ field_id }}-{{ option.value }}"
+        name="{{ field.name }}"
+        value="{{ option.value }}"
+        {% if saved == option.value %}checked{% endif %}
+        {% if problem_field == field.name %}autofocus{% endif %}
+      >
+      <span class="app-card__face">
+        <span class="app-card__top">
+          <span class="app-card-name">{{ option.label }}</span>
+          <span class="app-tick" aria-hidden="true">&#10003;</span>
+        </span>
+        {% if option.hint %}<span class="app-card-desc">{{ option.hint }}</span>{% endif %}
+      </span>
+    </label>
+    {% endfor %}
+  </div>
+  {% else %}
+  <label class="field-label" for="{{ field_id }}">{{ field.label }}</label>
+  <input
+    class="path-input"
+    type="{{ 'password' if field.kind == 'password' else 'text' }}"
+    id="{{ field_id }}"
+    name="{{ field.name }}"
+    {% if field.kind != "password" %}value="{{ saved }}"{% endif %}
+    {% if problem_field == field.name %}autofocus{% endif %}
+    {% if field.hint %}aria-describedby="{{ field_id }}-hint"{% endif %}
+  >
+  {% if field.hint %}<p class="field-hint" id="{{ field_id }}-hint">{{ field.hint }}</p>{% endif %}
+  {% endif %}
+  {% endfor %}
+</fieldset>

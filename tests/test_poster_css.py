@@ -47,16 +47,60 @@ def test_poster_and_deploy_css_carry_no_id_selector() -> None:
         assert _ID_SELECTOR_RE.search(path.read_text()) is None, path.name
 
 
-def test_deploy_css_holds_a_reduced_motion_block_that_removes_the_starting_lift() -> None:
-    css = _DEPLOY_CSS.read_text()
+def test_reduced_motion_block_moved_to_poster_css_and_removes_the_starting_lift() -> None:
+    poster_css = _POSTER_CSS.read_text()
+    deploy_css = _DEPLOY_CSS.read_text()
 
-    assert "@media (prefers-reduced-motion: reduce)" in css
-    assert "transform: none" in css
+    assert "@media (prefers-reduced-motion: reduce)" in poster_css
+    assert "transform: none" in poster_css
+    assert "@media (prefers-reduced-motion: reduce)" not in deploy_css
 
 
 def test_poster_css_declares_the_art_gradient_and_deploy_css_no_longer_does() -> None:
     assert "linear-gradient(155deg" in _POSTER_CSS.read_text()
     assert "linear-gradient(155deg" not in _DEPLOY_CSS.read_text()
+
+
+def test_spotlight_keyframes_are_declared_exactly_once_in_poster_css() -> None:
+    """`@keyframes poster-spotlight` and `@keyframes poster-spin` moved
+    (not copied) from `deploy.css` to `poster.css`, so the Deploy screen's
+    own starting tile and the Hub's adding tile draw from one animation.
+    """
+    poster_css = _POSTER_CSS.read_text()
+    deploy_css = _DEPLOY_CSS.read_text()
+
+    assert poster_css.count("@keyframes poster-spotlight") == 1
+    assert poster_css.count("@keyframes poster-spin") == 1
+    assert "@keyframes" not in deploy_css
+
+
+def test_the_starting_spotlight_covers_both_the_deploy_and_the_hub_tile() -> None:
+    poster_css = _POSTER_CSS.read_text()
+
+    assert (
+        '.poster[data-state="starting"]:not(.hub-poster),\n'
+        '.poster[data-add-state="starting"] {' in poster_css
+    )
+
+
+def test_the_linking_outline_covers_both_the_deploy_and_the_hub_tile() -> None:
+    poster_css = _POSTER_CSS.read_text()
+
+    assert '.poster[data-linking="true"],\n.poster[data-add-state="wiring"] {' in poster_css
+
+
+def test_the_deploy_screens_own_starting_tile_carries_no_hub_poster_class() -> None:
+    """The moved selector's `:not(.hub-poster)` guard only keeps excluding
+    the Deploy screen's own tile if that tile's markup never gains the
+    Hub's `hub-poster` class - this pins the fact directly in the
+    template, with no need for a live render.
+    """
+    deploy_html = (
+        Path(__file__).resolve().parents[1] / "src" / "marrquee" / "templates" / "deploy.html"
+    ).read_text()
+
+    assert 'class="poster"' in deploy_html
+    assert "hub-poster" not in deploy_html
 
 
 def test_the_poster_grid_shows_no_list_bullets() -> None:

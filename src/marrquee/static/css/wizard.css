@@ -189,6 +189,36 @@
   background: linear-gradient(to bottom right, var(--primary), var(--accent));
 }
 
+/* --- Question steps: one shared partial draws these, on this page and on
+ * the Hub's own "+" panel - reset to a plain block so a form holding
+ * several steps never stacks up a second border and padding around each
+ * one. */
+
+.question-step {
+  border: none;
+  padding: 0;
+  margin: 0 0 var(--space-6);
+}
+
+.question-step legend {
+  font-size: var(--text-lg);
+  font-weight: var(--weight-bold);
+  color: var(--text-primary);
+}
+
+.question-step__lede {
+  margin: var(--space-2) 0 var(--space-4);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+/* A question's own text or password box holds typed prose or a secret,
+ * not a file path - the sans stack, unlike `.path-input`'s usual
+ * monospace. */
+.question-step .path-input {
+  font-family: var(--font-sans);
+}
+
 /* --- Panels: the folder box and the time zone box share one look ----------- */
 
 .panel {

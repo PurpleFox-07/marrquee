@@ -30,7 +30,7 @@ from marrquee.config import Settings
 from marrquee.deploy import DeployManager
 from marrquee.docker_client import DockerEngine
 from marrquee.health import LinkProbe, read_health, read_link_health
-from marrquee.hub import HUB_POLL_MS, HubPanel, HubView, hub_panel, hub_view
+from marrquee.hub import HUB_ADD_POLL_MS, HUB_POLL_MS, HubPanel, HubView, hub_panel, hub_view
 from marrquee.links import (
     LINK_COUNT_MAX,
     LINK_ID_RE,
@@ -99,6 +99,9 @@ async def read_hub_view(request: Request) -> HubView:
         now=datetime.now(UTC),
         links=links,
         link_healths=link_healths,
+        adding=snapshot.adding,
+        wiring_gaps=snapshot.wiring_gaps,
+        busy=manager.is_busy(),
     )
 
 
@@ -122,7 +125,13 @@ def _hub_response(
     request: Request, view: HubView, panel: HubPanel, *, status_code: int = 200
 ) -> Response:
     templates: Jinja2Templates = request.app.state.templates
-    context = {"view": view, "words": words, "poll_ms": HUB_POLL_MS, "panel": panel}
+    context = {
+        "view": view,
+        "words": words,
+        "poll_ms": HUB_POLL_MS,
+        "add_poll_ms": HUB_ADD_POLL_MS,
+        "panel": panel,
+    }
     return templates.TemplateResponse(request, "hub.html", context, status_code=status_code)
 
 
@@ -201,4 +210,37 @@ async def post_hub_link_remove(link_id: str, request: Request) -> Response:
     remaining = tuple(card for card in links if card.id != link_id)
     if len(remaining) != len(links):
         save_links(settings.config_dir, remaining)
+    return RedirectResponse("/", status_code=303)
+
+
+# --- Adding an app: Try again, Cancel and Connect again are form posts -------
+#
+# All three always answer 303 to `/`, whatever they did or didn't do - the
+# Hub itself is the only place their result is ever shown, so there is
+# nothing else worth redirecting to.
+
+
+@router.post("/hub/apps/{app_id}/retry")
+async def post_hub_app_retry(app_id: str, request: Request) -> Response:
+    manager: DeployManager = request.app.state.deploy
+    adding = manager.snapshot().adding
+    if adding is not None and adding.app_id == app_id:
+        manager.retry_add()
+    return RedirectResponse("/", status_code=303)
+
+
+@router.post("/hub/apps/{app_id}/cancel")
+async def post_hub_app_cancel(app_id: str, request: Request) -> Response:
+    manager: DeployManager = request.app.state.deploy
+    adding = manager.snapshot().adding
+    if adding is not None and adding.app_id == app_id:
+        await manager.cancel_add()
+    return RedirectResponse("/", status_code=303)
+
+
+@router.post("/hub/apps/{app_id}/reconnect")
+async def post_hub_app_reconnect(app_id: str, request: Request) -> Response:
+    manager: DeployManager = request.app.state.deploy
+    if any(progress.app_id == app_id for progress in manager.snapshot().apps):
+        manager.reconnect(app_id)
     return RedirectResponse("/", status_code=303)

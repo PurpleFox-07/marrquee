@@ -21,7 +21,7 @@ from marrquee.config import Settings
 from marrquee.deploy import DeployManager
 from marrquee.deploy_screen import deploy_view
 from marrquee.state import load_state
-from marrquee.wizard import WIZARD_STEPS
+from marrquee.wizard import step_number, wizard_steps
 
 router = APIRouter()
 
@@ -46,7 +46,13 @@ async def get_deploy(request: Request) -> Response:
     authority = authority_from_headers(request.headers)
     view = deploy_view(state, manager.snapshot(), authority=authority)
 
-    context = {"view": view, "steps": WIZARD_STEPS, "current_step": 3, "words": words}
+    steps = wizard_steps(state.app_ids)
+    context = {
+        "view": view,
+        "steps": steps,
+        "current_step": step_number(steps, "deploy"),
+        "words": words,
+    }
     return templates.TemplateResponse(request, "deploy.html", context)
 
 

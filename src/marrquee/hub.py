@@ -19,16 +19,20 @@ the whole page be proven with no HTML and no Docker.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Final, Literal
 
 from marrquee.addresses import app_url
-from marrquee.catalog import CATALOG, CatalogApp, apps_in_order
+from marrquee.catalog import CATALOG, CatalogApp, apps_in_order, get_app, unavailable_reason
+from marrquee.deploy import AddState, AppAdd, WiringGap
 from marrquee.health import AppHealth, HubState, LinkHealth, LinkState
 from marrquee.links import LinkCard, link_address, link_glyph
+from marrquee.questions import QuestionStep, question_steps_for
 from marrquee.words import (
     HUB_ALL_UP,
+    HUB_CHIP_ADD_FAILED,
+    HUB_CHIP_ADDING,
     HUB_CHIP_DOWN,
     HUB_CHIP_STARTING,
     HUB_CHIP_UNKNOWN,
@@ -36,6 +40,13 @@ from marrquee.words import (
     HUB_LINK_LINE_DOWN,
     HUB_LINKS_ALL_UP,
     HUB_NOTHING_SET_UP,
+    WIRING_CHIP_RUNNING,
+    app_line_error,
+    hub_announce_add_failed,
+    hub_announce_adding,
+    hub_install_busy,
+    hub_install_resolve_first,
+    hub_line_connecting,
     hub_line_down,
     hub_line_down_last_seen,
     hub_line_gone,
@@ -45,6 +56,7 @@ from marrquee.words import (
     hub_links_some_down,
     hub_open_app_aria,
     hub_some_up,
+    hub_wiring_gap_note,
     relative_time,
 )
 
@@ -52,6 +64,12 @@ from marrquee.words import (
 # the number itself - the 15-second cadence the owner approved lives in
 # exactly one place.
 HUB_POLL_MS: Final = 15000
+
+# While an add or reconnect is running, `hub.js` polls this fast instead -
+# the spotlight-to-green moment is worth watching live, not on a 15-second
+# lag. Read from `data-add-poll-ms`, the same way `HUB_POLL_MS` is read from
+# `data-poll-ms`.
+HUB_ADD_POLL_MS: Final = 2000
 
 _CHIP_BY_STATE: dict[HubState, str] = {
     "up": HUB_CHIP_UP,
@@ -73,7 +91,15 @@ _LINKED_STATES: frozenset[HubState] = frozenset({"up", "unknown"})
 
 @dataclass(frozen=True)
 class HubTile:
-    """One poster, exactly as the page (and the live check) should draw it."""
+    """One poster, exactly as the page (and the live check) should draw it.
+
+    `add_state` is set only while this app is being added or reconnected -
+    it drives the spotlight/linking CSS on the Hub without needing a second
+    "is this the one being added" flag. `note` carries a wiring gap's own
+    amber sentence, and `actions` says which extra form (if any) the poster
+    needs beside its usual link: `retry` for a failed add, `reconnect` for
+    an app whose wiring only partly finished.
+    """
 
     app_id: str
     glyph: str
@@ -84,6 +110,9 @@ class HubTile:
     line: str
     url: str | None
     aria: str | None
+    add_state: AddState | None = None
+    note: str = ""
+    actions: Literal["none", "retry", "reconnect"] = "none"
 
 
 @dataclass(frozen=True)
@@ -107,12 +136,27 @@ class LinkTile:
 
 
 @dataclass(frozen=True)
+class InstallRow:
+    """One row in the "+" panel's install pane - one not-yet-installed app,
+    whether it can be added right now, and whatever questions it asks
+    before it can be.
+    """
+
+    app: CatalogApp
+    unavailable: str | None
+    steps: tuple[QuestionStep, ...]
+
+
+@dataclass(frozen=True)
 class HubView:
     """Everything the Hub page draws, from one deploy's worth of apps."""
 
     tiles: tuple[HubTile, ...]
     links: tuple[LinkTile, ...]
     installable: tuple[CatalogApp, ...]
+    install_rows: tuple[InstallRow, ...]
+    install_block: str | None
+    busy: bool
     announce: str
     any_down: bool
     docker_unreachable: bool
@@ -153,26 +197,169 @@ def hub_view(
     now: datetime,
     links: Sequence[LinkCard] = (),
     link_healths: Sequence[LinkHealth] = (),
+    adding: AppAdd | None = None,
+    wiring_gaps: Sequence[WiringGap] = (),
+    busy: bool = False,
 ) -> HubView:
     healths_by_id = {health.app_id: health for health in healths}
-    tiles = tuple(
-        _tile(app, healths_by_id.get(app.id), authority=authority, now=now)
-        for app in apps_in_order(app_ids)
+    gaps_by_id = {gap.app_id: gap for gap in wiring_gaps}
+    deployed_ids = set(app_ids)
+
+    # A brand-new app being added has no place in `apps` yet, so it has no
+    # health reading either - it's inserted into the grid by id, in the
+    # same catalog order everything else already respects, and dropped
+    # again from every count below that would otherwise call it "down" or
+    # "unknown" for the honest reason that it doesn't exist yet.
+    adding_new = adding is not None and adding.app_id not in deployed_ids
+    tile_ids = (*app_ids, adding.app_id) if adding_new and adding is not None else tuple(app_ids)
+
+    def _build_tile(app: CatalogApp) -> HubTile:
+        if adding_new and adding is not None and app.id == adding.app_id:
+            return _adding_tile(app, adding)
+        tile = _tile(app, healths_by_id.get(app.id), authority=authority, now=now)
+        return _apply_add_overlay(tile, app, adding, gaps_by_id.get(app.id))
+
+    tiles = tuple(_build_tile(app) for app in apps_in_order(tile_ids))
+    regular_tiles = tuple(
+        tile
+        for tile in tiles
+        if not (adding_new and adding is not None and tile.app_id == adding.app_id)
     )
+
     link_healths_by_id = {health.link_id: health for health in link_healths}
     link_tiles = tuple(_link_tile(card, link_healths_by_id.get(card.id)) for card in links)
-    deployed_ids = set(app_ids)
+
+    announce = _announce(regular_tiles, link_tiles)
+    if adding_new and adding is not None:
+        name = get_app(adding.app_id).name
+        add_sentence = (
+            hub_announce_add_failed(name) if adding.state == "error" else hub_announce_adding(name)
+        )
+        announce = f"{announce} {add_sentence}"
+
     installable = tuple(app for app in CATALOG if app.id not in deployed_ids)
+    excluded_id = adding.app_id if adding is not None else None
+    install_rows = tuple(
+        InstallRow(
+            app=app,
+            unavailable=unavailable_reason(app, deployed_ids),
+            steps=question_steps_for((app.id,)),
+        )
+        for app in installable
+        if app.id != excluded_id
+    )
+
+    install_block: str | None = None
+    if adding is not None:
+        name = get_app(adding.app_id).name
+        if busy:
+            install_block = hub_install_busy(name)
+        elif adding.state == "error":
+            install_block = hub_install_resolve_first(name)
+
     return HubView(
         tiles=tiles,
         links=link_tiles,
         installable=installable,
-        announce=_announce(tiles, link_tiles),
-        any_down=any(tile.state == "down" for tile in tiles),
-        docker_unreachable=bool(tiles) and all(tile.state == "unknown" for tile in tiles),
+        install_rows=install_rows,
+        install_block=install_block,
+        busy=busy,
+        announce=announce,
+        any_down=any(tile.state == "down" for tile in regular_tiles),
+        docker_unreachable=bool(regular_tiles)
+        and all(tile.state == "unknown" for tile in regular_tiles),
         proxied=proxied,
-        empty=not tiles,
+        empty=not regular_tiles,
     )
+
+
+def _adding_tile(app: CatalogApp, adding: AppAdd) -> HubTile:
+    """The one tile for a brand-new app while it's being added - never a
+    health-driven tile, since Docker has no opinion about it yet.
+    """
+    if adding.state == "starting":
+        return HubTile(
+            app_id=app.id,
+            glyph=app.glyph,
+            name=app.name,
+            description=app.description,
+            state="starting",
+            chip=HUB_CHIP_ADDING,
+            line=adding.note or adding.line,
+            url=None,
+            aria=None,
+            add_state="starting",
+        )
+    if adding.state == "wiring":
+        return HubTile(
+            app_id=app.id,
+            glyph=app.glyph,
+            name=app.name,
+            description=app.description,
+            state="starting",
+            chip=WIRING_CHIP_RUNNING,
+            line=hub_line_connecting(app.name),
+            url=None,
+            aria=None,
+            add_state="wiring",
+        )
+
+    # adding.state == "error": a failed add, waiting for "Try again" or
+    # "Cancel".
+    return HubTile(
+        app_id=app.id,
+        glyph=app.glyph,
+        name=app.name,
+        description=app.description,
+        state="down",
+        chip=HUB_CHIP_ADD_FAILED,
+        line=_add_failure_line(app, adding),
+        url=None,
+        aria=None,
+        add_state="error",
+        actions="retry",
+    )
+
+
+def _add_failure_line(app: CatalogApp, adding: AppAdd) -> str:
+    """The line for an `AppAdd` in `state="error"`.
+
+    `adding.line` is the generic `app_line_error` sentence unless Cancel
+    itself just failed, in which case it already carries that failure's
+    own, more specific sentence - the failure headline underneath it is
+    stale in that case, so it's never shown twice.
+    """
+    failure = adding.failure
+    if failure is not None and adding.line == app_line_error(app.name):
+        return f"{failure.headline} {failure.what_to_do}"
+    return adding.line
+
+
+def _apply_add_overlay(
+    tile: HubTile, app: CatalogApp, adding: AppAdd | None, gap: WiringGap | None
+) -> HubTile:
+    """Layer a reconnect (in flight or failed) and/or a lingering wiring gap
+    onto an already-installed app's normal, health-driven tile.
+    """
+    if gap is not None:
+        tile = replace(
+            tile, note=hub_wiring_gap_note(app.name, gap.failed_lines), actions="reconnect"
+        )
+    if adding is not None and adding.purpose == "reconnect" and adding.app_id == app.id:
+        if adding.state == "error":
+            # Never "retry" here: that action pairs with a Cancel button,
+            # and Cancel must never remove an already-installed, working
+            # app's own container - "Connect again" is this tile's only
+            # way back.
+            tile = replace(
+                tile,
+                add_state="error",
+                line=_add_failure_line(app, adding),
+                actions="reconnect",
+            )
+        else:
+            tile = replace(tile, add_state=adding.state, line=hub_line_connecting(app.name))
+    return tile
 
 
 def _link_tile(card: LinkCard, health: LinkHealth | None) -> LinkTile:
@@ -203,7 +390,9 @@ def _tile(
     # a silent "down".
     state: HubState = health.state if health is not None else "unknown"
     chip = _CHIP_BY_STATE[state]
-    url = app_url(authority, app.port) if state in _LINKED_STATES else None
+    # An app with no web page of its own (a reserved catalog kind no
+    # current app sets) never gets a link, whatever Docker says about it.
+    url = app_url(authority, app.port) if state in _LINKED_STATES and app.web_page else None
     aria = hub_open_app_aria(app.name, chip) if url is not None else None
     return HubTile(
         app_id=app.id,
@@ -224,6 +413,10 @@ def _line(
     if state == "up":
         # An Up poster with a working link says nothing more - the owner's
         # wireframe shows no extra line here (Content Direction row 10).
+        # An app with no web page at all is equally silent when it's up -
+        # there being no link is normal for it, not a missing address.
+        if not app.web_page:
+            return ""
         return "" if url is not None else hub_line_no_address(app.name, app.port)
     if state == "starting":
         return hub_line_starting(app.name)

@@ -14,8 +14,26 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import Literal
 
 from marrquee.words import PROWLARR_DESCRIPTION, RADARR_DESCRIPTION, SONARR_DESCRIPTION
+
+
+@dataclass(frozen=True)
+class AppRule:
+    """One condition that must hold before an app can be added.
+
+    `needs_any` fails when none of `app_ids` is present yet (Radarr needing
+    a search source before it has anything to sync with); `excludes_any`
+    fails when any of them is already present (a second media server, once
+    one is already installed). `reason` is plain text the app defining the
+    rule supplies directly - never a words.py lookup, so this module never
+    has to import words.py just to hold a rule.
+    """
+
+    kind: Literal["needs_any", "excludes_any"]
+    app_ids: tuple[str, ...]
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -33,6 +51,9 @@ class CatalogApp:
     needs_data_mount: bool
     glyph: str
     order: int
+    default_ticked: bool = True
+    web_page: bool = True
+    rules: tuple[AppRule, ...] = ()
 
 
 # Prowlarr, Sonarr and Radarr only - no qBittorrent, because the downloader
@@ -101,3 +122,21 @@ def apps_in_order(app_ids: Iterable[str]) -> tuple[CatalogApp, ...]:
     """
     chosen = set(app_ids)
     return tuple(app for app in CATALOG if app.id in chosen)
+
+
+def unavailable_reason(app: CatalogApp, present: Iterable[str]) -> str | None:
+    """Why `app` can't be added right now, or `None` when every rule passes.
+
+    `present` is whatever "already chosen" set matters to the caller - the
+    Hub's installed app ids, or a wizard's other ticked ids - this function
+    only ever compares against the ids it's given. Rules are checked in the
+    order the catalog declares them, and the first failing rule wins; later
+    rules never override an earlier verdict.
+    """
+    present_ids = set(present)
+    for rule in app.rules:
+        if rule.kind == "needs_any" and present_ids.isdisjoint(rule.app_ids):
+            return rule.reason
+        if rule.kind == "excludes_any" and not present_ids.isdisjoint(rule.app_ids):
+            return rule.reason
+    return None

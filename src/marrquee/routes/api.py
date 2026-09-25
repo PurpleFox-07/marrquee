@@ -18,15 +18,17 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncGenerator
-from typing import Annotated, cast
+from typing import Annotated, Literal, cast
 
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from marrquee.catalog import CATALOG
+from marrquee.catalog import CATALOG, CatalogApp, get_app, unavailable_reason
 from marrquee.config import Settings
 from marrquee.deploy import (
+    AddStart,
+    AddState,
     AppProgress,
     AppState,
     DeployManager,
@@ -38,11 +40,27 @@ from marrquee.deploy import (
 from marrquee.health import HubState, LinkState
 from marrquee.hub import HubTile, LinkTile
 from marrquee.install import install_apps
+from marrquee.questions import (
+    QuestionCheck,
+    check_step,
+    load_answers,
+    question_steps_for,
+    save_step_answers,
+)
 from marrquee.routes.hub import read_hub_view
 from marrquee.state import load_state
 from marrquee.storage import StorageCheck, check_storage_root
 from marrquee.wiring import WiringStep, WiringStepState
-from marrquee.words import REFUSAL_NOTHING_CHOSEN, storage_check_message
+from marrquee.words import (
+    HUB_INSTALL_ALREADY,
+    HUB_INSTALL_NOT_READY,
+    HUB_INSTALL_UNKNOWN,
+    HUB_SETUP_DONE_REFUSAL,
+    REFUSAL_NOTHING_CHOSEN,
+    hub_install_busy,
+    hub_install_unavailable,
+    storage_check_message,
+)
 
 router = APIRouter(prefix="/api")
 
@@ -58,6 +76,9 @@ _SSE_HEARTBEAT_SECONDS = 15.0
 _MAX_PATH_LENGTH = 4096
 _MAX_APP_ID_LENGTH = 64
 _MAX_APP_COUNT = 50
+_MAX_ANSWER_FIELD_NAME_LENGTH = 64
+_MAX_ANSWER_FIELD_VALUE_LENGTH = 4096
+_MAX_ANSWER_FIELD_COUNT = 50
 
 
 # --- Request bodies: validated before a single line of business logic runs --
@@ -166,6 +187,9 @@ class HubTileOut(BaseModel):
     line: str
     url: str | None
     aria: str | None
+    add_state: AddState | None
+    note: str
+    actions: Literal["none", "retry", "reconnect"]
 
 
 class LinkTileOut(BaseModel):
@@ -189,6 +213,23 @@ class HubStatusOut(BaseModel):
     announce: str
     any_down: bool
     docker_unreachable: bool
+    busy: bool
+
+
+class HubInstallRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    answers: dict[
+        Annotated[str, Field(max_length=_MAX_ANSWER_FIELD_NAME_LENGTH)],
+        Annotated[str, Field(max_length=_MAX_ANSWER_FIELD_VALUE_LENGTH)],
+    ] = Field(default_factory=dict, max_length=_MAX_ANSWER_FIELD_COUNT)
+
+
+class HubInstallOut(BaseModel):
+    ok: bool
+    message: str | None
+    step_id: str | None
+    field: str | None
 
 
 # --- Converting the engine's own dataclasses into the shapes above ----------
@@ -247,6 +288,9 @@ def _hub_tile_out(tile: HubTile) -> HubTileOut:
         line=tile.line,
         url=tile.url,
         aria=tile.aria,
+        add_state=tile.add_state,
+        note=tile.note,
+        actions=tile.actions,
     )
 
 
@@ -310,6 +354,8 @@ async def post_storage_check(body: StorageCheckRequest, request: Request) -> Sto
 
 @router.post("/install")
 async def post_install(body: InstallRequest, request: Request) -> InstallResponse:
+    if _manager(request).snapshot().phase == "finale":
+        raise HTTPException(status_code=409, detail=HUB_SETUP_DONE_REFUSAL)
     result = install_apps(_settings(request), body.path, list(body.app_ids))
     if not result.ok:
         status_code = 400 if result.kind == "invalid_input" else 409
@@ -408,4 +454,68 @@ async def get_hub_status(request: Request) -> HubStatusOut:
         announce=view.announce,
         any_down=view.any_down,
         docker_unreachable=view.docker_unreachable,
+        busy=view.busy,
     )
+
+
+def _add_start_refusal_message(result: AddStart, app: CatalogApp, manager: DeployManager) -> str:
+    """The plain sentence for every way `add_app` can refuse, other than
+    `"started"` - the install endpoint's own words, since `AddStart` itself
+    is just a token no screen may show directly.
+    """
+    if result == "busy":
+        return hub_install_busy(app.name)
+    if result == "already_installed":
+        return HUB_INSTALL_ALREADY
+    if result == "unavailable":
+        present_ids = tuple(progress.app_id for progress in manager.snapshot().apps)
+        reason = unavailable_reason(app, present_ids) or ""
+        return hub_install_unavailable(reason)
+    # "not_ready" and the defensive "unknown_app" (already ruled out above,
+    # by the time `add_app` runs, by this same route's own lookup)
+    return HUB_INSTALL_NOT_READY if result == "not_ready" else HUB_INSTALL_UNKNOWN
+
+
+@router.post("/hub/apps/{app_id}/install")
+async def post_hub_install(
+    app_id: str, body: HubInstallRequest, request: Request, response: Response
+) -> HubInstallOut:
+    """Answer any of the app's own questions, then start adding it.
+
+    Answers are saved BEFORE `add_app` runs, so the add itself can read
+    them - a refusal from `add_app` (busy, already installed, ...) never
+    rolls a just-saved answer back, the same way a wizard step's own save
+    never rolls back on a later step's refusal.
+    """
+    settings = _settings(request)
+    manager = _manager(request)
+
+    try:
+        app = get_app(app_id)
+    except KeyError:
+        response.status_code = 409
+        return HubInstallOut(ok=False, message=HUB_INSTALL_UNKNOWN, step_id=None, field=None)
+
+    steps = question_steps_for((app_id,))
+    saved = load_answers(settings.config_dir).get(app_id, {})
+    checks: list[QuestionCheck] = []
+    for step in steps:
+        check = check_step(step, body.answers, saved)
+        if not check.ok:
+            response.status_code = 400
+            return HubInstallOut(
+                ok=False, message=check.problem, step_id=step.step_id, field=check.field
+            )
+        checks.append(check)
+
+    for check in checks:
+        save_step_answers(settings.config_dir, app_id, check.answers)
+
+    result = manager.add_app(app_id)
+    if result == "started":
+        response.status_code = 202
+        return HubInstallOut(ok=True, message=None, step_id=None, field=None)
+
+    response.status_code = 409
+    message = _add_start_refusal_message(result, app, manager)
+    return HubInstallOut(ok=False, message=message, step_id=None, field=None)

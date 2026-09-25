@@ -32,11 +32,12 @@ from typing import ClassVar, Literal, Protocol, cast
 
 import httpx
 
-from marrquee.catalog import CatalogApp, apps_in_order
+from marrquee.catalog import CatalogApp, apps_in_order, get_app, unavailable_reason
 from marrquee.compose import build_stack_plan, write_compose
 from marrquee.config import Settings
 from marrquee.docker_client import ComposeResult, DockerEngine
-from marrquee.state import InstallState, load_state, write_json_atomic
+from marrquee.install import with_app_added, with_app_removed
+from marrquee.state import InstallState, load_state, save_state, write_json_atomic
 from marrquee.storage import (
     FreshnessCheck,
     StorageCheck,
@@ -69,6 +70,8 @@ from marrquee.words import (
     failure_download_failed,
     failure_never_became_ready,
     failure_port_in_use,
+    hub_cancel_failed,
+    hub_line_connecting,
     refusal_name_clash,
     refusal_not_a_folder,
     refusal_not_shared,
@@ -91,6 +94,18 @@ FailureCode = Literal[
     "compose_failed",
     "never_became_ready",
     "port_in_use",
+]
+
+# An add's own tiny state machine - never "done": once wiring finishes, the
+# app moves into `DeploySnapshot.apps` and `adding` goes back to `None`,
+# exactly the way a full deploy never keeps a `done` app around as
+# `adding` either.
+AddState = Literal["starting", "wiring", "error"]
+# "add" is a brand new app; "reconnect" re-runs only the wiring steps for an
+# app that is already `done` in `apps` - it never touches Docker at all.
+AddPurpose = Literal["add", "reconnect"]
+AddStart = Literal[
+    "started", "busy", "not_ready", "unknown_app", "already_installed", "unavailable"
 ]
 
 _DEPLOY_FILE_NAME = "deploy.json"
@@ -133,6 +148,43 @@ class Failure:
 
 
 @dataclass(frozen=True)
+class AppAdd:
+    """One app being added (or reconnected) to an already-finale deploy.
+
+    Lives entirely inside `DeploySnapshot.adding`, never in `apps` - the Hub
+    builds its posters from `apps`, so a half-added app stays invisible to
+    every reader of that list until it is genuinely `done`. `compose_ran`
+    is what lets Cancel tell "Docker was actually asked to create this
+    container" apart from "we refused before ever touching Docker" (a name
+    clash) - removing a container in the second case would delete someone
+    else's.
+    """
+
+    app_id: str
+    purpose: AddPurpose
+    state: AddState
+    line: str
+    note: str | None
+    failure: Failure | None
+    wiring: tuple[WiringStep, ...]
+    compose_ran: bool
+    started_at: str
+
+
+@dataclass(frozen=True)
+class WiringGap:
+    """One already-installed app whose wiring didn't fully finish.
+
+    `app_id` is the app whose add or reconnect ran the steps that produced
+    these lines - the tile that gets the amber note and the "Connect
+    again" button.
+    """
+
+    app_id: str
+    failed_lines: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class DeploySnapshot:
     """The whole truth about the current (or most recent) deploy, right now."""
 
@@ -145,6 +197,8 @@ class DeploySnapshot:
     started_at: str | None
     finished_at: str | None
     wiring: tuple[WiringStep, ...] = ()
+    adding: AppAdd | None = None
+    wiring_gaps: tuple[WiringGap, ...] = ()
 
 
 class ReadinessProbe(Protocol):
@@ -315,6 +369,8 @@ class DeployManager:
         """
         if self._is_running():
             return self.snapshot()
+        if self._snapshot.phase == "finale":
+            return self._resume_add_if_interrupted()
         if self._snapshot.phase not in ("running", "wiring"):
             return self.snapshot()
         install = load_state(self._settings.config_dir)
@@ -323,8 +379,41 @@ class DeployManager:
         self._task = asyncio.create_task(self._run(install))
         return self.snapshot()
 
+    def _resume_add_if_interrupted(self) -> DeploySnapshot:
+        """A `finale` deploy whose `adding` was still `starting`/`wiring` when
+        this process last stopped - the add-path equivalent of the branch
+        just above.
+
+        An `adding` already `error` needs an owner's "Try again", not an
+        automatic resume - the same reason a full deploy's own `error`
+        phase is never auto-resumed either.
+        """
+        adding = self._snapshot.adding
+        if adding is None or adding.state not in ("starting", "wiring"):
+            return self.snapshot()
+        install = load_state(self._settings.config_dir)
+        if install is None:
+            return self.snapshot()
+        try:
+            app = get_app(adding.app_id)
+        except KeyError:
+            return self.snapshot()
+        if adding.purpose == "add":
+            self._task = asyncio.create_task(self._run_add(app, install))
+        else:
+            self._task = asyncio.create_task(self._run_reconnect(app, install))
+        return self.snapshot()
+
     def _is_running(self) -> bool:
         return self._task is not None and not self._task.done()
+
+    def is_busy(self) -> bool:
+        """Whether a run (a full deploy, an add, a retry or a reconnect) is
+        actively going right now - the Hub's own "one thing at a time" flag,
+        as opposed to `adding is not None`, which also stays true while a
+        failed add just sits there waiting for "Try again" or "Cancel".
+        """
+        return self._is_running()
 
     def return_to_ready(self) -> DeploySnapshot:
         """Bring back the Deploy button after new choices are saved.
@@ -341,6 +430,192 @@ class DeployManager:
         if self._snapshot.phase in ("finale", "error"):
             self._emit(_resting_snapshot())
         return self.snapshot()
+
+    # --- Adding, retrying, cancelling and reconnecting one app -----------
+
+    def add_app(self, app_id: str) -> AddStart:
+        """Start adding one app to an already-finale deploy - never a second
+        full deploy.
+
+        Synchronous, and refuses before ever touching Docker: only one add
+        (or one waiting failed add) is allowed at a time, so a second
+        `add_app` while the first is still going, or still sitting there
+        failed, is refused as `"busy"` rather than silently queued or
+        silently ignored. Nothing awaits between the refusal checks and
+        `create_task` - a second call arriving before the first `await`
+        point inside the new task could otherwise slip past `adding is not
+        None` and start a second add for real.
+        """
+        install = load_state(self._settings.config_dir)
+        snapshot = self.snapshot()
+        if install is None or snapshot.phase != "finale":
+            return "not_ready"
+        if self._is_running() or snapshot.adding is not None:
+            return "busy"
+        try:
+            app = get_app(app_id)
+        except KeyError:
+            return "unknown_app"
+        if any(progress.app_id == app_id for progress in snapshot.apps):
+            return "already_installed"
+        present_ids = tuple(progress.app_id for progress in snapshot.apps)
+        if unavailable_reason(app, present_ids) is not None:
+            return "unavailable"
+
+        started_at = _now_iso()
+        adding = AppAdd(
+            app_id=app_id,
+            purpose="add",
+            state="starting",
+            line=app_line_starting(app.name),
+            note=None,
+            failure=None,
+            wiring=(),
+            compose_ran=False,
+            started_at=started_at,
+        )
+        self._emit(replace(snapshot, adding=adding))
+        self._task = asyncio.create_task(self._run_add(app, install))
+        return "started"
+
+    def retry_add(self) -> AddStart:
+        """Re-run a failed add from scratch - the add-path "press Deploy again"."""
+        if self._is_running():
+            return "busy"
+        current = self._snapshot.adding
+        if current is None or current.state != "error" or current.purpose != "add":
+            return "busy"
+        install = load_state(self._settings.config_dir)
+        if install is None:
+            return "not_ready"
+        app = get_app(current.app_id)
+
+        started_at = _now_iso()
+        adding = AppAdd(
+            app_id=app.id,
+            purpose="add",
+            state="starting",
+            line=app_line_starting(app.name),
+            note=None,
+            failure=None,
+            wiring=(),
+            compose_ran=current.compose_ran,
+            started_at=started_at,
+        )
+        self._emit(self._replace_finale(adding=adding))
+        self._task = asyncio.create_task(self._run_add(app, install))
+        return "started"
+
+    async def cancel_add(self) -> bool:
+        """Give up on a failed add: remove the container it created (if any),
+        drop the app from install.json, and put it back in the "+" list.
+
+        Only ever removes a container `compose_ran` says WE asked Docker to
+        create - a name-clash refusal never got that far, so Cancel after
+        one never touches a container it didn't create. Never deletes a
+        folder: the app's API key and every folder Marrquee built for it
+        are left exactly where they are, ready for a later re-add.
+
+        Refuses for a failed `reconnect` too, even though its `AppAdd`
+        always carries `compose_ran=True` (a reconnect never calls Docker
+        at all, so that flag alone can't tell "we created this" apart from
+        "this was already installed and running"). A failed reconnect is
+        already-installed, working app - Cancel must never remove it;
+        `reconnect(app_id)` is the only recovery this offers.
+        """
+        current = self._snapshot.adding
+        if current is None or current.state != "error" or current.purpose != "add":
+            return False
+
+        app = get_app(current.app_id)
+        if current.compose_ran:
+            result = await self._engine.remove_container(app.id)
+            if not result.ok:
+                failed = replace(current, line=hub_cancel_failed(app.name))
+                self._emit(self._replace_finale(adding=failed))
+                return False
+
+        install = load_state(self._settings.config_dir)
+        if install is not None:
+            shrunk = with_app_removed(install, app.id)
+            save_state(self._settings.config_dir, shrunk)
+            if shrunk.storage_root is not None:
+                root = PurePosixPath(shrunk.storage_root)
+                write_marker(self._settings, root, shrunk.app_ids, shrunk.puid, shrunk.pgid)
+                write_compose(self._settings, build_stack_plan(shrunk))
+
+        self._emit(self._replace_finale(adding=None))
+        return True
+
+    def reconnect(self, app_id: str) -> AddStart:
+        """Re-run only one already-installed app's wiring steps.
+
+        The same "press it again" idea a failed full deploy already offers,
+        narrowed to one app: nothing about the app itself is touched, only
+        the connections its wiring steps make - so an app that is already
+        fully wired is never at risk of losing anything by being
+        reconnected again.
+        """
+        install = load_state(self._settings.config_dir)
+        snapshot = self.snapshot()
+        if install is None or snapshot.phase != "finale":
+            return "not_ready"
+        if self._is_running() or snapshot.adding is not None:
+            return "busy"
+        if not any(progress.app_id == app_id for progress in snapshot.apps):
+            return "unknown_app"
+        app = get_app(app_id)
+
+        started_at = _now_iso()
+        adding = AppAdd(
+            app_id=app_id,
+            purpose="reconnect",
+            state="wiring",
+            line=hub_line_connecting(app.name),
+            note=None,
+            failure=None,
+            wiring=(),
+            compose_ran=True,
+            started_at=started_at,
+        )
+        self._emit(replace(snapshot, adding=adding))
+        self._task = asyncio.create_task(self._run_reconnect(app, install))
+        return "started"
+
+    def _current_adding(self) -> AppAdd | None:
+        return self._snapshot.adding
+
+    def _replace_finale(
+        self,
+        *,
+        adding: AppAdd | None,
+        apps: tuple[AppProgress, ...] | None = None,
+        wiring_gaps: tuple[WiringGap, ...] | None = None,
+    ) -> DeploySnapshot:
+        """The current snapshot with only `adding` (and optionally `apps` /
+        `wiring_gaps`) swapped - `phase`, `headline`, `detail`, `failure`,
+        `wiring`, `started_at` and `finished_at` all stay exactly what the
+        finale deploy already set them to. This is what keeps every
+        snapshot emitted during an add still reading `phase == "finale"` -
+        the Hub never bounces to /deploy while one is running.
+        """
+        current = self._snapshot
+        return replace(
+            current,
+            adding=adding,
+            apps=current.apps if apps is None else apps,
+            wiring_gaps=current.wiring_gaps if wiring_gaps is None else wiring_gaps,
+        )
+
+    def _gaps_with(self, app_id: str, failed_lines: tuple[str, ...]) -> tuple[WiringGap, ...]:
+        """`wiring_gaps` with `app_id`'s own entry replaced, added, or
+        removed - a clean reconnect drops a gap it just closed instead of
+        leaving a stale one behind.
+        """
+        remaining = tuple(gap for gap in self._snapshot.wiring_gaps if gap.app_id != app_id)
+        if not failed_lines:
+            return remaining
+        return (*remaining, WiringGap(app_id=app_id, failed_lines=failed_lines))
 
     # --- Subscribing -------------------------------------------------------
 
@@ -525,16 +800,9 @@ class DeployManager:
             return
 
         for index, app in enumerate(catalog_apps):
+            report = self._full_deploy_reporter(progresses, index, app, run_id, started_at)
             failure = await self._bring_up_app(
-                app,
-                install,
-                compose_path,
-                progresses,
-                index,
-                run_id,
-                started_at,
-                plan.network,
-                self_id,
+                app, install, compose_path, plan.network, self_id, report
             )
             if failure is not None:
                 await self._fail(run_id, started_at, progresses, install, failure)
@@ -621,17 +889,44 @@ class DeployManager:
                 )
         return None
 
+    def _full_deploy_reporter(
+        self,
+        progresses: list[AppProgress],
+        index: int,
+        app: CatalogApp,
+        run_id: str,
+        started_at: str,
+    ) -> Callable[[AppState, str, str | None], Awaitable[None]]:
+        """The full deploy's own `report` callback for `_bring_up_app`.
+
+        Reproduces exactly the snapshot the inline code used to publish at
+        each of its three call sites - the existing `test_deploy` suite is
+        what proves this refactor changed no observable behaviour.
+        """
+        chip_for_state = {"starting": STATUS_CHIP_STARTING, "done": STATUS_CHIP_DONE}
+        headline_for_state = {
+            "starting": app_headline_starting(app.name),
+            "done": app_headline_done(app.name),
+        }
+
+        async def report(state: AppState, line: str, note: str | None) -> None:
+            progresses[index] = replace(
+                progresses[index], state=state, chip=chip_for_state[state], line=line, note=note
+            )
+            await self._publish(
+                _running_snapshot(run_id, started_at, progresses, headline_for_state[state])
+            )
+
+        return report
+
     async def _bring_up_app(
         self,
         app: CatalogApp,
         install: InstallState,
         compose_path: Path,
-        progresses: list[AppProgress],
-        index: int,
-        run_id: str,
-        started_at: str,
         network: str,
         self_id: str,
+        report: Callable[[AppState, str, str | None], Awaitable[None]],
     ) -> Failure | None:
         api_key = install.api_keys.get(app.id)
         if api_key is None:
@@ -648,12 +943,7 @@ class DeployManager:
         downloading = not await self._engine.image_present(app.image)
         line = app_line_downloading(app.name) if downloading else app_line_starting(app.name)
         note: str | None = None
-        progresses[index] = replace(
-            progresses[index], state="starting", chip=STATUS_CHIP_STARTING, line=line, note=note
-        )
-        await self._publish(
-            _running_snapshot(run_id, started_at, progresses, app_headline_starting(app.name))
-        )
+        await report("starting", line, note)
 
         result = await self._engine.compose_up(self._settings.stack_project, compose_path, app.id)
         if not result.ok:
@@ -690,18 +980,7 @@ class DeployManager:
             container = await self._engine.inspect(app.id)
             if container.state == "running":
                 if await self._probe.check(app.id, app.port, app.api_base, api_key):
-                    progresses[index] = replace(
-                        progresses[index],
-                        state="done",
-                        chip=STATUS_CHIP_DONE,
-                        line=app_line_done(app.name),
-                        note=None,
-                    )
-                    await self._publish(
-                        _running_snapshot(
-                            run_id, started_at, progresses, app_headline_done(app.name)
-                        )
-                    )
+                    await report("done", app_line_done(app.name), None)
                     return None
                 candidate_line = app_line_warming_up(app.name)
             else:
@@ -714,14 +993,254 @@ class DeployManager:
 
             if candidate_line != line or candidate_note != note:
                 line, note = candidate_line, candidate_note
-                progresses[index] = replace(progresses[index], line=line, note=note)
-                await self._publish(
-                    _running_snapshot(
-                        run_id, started_at, progresses, app_headline_starting(app.name)
-                    )
-                )
+                await report("starting", line, note)
 
             await self._sleep(self.POLL_INTERVAL_SECONDS)
+
+    # --- Running an add or a retry -----------------------------------------
+
+    def _diagnostics_recorder(self) -> Callable[[str], None]:
+        """A `record(text)` closure for one add/reconnect run: the FIRST
+        call replaces the diagnostics file, every later call appends -
+        "Last problem" is replaced only by a newer problem, and an add with
+        nothing to say about it never touches an older run's evidence.
+        """
+        wrote = False
+
+        def record(text: str) -> None:
+            nonlocal wrote
+            if not wrote:
+                self._diagnostics_file.parent.mkdir(parents=True, exist_ok=True)
+                self._diagnostics_file.write_text(text if text.endswith("\n") else f"{text}\n")
+                wrote = True
+            else:
+                self._append_diagnostics(text)
+
+        return record
+
+    async def _run_add(self, app: CatalogApp, install: InstallState) -> None:
+        """Run a whole add (or a retry of one) to completion.
+
+        `install` is the ORIGINAL, on-disk state - not yet grown - the same
+        object whether this is a fresh `add_app`, a `retry_add`, or a
+        resumed one; `_run_add_steps` is the one place that decides whether
+        `app` already belongs to it.
+        """
+        record_diagnostics = self._diagnostics_recorder()
+        try:
+            await self._run_add_steps(app, install, record_diagnostics=record_diagnostics)
+        except Exception as error:  # the background task must never die silently
+            logger.exception("add-app run crashed unexpectedly")
+            headline, what_to_do = _split_failure_text(failure_compose_failed(app.name))
+            await self._fail_add(
+                app,
+                install,
+                Failure(
+                    code="compose_failed",
+                    headline=headline,
+                    what_to_do=what_to_do,
+                    technical=f"{type(error).__name__}: {error}",
+                ),
+                record_diagnostics,
+            )
+
+    async def _run_add_steps(
+        self, app: CatalogApp, install: InstallState, *, record_diagnostics: Callable[[str], None]
+    ) -> None:
+        # Idempotent: an already-grown state (a resumed add) just re-keeps
+        # its existing ids and key - this is what lets every caller
+        # (add_app, retry_add, a resume) pass the ORIGINAL, on-disk install
+        # and let this one call decide whether it's already grown.
+        grown = with_app_added(install, app.id)
+        save_state(self._settings.config_dir, grown)
+
+        docker_status = await self._engine.status()
+        if not docker_status.connected:
+            await self._fail_add(
+                app,
+                grown,
+                _docker_unreachable_failure(docker_status.detail or "Docker did not answer"),
+                record_diagnostics,
+            )
+            return
+
+        if grown.storage_root is None:
+            headline, what_to_do = _split_failure_text(
+                refusal_path_missing("(no storage folder chosen)")
+            )
+            await self._fail_add(
+                app,
+                grown,
+                Failure(
+                    code="storage_refused",
+                    headline=headline,
+                    what_to_do=what_to_do,
+                    technical="no storage_root was ever saved",
+                ),
+                record_diagnostics,
+            )
+            return
+
+        storage_check = check_storage_root(self._settings, grown.storage_root)
+        if not storage_check.ok:
+            await self._fail_add(
+                app,
+                grown,
+                _storage_failure(storage_check, grown.storage_root),
+                record_diagnostics,
+            )
+            return
+
+        root = PurePosixPath(grown.storage_root)
+        freshness = check_fresh_start(self._settings, root, grown.app_ids)
+        if not freshness.ok:
+            await self._fail_add(
+                app, grown, _freshness_failure(freshness, grown.storage_root), record_diagnostics
+            )
+            return
+
+        clash = await self._find_name_clash(grown, root, (app,))
+        if clash is not None:
+            await self._fail_add(app, grown, clash, record_diagnostics)
+            return
+
+        build_folders(self._settings, root, grown.app_ids, grown.puid, grown.pgid)
+        write_marker(self._settings, root, grown.app_ids, grown.puid, grown.pgid)
+        plan = build_stack_plan(grown)
+        compose_path = write_compose(self._settings, plan)
+
+        self_id = await self._engine.self_container_id()
+        if self_id is None:
+            await self._fail_add(
+                app,
+                grown,
+                _docker_unreachable_failure("could not identify Marrquee's own container"),
+                record_diagnostics,
+            )
+            return
+
+        current = self._current_adding()
+        if current is not None:
+            self._emit(self._replace_finale(adding=replace(current, compose_ran=True)))
+
+        report = self._add_reporter()
+        failure = await self._bring_up_app(app, grown, compose_path, plan.network, self_id, report)
+        if failure is not None:
+            await self._fail_add(app, grown, failure, record_diagnostics)
+            return
+
+        current = self._current_adding()
+        if current is not None:
+            self._emit(
+                self._replace_finale(
+                    adding=replace(current, state="wiring", line=hub_line_connecting(app.name))
+                )
+            )
+
+        await self._run_wiring_for_add(app, grown, record_diagnostics)
+
+    def _add_reporter(self) -> Callable[[AppState, str, str | None], Awaitable[None]]:
+        """The add path's own `report` callback for `_bring_up_app`.
+
+        Only `line`/`note` change here - `adding.state` stays `"starting"`
+        throughout the whole call (the explicit transition to `"wiring"`
+        happens once, right after `_bring_up_app` returns), so this never
+        needs to know which of the two `AppState`s it was just told about.
+        """
+
+        async def report(state: AppState, line: str, note: str | None) -> None:
+            current = self._current_adding()
+            if current is None:
+                return
+            await self._publish(self._replace_finale(adding=replace(current, line=line, note=note)))
+
+        return report
+
+    async def _run_wiring_for_add(
+        self, app: CatalogApp, install: InstallState, record_diagnostics: Callable[[str], None]
+    ) -> None:
+        """Run only the wiring steps about `app`, then fold it into `apps`.
+
+        Shared by a fresh add and a resumed one - the wiring runner is
+        idempotent (look-before-write), so re-running it for an app whose
+        wiring already fully succeeded on an earlier, interrupted attempt
+        is a repeat, not a risk.
+        """
+        wiring_rows: dict[int, WiringStep] = {}
+
+        def collect_wiring_step(step: WiringStep) -> None:
+            if step.technical:
+                record_diagnostics(_redact_secrets(step.technical, install.api_keys))
+            wiring_rows[step.index] = replace(step, technical=None)
+            current = self._current_adding()
+            if current is not None:
+                ordered_steps = tuple(wiring_rows[index] for index in sorted(wiring_rows))
+                self._emit(self._replace_finale(adding=replace(current, wiring=ordered_steps)))
+
+        try:
+            await self._wiring.run(install, collect_wiring_step, only_app=app.id)
+        except Exception:
+            # A wiring problem is not an add failure - the app is already
+            # up and done, so this never turns a successful add into one
+            # that looks failed.
+            logger.exception("wiring runner raised during an add; continuing anyway")
+
+        wiring_steps = tuple(wiring_rows[index] for index in sorted(wiring_rows))
+        failed_lines = tuple(step.line for step in wiring_steps if step.state == "error")
+
+        progresses_by_id = {progress.app_id: progress for progress in self._snapshot.apps}
+        progresses_by_id[app.id] = AppProgress(
+            app_id=app.id,
+            name=app.name,
+            state="done",
+            chip=STATUS_CHIP_DONE,
+            line=app_line_done(app.name),
+            note=None,
+            port=app.port,
+        )
+        ordered_ids = tuple(catalog_app.id for catalog_app in apps_in_order(progresses_by_id))
+        new_apps = tuple(progresses_by_id[app_id] for app_id in ordered_ids)
+
+        await self._publish(
+            self._replace_finale(
+                adding=None, apps=new_apps, wiring_gaps=self._gaps_with(app.id, failed_lines)
+            )
+        )
+
+    async def _run_reconnect(self, app: CatalogApp, install: InstallState) -> None:
+        record_diagnostics = self._diagnostics_recorder()
+        try:
+            await self._run_wiring_for_add(app, install, record_diagnostics)
+        except Exception as error:  # the background task must never die silently
+            logger.exception("reconnect crashed unexpectedly")
+            headline, what_to_do = _split_failure_text(failure_compose_failed(app.name))
+            await self._fail_add(
+                app,
+                install,
+                Failure(
+                    code="compose_failed",
+                    headline=headline,
+                    what_to_do=what_to_do,
+                    technical=f"{type(error).__name__}: {error}",
+                ),
+                record_diagnostics,
+            )
+
+    async def _fail_add(
+        self,
+        app: CatalogApp,
+        install: InstallState,
+        failure: Failure,
+        record_diagnostics: Callable[[str], None],
+    ) -> None:
+        redacted = replace(failure, technical=_redact_secrets(failure.technical, install.api_keys))
+        record_diagnostics(f"{redacted.code}\n{redacted.technical}")
+        logger.error("add failed (%s): %s", redacted.code, redacted.technical)
+        current = self._current_adding()
+        if current is None:
+            return
+        updated = replace(current, state="error", line=app_line_error(app.name), failure=redacted)
+        await self._publish(self._replace_finale(adding=updated))
 
     async def _fail(
         self,
@@ -952,6 +1471,11 @@ def _snapshot_from_payload(payload: object) -> DeploySnapshot:
     )
     failure_payload = payload.get("failure")
     failure = _failure_from_payload(failure_payload) if isinstance(failure_payload, dict) else None
+    adding_payload = payload.get("adding")
+    adding = _app_add_from_payload(adding_payload) if isinstance(adding_payload, dict) else None
+    wiring_gaps = tuple(
+        _wiring_gap_from_payload(item) for item in _require_list(payload.get("wiring_gaps", []))
+    )
 
     return DeploySnapshot(
         run_id=_require_str(payload.get("run_id")),
@@ -968,6 +1492,8 @@ def _snapshot_from_payload(payload: object) -> DeploySnapshot:
         started_at=_require_optional_str(payload.get("started_at")),
         finished_at=_require_optional_str(payload.get("finished_at")),
         wiring=wiring,
+        adding=adding,
+        wiring_gaps=wiring_gaps,
     )
 
 
@@ -1033,9 +1559,47 @@ def _wiring_step_from_payload(payload: object) -> WiringStep:
     )
 
 
+def _app_add_from_payload(payload: dict[str, object]) -> AppAdd:
+    wiring = tuple(
+        _wiring_step_from_payload(item) for item in _require_list(payload.get("wiring", []))
+    )
+    failure_payload = payload.get("failure")
+    failure = _failure_from_payload(failure_payload) if isinstance(failure_payload, dict) else None
+    return AppAdd(
+        app_id=_require_str(payload.get("app_id")),
+        purpose=cast(AddPurpose, _require_choice(payload.get("purpose"), ("add", "reconnect"))),
+        state=cast(
+            AddState, _require_choice(payload.get("state"), ("starting", "wiring", "error"))
+        ),
+        line=_require_str(payload.get("line")),
+        note=_require_optional_str(payload.get("note")),
+        failure=failure,
+        wiring=wiring,
+        compose_ran=_require_bool(payload.get("compose_ran")),
+        started_at=_require_str(payload.get("started_at")),
+    )
+
+
+def _wiring_gap_from_payload(payload: object) -> WiringGap:
+    if not isinstance(payload, dict):
+        raise TypeError(f"expected a JSON object, got {payload!r}")
+    failed_lines = payload.get("failed_lines", [])
+    if not isinstance(failed_lines, list) or not all(
+        isinstance(item, str) for item in failed_lines
+    ):
+        raise TypeError(f"expected a list of strings, got {failed_lines!r}")
+    return WiringGap(app_id=_require_str(payload.get("app_id")), failed_lines=tuple(failed_lines))
+
+
 def _require_str(value: object) -> str:
     if not isinstance(value, str):
         raise TypeError(f"expected a string, got {value!r}")
+    return value
+
+
+def _require_bool(value: object) -> bool:
+    if not isinstance(value, bool):
+        raise TypeError(f"expected a bool, got {value!r}")
     return value
 
 

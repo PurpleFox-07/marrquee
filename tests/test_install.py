@@ -10,9 +10,11 @@ from __future__ import annotations
 
 from pathlib import Path, PurePosixPath
 
+import pytest
+
 from marrquee.config import Settings
-from marrquee.install import install_apps
-from marrquee.state import load_state
+from marrquee.install import install_apps, with_app_added, with_app_removed
+from marrquee.state import InstallState, load_state
 from marrquee.words import REFUSAL_NOTHING_CHOSEN, REFUSAL_UNKNOWN_APP
 
 
@@ -188,3 +190,82 @@ def test_install_apps_can_be_reposted_against_the_same_still_fresh_root(tmp_path
     second = install_apps(settings, str(root), ["sonarr"])
 
     assert second.ok
+
+
+def _state(app_ids: tuple[str, ...], api_keys: dict[str, str]) -> InstallState:
+    return InstallState(
+        version=1,
+        storage_root="/volume1/media",
+        app_ids=app_ids,
+        api_keys=api_keys,
+        puid=1000,
+        pgid=1000,
+        umask="002",
+        timezone="Etc/UTC",
+        created="2026-01-01T00:00:00+00:00",
+    )
+
+
+def test_with_app_added_keeps_every_existing_key_and_orders_ids_by_catalog() -> None:
+    state = _state(("sonarr",), {"sonarr": "sonarr-key"})
+
+    grown = with_app_added(state, "prowlarr")
+
+    assert grown.app_ids == ("prowlarr", "sonarr")
+    assert grown.api_keys["sonarr"] == "sonarr-key"
+    assert "prowlarr" in grown.api_keys
+    assert grown.api_keys["prowlarr"] != "sonarr-key"
+
+
+def test_with_app_added_keeps_the_apps_own_key_when_re_added() -> None:
+    state = _state(("sonarr", "radarr"), {"sonarr": "sonarr-key", "radarr": "radarr-key"})
+
+    grown = with_app_added(state, "sonarr")
+
+    assert grown.app_ids == ("sonarr", "radarr")
+    assert grown.api_keys["sonarr"] == "sonarr-key"
+    assert grown.api_keys["radarr"] == "radarr-key"
+
+
+def test_with_app_added_never_mutates_the_state_it_was_given() -> None:
+    state = _state(("sonarr",), {"sonarr": "sonarr-key"})
+
+    with_app_added(state, "prowlarr")
+
+    assert state.app_ids == ("sonarr",)
+    assert set(state.api_keys) == {"sonarr"}
+
+
+def test_with_app_added_raises_key_error_for_an_unknown_app() -> None:
+    state = _state((), {})
+
+    with pytest.raises(KeyError):
+        with_app_added(state, "plex")
+
+
+def test_with_app_removed_keeps_the_removed_apps_key() -> None:
+    state = _state(
+        ("prowlarr", "sonarr", "radarr"),
+        {"prowlarr": "p-key", "sonarr": "s-key", "radarr": "r-key"},
+    )
+
+    shrunk = with_app_removed(state, "radarr")
+
+    assert shrunk.app_ids == ("prowlarr", "sonarr")
+    assert shrunk.api_keys["radarr"] == "r-key"
+    assert set(shrunk.api_keys) == {"prowlarr", "sonarr", "radarr"}
+
+
+def test_with_app_removed_never_mutates_the_state_it_was_given() -> None:
+    state = _state(("sonarr", "radarr"), {"sonarr": "s-key", "radarr": "r-key"})
+
+    with_app_removed(state, "radarr")
+
+    assert state.app_ids == ("sonarr", "radarr")
+
+
+def test_with_app_removed_raises_key_error_for_an_unknown_app() -> None:
+    state = _state(("sonarr",), {"sonarr": "sonarr-key"})
+
+    with pytest.raises(KeyError):
+        with_app_removed(state, "plex")

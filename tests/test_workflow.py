@@ -323,15 +323,19 @@ def test_stack_smoke_starts_the_image_with_the_socket_and_the_host_mount() -> No
     assert f"-p {port}:{port}" in step["run"]
 
 
-def test_stack_smoke_installs_all_three_apps_and_starts_a_deploy() -> None:
+def test_stack_smoke_installs_two_apps_and_starts_a_deploy() -> None:
+    """Radarr is deliberately left out of the first install - this job's
+    whole point is proving it arrives later, through the Hub's own add
+    endpoint, onto a stack that is already running.
+    """
     job = _stack_smoke_job()
 
-    install_step = _step_named(job, "install all three apps")
+    install_step = _step_named(job, "install two apps")
     run = install_step["run"]
     assert "/api/install" in run
     assert "prowlarr" in run
     assert "sonarr" in run
-    assert "radarr" in run
+    assert "radarr" not in run
 
     start_step = _step_named(job, "start the deploy")
     assert "POST http://127.0.0.1:7788/api/deploy" in start_step["run"]
@@ -371,6 +375,94 @@ def test_stack_smoke_annotation_escapes_percent_cr_lf_and_double_colon() -> None
     assert "%0D" in run  # escapes a literal carriage return
     assert "%0A" in run  # escapes a literal newline
     assert "': :'" in run  # collapses a literal '::' in the message body
+
+
+def test_stack_smoke_job_is_named_for_the_add_flow() -> None:
+    assert _stack_smoke_job()["name"] == (
+        "Real-Docker stack smoke (two arr apps, then add one from the Hub)"
+    )
+
+
+def test_stack_smoke_records_prowlarr_and_sonarr_before_the_add() -> None:
+    step = _step_named(_stack_smoke_job(), "record", "before the add")
+    run = step["run"]
+
+    assert "docker inspect -f '{{.Id}} {{.State.StartedAt}}' prowlarr" in run
+    assert "docker inspect -f '{{.Id}} {{.State.StartedAt}}' sonarr" in run
+    assert "PROWLARR_BEFORE=" in run
+    assert "SONARR_BEFORE=" in run
+    assert "$GITHUB_ENV" in run
+
+
+def test_stack_smoke_adds_radarr_through_the_hub_install_endpoint() -> None:
+    step = _step_named(_stack_smoke_job(), "add radarr", "hub's install endpoint")
+    run = step["run"]
+
+    assert "/api/hub/apps/radarr/install" in run
+    assert '{"answers":{}}' in run
+    assert "202" in run
+    assert "::error::" in run
+
+
+def test_stack_smoke_polls_hub_status_until_radarr_finishes_adding() -> None:
+    step = _step_named(_stack_smoke_job(), "poll", "radarr finishes adding")
+    run = step["run"]
+
+    assert "/api/hub/status" in run
+    assert 'app_id == "radarr"' in run
+    assert ".add_state" in run
+    assert ".busy" in run
+    # Bounded - `seq 1 N`, never an unconditional `while true`.
+    assert "seq 1 " in run
+    assert "while true" not in run
+    # An add_state of "error" fails loudly instead of spinning until the
+    # loop's own timeout hides the real reason.
+    assert '"$add_state" = "error"' in run
+    assert run.count("::error::") >= 2
+
+
+def test_stack_smoke_polls_hub_status_annotation_escapes_percent_cr_lf_and_double_colon() -> None:
+    run = _step_named(_stack_smoke_job(), "poll", "radarr finishes adding")["run"]
+
+    assert "%25" in run
+    assert "%0D" in run
+    assert "%0A" in run
+    assert "': :'" in run
+
+
+def test_stack_smoke_asserts_prowlarr_and_sonarr_were_not_recreated_by_the_add() -> None:
+    """A real daemon is the only way to prove that `--no-recreate` really
+    does leave a running container's id and start time untouched.
+    """
+    step = _step_named(_stack_smoke_job(), "were not recreated")
+    run = step["run"]
+
+    assert "docker inspect -f '{{.Id}} {{.State.StartedAt}}' prowlarr" in run
+    assert "docker inspect -f '{{.Id}} {{.State.StartedAt}}' sonarr" in run
+    assert "$PROWLARR_BEFORE" in run
+    assert "$SONARR_BEFORE" in run
+    assert "::error::Prowlarr or Sonarr was recreated by adding Radarr" in run
+
+
+def test_stack_smoke_add_path_steps_run_between_the_first_finale_and_the_container_check() -> None:
+    job = _stack_smoke_job()
+    names = [str(step.get("name", "")) for step in _steps(job)]
+
+    first_finale_index = names.index(_step_named(job, "poll", "it reaches finale")["name"])
+    record_index = names.index(_step_named(job, "record", "before the add")["name"])
+    add_index = names.index(_step_named(job, "add radarr", "hub's install endpoint")["name"])
+    add_poll_index = names.index(_step_named(job, "poll", "radarr finishes adding")["name"])
+    recreate_index = names.index(_step_named(job, "were not recreated")["name"])
+    containers_index = names.index(_step_named(job, "all three containers are running")["name"])
+
+    assert (
+        first_finale_index
+        < record_index
+        < add_index
+        < add_poll_index
+        < recreate_index
+        < containers_index
+    )
 
 
 def test_stack_smoke_asserts_the_marrquee_network_lists_every_app_and_marrquee_itself() -> None:

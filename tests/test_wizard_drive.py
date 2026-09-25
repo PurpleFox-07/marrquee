@@ -20,11 +20,13 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+import marrquee.questions as questions_module
 from marrquee import wizard, words
 from marrquee.config import Settings
-from marrquee.deploy import AppProgress, DeploySnapshot
+from marrquee.deploy import AppProgress, DeployPhase, DeploySnapshot
 from marrquee.docker_client import DockerStatus, FakeDockerEngine
 from marrquee.main import create_app
+from marrquee.questions import QuestionCheck, QuestionField, QuestionStep
 from marrquee.state import STATE_VERSION, InstallState, load_state, save_state, write_json_atomic
 
 _WIZARD_JS_PATH = (
@@ -60,6 +62,35 @@ def _install_state(
         umask="022",
         timezone=timezone,
         created="2026-09-22T00:00:00+00:00",
+    )
+
+
+def _write_deploy(settings: Settings, *, phase: DeployPhase) -> None:
+    """Persist a `deploy.json` at `phase` - the shape every hub-exists-guard
+    test needs, and the "still error, still reachable" test's counterpart.
+    """
+    snapshot = DeploySnapshot(
+        run_id="run-1",
+        phase=phase,
+        apps=(),
+        headline="Now showing" if phase == "finale" else "Something went wrong",
+        detail=None,
+        failure=None,
+        started_at="2026-09-19T00:00:00+00:00",
+        finished_at="2026-09-19T00:05:00+00:00",
+        wiring=(),
+    )
+    write_json_atomic(settings.config_dir / "deploy.json", dataclasses.asdict(snapshot))
+
+
+def _fixture_step(app_id: str = "radarr") -> QuestionStep:
+    return QuestionStep(
+        app_id=app_id,
+        step_id="fixture",
+        title="Fixture questions",
+        lede="A fixture step for the test.",
+        fields=(QuestionField(name="token", label="Token", kind="text"),),
+        check=lambda answers: QuestionCheck(ok=True, answers=answers, problem=None, field=None),
     )
 
 
@@ -202,6 +233,67 @@ def test_no_apps_chosen_redirects_to_the_apps_screen(tmp_path: Path) -> None:
     assert response.headers["location"] == "/setup/apps"
 
 
+def test_drive_with_an_unanswered_step_redirects_to_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(questions_module, "QUESTION_STEPS", (_fixture_step(),))
+    client = _client(_settings(tmp_path))
+
+    response = client.get("/setup/drive", params={"apps": "radarr"}, follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/setup/questions/radarr/fixture?apps=radarr"
+
+
+def test_drive_moves_on_once_the_step_is_answered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(questions_module, "QUESTION_STEPS", (_fixture_step(),))
+    settings = _settings(tmp_path)
+    client = _client(settings)
+    client.post(
+        "/setup/questions/radarr/fixture",
+        data={"apps": "radarr", "token": "a-value"},
+        follow_redirects=False,
+    )
+
+    response = client.get("/setup/drive", params={"apps": "radarr"}, follow_redirects=False)
+
+    assert response.status_code == 200
+
+
+def test_setup_drive_redirects_home_once_the_hub_exists(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    _mount_volume1(settings, "media")
+    save_state(settings.config_dir, _install_state(app_ids=("prowlarr",)))
+    install_bytes_before = (settings.config_dir / "install.json").read_bytes()
+    _write_deploy(settings, phase="finale")
+    client = _client(settings)
+
+    get_response = client.get("/setup/drive", params={"apps": "radarr"}, follow_redirects=False)
+    post_response = client.post(
+        "/setup/drive",
+        data={"apps": "radarr", "path": "/volume1/media"},
+        follow_redirects=False,
+    )
+
+    assert get_response.status_code == 303
+    assert get_response.headers["location"] == "/"
+    assert post_response.status_code == 303
+    assert post_response.headers["location"] == "/"
+    assert (settings.config_dir / "install.json").read_bytes() == install_bytes_before
+
+
+def test_a_failed_first_deploy_can_still_reach_setup(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    _write_deploy(settings, phase="error")
+    client = _client(settings)
+
+    response = client.get("/setup/drive", params={"apps": "radarr"}, follow_redirects=False)
+
+    assert response.status_code == 200
+
+
 def test_first_paint_is_empty_with_placeholder_hint_and_freshstart_note(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     (settings.host_mount / "volume1").mkdir(parents=True)
@@ -295,10 +387,33 @@ def test_a_good_path_saves_through_install_apps_and_redirects_to_deploy(tmp_path
     assert saved.timezone == "America/Chicago"
 
 
-def test_continuing_after_a_finished_deploy_lands_on_the_deploy_button(tmp_path: Path) -> None:
-    """Finishing the wizard a second time (for example, after re-choosing
-    apps on a NAS that was already deployed once) must not leave the owner
-    staring at an old finale with no Deploy button to press.
+def test_posting_drive_with_an_unanswered_step_redirects_to_it_and_saves_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(questions_module, "QUESTION_STEPS", (_fixture_step(),))
+    settings = _settings(tmp_path)
+    _mount_volume1(settings, "fresh")
+    client = _client(settings)
+
+    response = client.post(
+        "/setup/drive",
+        data={"apps": "radarr", "path": "/volume1/fresh"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/setup/questions/radarr/fixture?apps=radarr"
+    assert load_state(settings.config_dir) is None
+
+
+def test_continuing_to_setup_once_the_hub_exists_closes_the_wizard_instead(
+    tmp_path: Path,
+) -> None:
+    """Once a deploy has reached its finale, the Hub is home - a stale
+    wizard tab (re-choosing apps on a NAS that's already set up) must never
+    resurrect the wizard or rewrite install.json out from under a running
+    Hub. The owner's own way back in is the Hub's own "+" panel, not this
+    screen.
     """
     settings = _settings(tmp_path)
     _mount_volume1(settings, "fresh")
@@ -336,8 +451,9 @@ def test_continuing_after_a_finished_deploy_lands_on_the_deploy_button(tmp_path:
     )
 
     assert response.status_code == 303
-    assert response.headers["location"] == "/deploy"
-    assert app.state.deploy.snapshot().phase == "ready"
+    assert response.headers["location"] == "/"
+    assert load_state(settings.config_dir) is None
+    assert app.state.deploy.snapshot().phase == "finale"
 
 
 def test_a_populated_folder_is_refused_at_200_with_storys_wording_and_nothing_saved(

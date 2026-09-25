@@ -8,13 +8,21 @@ returns, so every poster word this story promises is proven here first.
 
 from __future__ import annotations
 
+import dataclasses
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
+import marrquee.catalog as catalog_module
+import marrquee.hub as hub_module
+import marrquee.questions as questions_module
 from marrquee import words
-from marrquee.catalog import CATALOG
+from marrquee.catalog import CATALOG, AppRule
+from marrquee.deploy import AppAdd, Failure, WiringGap
 from marrquee.health import AppHealth, HubState, LinkHealth, LinkState
-from marrquee.hub import HUB_POLL_MS, HubPanel, HubTile, LinkTile, hub_panel, hub_view
+from marrquee.hub import HUB_POLL_MS, HubPanel, HubTile, InstallRow, LinkTile, hub_panel, hub_view
 from marrquee.links import LinkCard
+from marrquee.questions import QuestionCheck, QuestionField, QuestionStep
 
 _NOW = datetime(2026, 9, 23, 12, 0, 0, tzinfo=UTC)
 _AUTHORITY = "192.168.1.50:7788"
@@ -387,6 +395,346 @@ def test_edit_with_no_id_at_all_is_closed() -> None:
     panel = hub_panel("edit", None, [card])
 
     assert panel.mode == "closed"
+
+
+# --- Adding, retrying, gaps and install rows --------------------------------
+
+
+def _adding(
+    app_id: str = "radarr",
+    *,
+    purpose: str = "add",
+    state: str = "starting",
+    line: str = "Starting Radarr",
+    note: str | None = None,
+    failure: Failure | None = None,
+) -> AppAdd:
+    return AppAdd(
+        app_id=app_id,
+        purpose=purpose,  # type: ignore[arg-type]
+        state=state,  # type: ignore[arg-type]
+        line=line,
+        note=note,
+        failure=failure,
+        wiring=(),
+        compose_ran=False,
+        started_at="2026-09-24T00:00:00+00:00",
+    )
+
+
+def _failure(
+    headline: str = "Radarr couldn't be added.", what_to_do: str = "Try again."
+) -> Failure:
+    return Failure(
+        code="compose_failed", headline=headline, what_to_do=what_to_do, technical="boom"
+    )
+
+
+def test_an_app_with_no_web_page_never_gets_a_url_even_when_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patched = tuple(
+        dataclasses.replace(app, web_page=False) if app.id == "sonarr" else app
+        for app in catalog_module.CATALOG
+    )
+    # `apps_in_order`/`get_app` read `catalog.CATALOG` at call time (they
+    # live in catalog.py); `hub.installable` reads its own imported copy -
+    # both have to see the same patched entry for this test to be honest.
+    monkeypatch.setattr(catalog_module, "CATALOG", patched)
+    monkeypatch.setattr(hub_module, "CATALOG", patched)
+
+    view = hub_view(
+        ["sonarr"], [_health("sonarr", state="up")], authority=_AUTHORITY, proxied=False, now=_NOW
+    )
+
+    tile = view.tiles[0]
+    assert tile.url is None
+    assert tile.aria is None
+    assert tile.line == ""
+
+
+def test_hub_tile_defaults_carry_no_add_state_no_note_and_no_actions() -> None:
+    view = hub_view(["sonarr"], [_health("sonarr")], authority=_AUTHORITY, proxied=False, now=_NOW)
+
+    tile = view.tiles[0]
+    assert tile.add_state is None
+    assert tile.note == ""
+    assert tile.actions == "none"
+
+
+def test_install_rows_exclude_the_app_being_added_and_grey_an_unavailable_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    needs_prowlarr = AppRule(kind="needs_any", app_ids=("prowlarr",), reason="needs Prowlarr first")
+    patched = tuple(
+        dataclasses.replace(app, rules=(needs_prowlarr,)) if app.id == "radarr" else app
+        for app in catalog_module.CATALOG
+    )
+    # `hub.py` does `from marrquee.catalog import CATALOG`, which copies the
+    # reference at import time - patching `catalog_module.CATALOG` alone
+    # would never be seen here, so the name is patched where it's actually
+    # read from.
+    monkeypatch.setattr(hub_module, "CATALOG", patched)
+
+    view = hub_view(
+        [],
+        [],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        adding=_adding(app_id="sonarr"),
+    )
+
+    ids = [row.app.id for row in view.install_rows]
+    assert "sonarr" not in ids
+    assert ids == ["prowlarr", "radarr"]
+    by_id = {row.app.id: row for row in view.install_rows}
+    assert isinstance(by_id["radarr"], InstallRow)
+    assert by_id["prowlarr"].unavailable is None
+    assert by_id["radarr"].unavailable == "needs Prowlarr first"
+
+
+def test_install_rows_carry_each_apps_registered_question_steps() -> None:
+    fixture_step = QuestionStep(
+        app_id="prowlarr",
+        step_id="fixture",
+        title="Fixture",
+        lede="A fixture step.",
+        fields=(QuestionField(name="name", label="Name", kind="text"),),
+        check=lambda answers: QuestionCheck(ok=True, answers=answers, problem=None, field=None),
+    )
+    original = questions_module.QUESTION_STEPS
+    questions_module.QUESTION_STEPS = (fixture_step,)
+    try:
+        view = hub_view([], [], authority=_AUTHORITY, proxied=False, now=_NOW)
+    finally:
+        questions_module.QUESTION_STEPS = original
+
+    by_id = {row.app.id: row for row in view.install_rows}
+    assert by_id["prowlarr"].steps == (fixture_step,)
+    assert by_id["sonarr"].steps == ()
+
+
+def test_a_starting_add_gets_a_spotlit_tile_with_no_url() -> None:
+    view = hub_view(
+        ["sonarr"],
+        [_health("sonarr")],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        adding=_adding(app_id="radarr", state="starting", line="Starting Radarr", note=None),
+    )
+
+    assert [tile.app_id for tile in view.tiles] == ["sonarr", "radarr"]
+    tile = view.tiles[1]
+    assert tile.state == "starting"
+    assert tile.chip == words.HUB_CHIP_ADDING
+    assert tile.line == "Starting Radarr"
+    assert tile.url is None
+    assert tile.aria is None
+    assert tile.add_state == "starting"
+
+
+def test_a_starting_add_prefers_its_note_over_its_line() -> None:
+    view = hub_view(
+        [],
+        [],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        adding=_adding(line="Starting Radarr", note="Downloading Radarr - this only happens once"),
+    )
+
+    tile = view.tiles[0]
+    assert tile.line == "Downloading Radarr - this only happens once"
+
+
+def test_a_wiring_add_shows_the_connecting_chip_and_line() -> None:
+    view = hub_view(
+        [],
+        [],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        adding=_adding(state="wiring"),
+    )
+
+    tile = view.tiles[0]
+    assert tile.chip == words.WIRING_CHIP_RUNNING
+    assert tile.line == words.hub_line_connecting("Radarr")
+    assert tile.add_state == "wiring"
+    assert tile.url is None
+
+
+def test_a_failed_add_shows_the_failure_headline_and_offers_retry() -> None:
+    failure = _failure("Radarr couldn't be added.", "Check your NAS's Docker app and try again.")
+    view = hub_view(
+        [],
+        [],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        adding=_adding(state="error", line=words.app_line_error("Radarr"), failure=failure),
+    )
+
+    tile = view.tiles[0]
+    assert tile.state == "down"
+    assert tile.chip == words.HUB_CHIP_ADD_FAILED
+    assert tile.line == "Radarr couldn't be added. Check your NAS's Docker app and try again."
+    assert tile.actions == "retry"
+    assert tile.url is None
+
+
+def test_a_failed_cancel_keeps_its_own_line_instead_of_the_failure_text() -> None:
+    failure = _failure()
+    view = hub_view(
+        [],
+        [],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        adding=_adding(state="error", line=words.hub_cancel_failed("Radarr"), failure=failure),
+    )
+
+    tile = view.tiles[0]
+    assert tile.line == words.hub_cancel_failed("Radarr")
+
+
+def test_the_adding_tile_is_excluded_from_any_down_docker_unreachable_empty_and_the_up_count() -> (
+    None
+):
+    view = hub_view(
+        ["sonarr"],
+        [_health("sonarr", state="up")],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        adding=_adding(app_id="radarr"),
+    )
+
+    assert view.any_down is False
+    assert view.docker_unreachable is False
+    assert view.empty is False
+    assert view.announce.startswith(words.HUB_ALL_UP)
+
+
+def test_announce_names_the_app_being_added_or_that_it_failed() -> None:
+    starting = hub_view(
+        [], [], authority=_AUTHORITY, proxied=False, now=_NOW, adding=_adding(app_id="radarr")
+    )
+    failed = hub_view(
+        [],
+        [],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        adding=_adding(app_id="radarr", state="error", failure=_failure()),
+    )
+
+    assert starting.announce == f"{words.HUB_NOTHING_SET_UP} {words.hub_announce_adding('Radarr')}"
+    assert failed.announce == (
+        f"{words.HUB_NOTHING_SET_UP} {words.hub_announce_add_failed('Radarr')}"
+    )
+
+
+def test_a_reconnecting_installed_app_keeps_its_health_tile_but_shows_connecting() -> None:
+    view = hub_view(
+        ["sonarr"],
+        [_health("sonarr", state="up")],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        adding=_adding(app_id="sonarr", purpose="reconnect", state="wiring"),
+    )
+
+    tile = view.tiles[0]
+    assert tile.state == "up"
+    assert tile.chip == words.HUB_CHIP_UP
+    assert tile.line == words.hub_line_connecting("Sonarr")
+    assert tile.add_state == "wiring"
+    assert tile.url is not None
+
+
+def test_a_failed_reconnect_offers_connect_again_never_cancel() -> None:
+    failure = _failure("Sonarr couldn't be reconnected.", "Try again in a moment.")
+    view = hub_view(
+        ["sonarr"],
+        [_health("sonarr", state="up")],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        adding=_adding(
+            app_id="sonarr",
+            purpose="reconnect",
+            state="error",
+            line=words.app_line_error("Sonarr"),
+            failure=failure,
+        ),
+    )
+
+    tile = view.tiles[0]
+    assert tile.state == "up"
+    assert tile.add_state == "error"
+    assert tile.line == "Sonarr couldn't be reconnected. Try again in a moment."
+    # "reconnect" offers only Connect again - never Cancel, which would
+    # remove an already-installed, working app's own container.
+    assert tile.actions == "reconnect"
+
+
+def test_a_wiring_gap_tile_is_up_with_the_amber_note_and_reconnect_action() -> None:
+    view = hub_view(
+        ["sonarr"],
+        [_health("sonarr", state="up")],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        wiring_gaps=[
+            WiringGap(app_id="sonarr", failed_lines=("Prowlarr wasn't told about Sonarr",))
+        ],
+    )
+
+    tile = view.tiles[0]
+    assert tile.state == "up"
+    assert tile.note == words.hub_wiring_gap_note("Sonarr", ("Prowlarr wasn't told about Sonarr",))
+    assert tile.actions == "reconnect"
+
+
+def test_a_clean_reconnect_removes_the_gap_and_its_note() -> None:
+    view = hub_view(
+        ["sonarr"], [_health("sonarr", state="up")], authority=_AUTHORITY, proxied=False, now=_NOW
+    )
+
+    tile = view.tiles[0]
+    assert tile.note == ""
+    assert tile.actions == "none"
+
+
+def test_install_block_reports_busy_or_a_waiting_failed_add_or_nothing() -> None:
+    idle = hub_view(["sonarr"], [_health("sonarr")], authority=_AUTHORITY, proxied=False, now=_NOW)
+    busy = hub_view(
+        ["sonarr"],
+        [_health("sonarr")],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        adding=_adding(app_id="radarr"),
+        busy=True,
+    )
+    waiting_failed = hub_view(
+        ["sonarr"],
+        [_health("sonarr")],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        adding=_adding(app_id="radarr", state="error", failure=_failure()),
+        busy=False,
+    )
+
+    assert idle.install_block is None
+    assert busy.install_block == words.hub_install_busy("Radarr")
+    assert waiting_failed.install_block == words.hub_install_resolve_first("Radarr")
+    assert idle.busy is False
+    assert busy.busy is True
 
 
 def test_hub_panel_prefills_the_stored_url_not_a_re_derived_one() -> None:

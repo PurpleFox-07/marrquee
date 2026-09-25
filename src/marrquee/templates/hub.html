@@ -17,6 +17,7 @@
   data-docker-unreachable="{{ 'true' if view.docker_unreachable else 'false' }}"
   data-stale="false"
   data-poll-ms="{{ poll_ms }}"
+  data-add-poll-ms="{{ add_poll_ms }}"
 >
   <p class="eyebrow">{{ words.HUB_EYEBROW }}</p>
   <h1>{{ words.HUB_HEADLINE[0] }}<br><span class="accent">{{ words.HUB_HEADLINE[1] }}</span></h1>
@@ -43,11 +44,12 @@
   <div class="hub-stage">
     <ul class="poster-grid" data-role="poster-grid">
       {% for tile in view.tiles %}
-      <li>
+      <li class="hub-app-item" data-actions="{{ tile.actions }}">
         <a
           class="poster hub-poster"
           data-app="{{ tile.app_id }}"
           data-state="{{ tile.state }}"
+          {% if tile.add_state %}data-add-state="{{ tile.add_state }}"{% endif %}
           {% if tile.url %}href="{{ tile.url }}" aria-label="{{ tile.aria }}"{% endif %}
           target="_blank"
           rel="noopener noreferrer"
@@ -61,7 +63,24 @@
             <span data-role="chip">{{ tile.chip }}</span>
           </div>
           <p data-role="line">{{ tile.line }}</p>
+          <p class="hub-note" data-role="note">{{ tile.note }}</p>
         </a>
+        {% if tile.actions == "retry" %}
+        <div class="hub-tile-actions">
+          <form method="post" action="/hub/apps/{{ tile.app_id }}/retry">
+            <button type="submit" class="btn-primary">{{ words.HUB_TRY_AGAIN }}</button>
+          </form>
+          <form method="post" action="/hub/apps/{{ tile.app_id }}/cancel">
+            <button type="submit" class="btn-ghost">{{ words.HUB_CANCEL_ADD }}</button>
+          </form>
+        </div>
+        {% elif tile.actions == "reconnect" %}
+        <div class="hub-tile-actions">
+          <form method="post" action="/hub/apps/{{ tile.app_id }}/reconnect">
+            <button type="submit" class="btn-primary">{{ words.HUB_CONNECT_AGAIN }}</button>
+          </form>
+        </div>
+        {% endif %}
       </li>
       {% endfor %}
       {% for link in view.links %}
@@ -143,15 +162,58 @@
 
     <div data-panel-pane="install">
       <a class="btn-ghost" href="/?panel=choose#hub-panel" data-panel-choice="choose">{{ words.HUB_PANEL_BACK }}</a>
-      {% if view.installable %}
-      <ul>
-        {% for app in view.installable %}
-        <li>{{ app.name }}</li>
+      {% if view.install_block %}
+      <p data-role="install-block">{{ view.install_block }}</p>
+      {% elif not view.install_rows %}
+      <p>{{ words.HUB_INSTALL_ALL_DONE }}</p>
+      {% else %}
+      <p>{{ words.HUB_INSTALL_LEDE }}</p>
+      <noscript><p>{{ words.HUB_INSTALL_NEEDS_JS }}</p></noscript>
+      <ul class="install-list">
+        {% for row in view.install_rows %}
+        <li
+          class="install-row"
+          data-install-row="{{ row.app.id }}"
+          data-available="{{ 'false' if row.unavailable else 'true' }}"
+        >
+          <span class="install-row__name">{{ row.app.name }}</span>
+          <p class="install-row__desc">{{ row.app.description }}</p>
+          {% if row.unavailable %}
+          <p class="install-row__reason">{{ words.hub_install_unavailable(row.unavailable) }}</p>
+          {% else %}
+          <button
+            type="button"
+            class="btn-primary"
+            data-install-app="{{ row.app.id }}"
+            hidden
+          >{{ words.hub_install_button(row.app.name) }}</button>
+          {% endif %}
+        </li>
         {% endfor %}
       </ul>
-      <p>{{ words.HUB_INSTALL_ARRIVING }}</p>
-      {% else %}
-      <p>{{ words.HUB_INSTALL_ALL_DONE }}</p>
+      {% for row in view.install_rows if row.steps and not row.unavailable %}
+      <form data-install-form="{{ row.app.id }}" hidden>
+        {% set answers = {} %}
+        {% set problem = none %}
+        {% set problem_field = none %}
+        {% for step in row.steps %}
+        {% include "partials/app_questions.html" %}
+        {% endfor %}
+        <div class="hub-question-actions">
+          <button type="button" class="btn-ghost" data-install-back hidden>{{ words.QUESTIONS_BACK }}</button>
+          <button type="button" class="btn-primary" data-install-next>{{ words.QUESTIONS_NEXT }}</button>
+          <button
+            type="submit"
+            class="btn-primary"
+            data-install-submit
+            hidden
+          >{{ words.hub_install_button(row.app.name) }}</button>
+        </div>
+        <div class="refusal-banner" data-role="install-refusal" role="alert" hidden>
+          <p data-role="install-refusal-text"></p>
+        </div>
+      </form>
+      {% endfor %}
       {% endif %}
     </div>
 

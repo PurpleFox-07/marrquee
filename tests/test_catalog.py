@@ -8,9 +8,18 @@ catalog's shape rather than any one module's use of it.
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
-from marrquee.catalog import CATALOG, apps_in_order, get_app
+from marrquee.catalog import (
+    CATALOG,
+    AppRule,
+    CatalogApp,
+    apps_in_order,
+    get_app,
+    unavailable_reason,
+)
 from marrquee.words import PROWLARR_DESCRIPTION, RADARR_DESCRIPTION, SONARR_DESCRIPTION
 
 
@@ -22,6 +31,74 @@ def test_catalog_holds_exactly_the_three_cycle_1_apps_in_deploy_order() -> None:
     assert orders == sorted(orders)
     assert "qbittorrent" not in ids
     assert "gluetun" not in ids
+
+
+def test_the_catalog_is_unchanged_in_value() -> None:
+    """Every catalog entry keeps its old values - the new fields only ever
+    change behaviour when a caller sets them explicitly.
+    """
+    assert len(CATALOG) == 3
+    for app in CATALOG:
+        assert app.default_ticked is True
+        assert app.web_page is True
+        assert app.rules == ()
+
+
+def _with_rules(app_id: str, rules: tuple[AppRule, ...]) -> CatalogApp:
+    return dataclasses.replace(get_app(app_id), rules=rules)
+
+
+def test_needs_any_refuses_until_one_partner_is_present() -> None:
+    app = _with_rules(
+        "radarr",
+        (
+            AppRule(
+                kind="needs_any", app_ids=("prowlarr", "sonarr"), reason="needs a search source"
+            ),
+        ),
+    )
+
+    assert unavailable_reason(app, ()) == "needs a search source"
+    assert unavailable_reason(app, ("sonarr",)) is None
+    assert unavailable_reason(app, ("prowlarr",)) is None
+
+
+def test_excludes_any_refuses_once_one_partner_is_present() -> None:
+    app = _with_rules(
+        "radarr",
+        (
+            AppRule(
+                kind="excludes_any", app_ids=("plex",), reason="you already have a media server"
+            ),
+        ),
+    )
+
+    assert unavailable_reason(app, ()) is None
+    assert unavailable_reason(app, ("plex",)) == "you already have a media server"
+
+
+def test_the_first_failing_rule_wins_even_when_a_later_rule_would_also_fail() -> None:
+    app = _with_rules(
+        "radarr",
+        (
+            AppRule(kind="needs_any", app_ids=("prowlarr",), reason="first reason"),
+            AppRule(kind="excludes_any", app_ids=("plex",), reason="second reason"),
+        ),
+    )
+
+    # prowlarr is absent (first rule fails) AND plex is present (second rule
+    # fails too) - the declared order must decide, not which rule is checked.
+    assert unavailable_reason(app, ("plex",)) == "first reason"
+
+    # Only the second rule fails here, so it - and only it - can win.
+    assert unavailable_reason(app, ("prowlarr", "plex")) == "second reason"
+
+
+def test_unavailable_reason_is_none_with_no_rules() -> None:
+    app = get_app("radarr")
+
+    assert unavailable_reason(app, ()) is None
+    assert unavailable_reason(app, ("prowlarr", "sonarr")) is None
 
 
 def test_every_catalog_description_is_the_mockups_own_wording() -> None:

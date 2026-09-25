@@ -16,6 +16,7 @@ import pytest
 
 from marrquee.docker_client import (
     ComposeResult,
+    ContainerRemoveResult,
     ContainerSnapshot,
     DockerEngine,
     DockerFailure,
@@ -600,6 +601,71 @@ async def test_self_container_id_is_none_when_neither_lookup_succeeds(
     assert await engine.self_container_id() is None
 
 
+# --- remove_container() ----------------------------------------------------
+
+
+async def test_remove_container_sends_delete_with_force_and_treats_404_as_done(docker_stub):
+    """FIRST TEST - the plan's weakest assumption: does the exact DELETE
+    request the plan promised actually go out, and does Docker's 204/404/409
+    table come back classified the way Cancel needs it to be?
+
+    No `v=` on the query string on purpose - every volume this container
+    could have is a bind mount, so there is nothing anonymous to lose.
+    """
+    stub, socket_path = docker_stub
+    stub.respond_with_sequence(
+        [
+            ("HTTP/1.1 204 No Content", b""),
+            ("HTTP/1.1 404 Not Found", b'{"message": "no such container: radarr"}'),
+            ("HTTP/1.1 409 Conflict", b'{"message": "removal of container already in progress"}'),
+        ]
+    )
+    engine = SocketDockerEngine(socket_path=socket_path)
+
+    removed = await engine.remove_container("radarr")
+    already_gone = await engine.remove_container("radarr")
+    still_removing = await engine.remove_container("radarr")
+
+    assert stub.request_lines[0] == "DELETE /containers/radarr?force=true HTTP/1.1"
+    assert removed == ContainerRemoveResult(ok=True, detail=None)
+    assert already_gone == ContainerRemoveResult(ok=True, detail=None)
+    assert still_removing.ok is False
+
+
+async def test_remove_container_failure_detail_names_the_status_and_dockers_own_message(
+    docker_stub,
+):
+    stub, socket_path = docker_stub
+    stub.respond_with_json(
+        {"message": "removal of container already in progress"},
+        status_line="HTTP/1.1 409 Conflict",
+    )
+    engine = SocketDockerEngine(socket_path=socket_path)
+
+    result = await engine.remove_container("radarr")
+
+    assert result.ok is False
+    assert result.detail is not None
+    assert "409" in result.detail
+    assert "removal of container already in progress" in result.detail
+
+
+async def test_remove_container_reports_a_connection_error_as_not_ok(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    relative_name = "refusing.sock"
+    raw_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    raw_socket.bind(relative_name)
+    raw_socket.close()
+
+    engine = SocketDockerEngine(socket_path=tmp_path / relative_name)
+    result = await engine.remove_container("radarr")
+
+    assert result.ok is False
+    assert result.detail is not None
+
+
 # --- FakeDockerEngine -----------------------------------------------------
 
 
@@ -635,6 +701,7 @@ async def test_the_fake_satisfies_the_widened_protocol_and_records_its_calls() -
     await fake.logs("sonarr")
     await fake.compose_up("marrquee", Path("/tmp/compose.yaml"), "sonarr")
     await fake.self_container_id()
+    await fake.remove_container("sonarr")
 
     assert [name for name, _args in fake.calls] == [
         "status",
@@ -644,6 +711,7 @@ async def test_the_fake_satisfies_the_widened_protocol_and_records_its_calls() -
         "logs",
         "compose_up",
         "self_container_id",
+        "remove_container",
     ]
 
 
@@ -742,3 +810,48 @@ async def test_the_fakes_self_container_id_defaults_to_a_fixed_id() -> None:
     fake = FakeDockerEngine(DockerStatus(connected=True))
 
     assert await fake.self_container_id() == "fake-marrquee-container"
+
+
+# --- FakeDockerEngine.remove_container() -----------------------------------
+
+
+async def test_the_fake_forgets_a_removed_container() -> None:
+    """The regression this shape exists to catch: a fake that always
+    answers "yes" to a remove could never prove Cancel actually stopped
+    seeing the container it just removed.
+    """
+    radarr = ContainerSnapshot(
+        name="radarr", exists=True, state="running", exit_code=None, image=None, detail=None
+    )
+    fake = FakeDockerEngine(DockerStatus(connected=True), containers={"radarr": radarr})
+
+    result = await fake.remove_container("radarr")
+    snapshot = await fake.inspect("radarr")
+
+    assert result == ContainerRemoveResult(ok=True, detail=None)
+    assert snapshot.exists is False
+
+
+async def test_the_fake_defaults_remove_container_to_ok() -> None:
+    fake = FakeDockerEngine(DockerStatus(connected=True))
+
+    result = await fake.remove_container("radarr")
+
+    assert result.ok is True
+
+
+async def test_a_scripted_remove_failure_keeps_the_container_in_place() -> None:
+    radarr = ContainerSnapshot(
+        name="radarr", exists=True, state="running", exit_code=None, image=None, detail=None
+    )
+    fake = FakeDockerEngine(
+        DockerStatus(connected=True),
+        containers={"radarr": radarr},
+        remove_results={"radarr": False},
+    )
+
+    result = await fake.remove_container("radarr")
+    snapshot = await fake.inspect("radarr")
+
+    assert result.ok is False
+    assert snapshot.exists is True

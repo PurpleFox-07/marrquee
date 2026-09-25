@@ -18,16 +18,19 @@ import dataclasses
 import re
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
+from marrquee import questions as questions_module
 from marrquee import words
 from marrquee.config import Settings
-from marrquee.deploy import AppProgress, DeploySnapshot
+from marrquee.deploy import AppAdd, AppProgress, DeploySnapshot
 from marrquee.docker_client import DockerStatus, FakeDockerEngine
 from marrquee.health import FakeLinkProbe
 from marrquee.links import LinkCard, save_links
 from marrquee.main import create_app
-from marrquee.routes.api import HubStatusOut, HubTileOut, LinkTileOut
+from marrquee.questions import QuestionCheck, QuestionField, QuestionStep
+from marrquee.routes.api import HubInstallOut, HubStatusOut, HubTileOut, LinkTileOut
 from marrquee.state import STATE_VERSION, InstallState, save_state, write_json_atomic
 from marrquee.words import STATUS_CHIP_DONE
 
@@ -73,7 +76,7 @@ def test_the_script_names_only_fields_on_the_hub_output_models() -> None:
     script = _HUB_JS_PATH.read_text()
     arrays = _field_arrays(script)
 
-    assert arrays.keys() == {"STATUS_FIELDS", "APP_FIELDS", "LINK_FIELDS"}
+    assert arrays.keys() == {"STATUS_FIELDS", "APP_FIELDS", "LINK_FIELDS", "INSTALL_FIELDS"}
     # Every array is non-empty, so a regex that silently matched nothing
     # can't pass this test by accident.
     assert all(arrays.values())
@@ -81,6 +84,7 @@ def test_the_script_names_only_fields_on_the_hub_output_models() -> None:
     assert arrays["STATUS_FIELDS"] <= set(HubStatusOut.model_fields)
     assert arrays["APP_FIELDS"] <= set(HubTileOut.model_fields)
     assert arrays["LINK_FIELDS"] <= set(LinkTileOut.model_fields)
+    assert arrays["INSTALL_FIELDS"] <= set(HubInstallOut.model_fields)
 
 
 # --- FIRST TEST: every hook the panel script queries exists on the page ----
@@ -140,22 +144,66 @@ def _client(settings: Settings) -> TestClient:
     return TestClient(app)
 
 
-def test_every_hook_the_script_queries_exists_on_the_rendered_hub(tmp_path: Path) -> None:
+def test_every_hook_the_script_queries_exists_on_the_rendered_hub(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FIRST TEST - every `data-*` selector `hub.js` reads by querySelector
+    or getAttribute must exist on at least one real render: the edit pane
+    (with a saved link card), the install pane (with a fixture question
+    step registered, so the form/step/back/next/submit/refusal hooks the
+    install flow needs exist too) and a page with an app mid-add (for
+    `data-add-state`, which only ever appears on an adding tile).
+    """
+    fixture_step = QuestionStep(
+        app_id="radarr",
+        step_id="fixture",
+        title="Fixture step",
+        lede="A fixture question for tests.",
+        fields=(QuestionField(name="name", label="Name", kind="text"),),
+        check=lambda answers: QuestionCheck(ok=True, answers=answers, problem=None, field=None),
+    )
+    monkeypatch.setattr(questions_module, "QUESTION_STEPS", (fixture_step,))
+
     script = _HUB_JS_PATH.read_text()
     hooks = _data_hooks(script)
     assert hooks, "expected the script to read at least one data-* hook"
 
     settings = _settings(tmp_path)
-    save_state(settings.config_dir, _install_state(("sonarr",)))
-    _write_snapshot(settings, _finale_snapshot(("sonarr",)))
+    save_state(settings.config_dir, _install_state(("prowlarr", "sonarr")))
+    _write_snapshot(settings, _finale_snapshot(("prowlarr", "sonarr")))
     card = LinkCard(id="0" * 16, label="Router", url="http://192.168.1.1")
     save_links(settings.config_dir, [card])
     client = _client(settings)
 
-    page = client.get(f"/?panel=edit&link={card.id}")
+    edit_page = client.get(f"/?panel=edit&link={card.id}").text
+    install_page = client.get("/?panel=install").text
 
+    adding_settings = _settings(tmp_path / "adding")
+    save_state(adding_settings.config_dir, _install_state(("prowlarr", "sonarr")))
+    _write_snapshot(
+        adding_settings,
+        dataclasses.replace(
+            _finale_snapshot(("prowlarr", "sonarr")),
+            adding=AppAdd(
+                app_id="radarr",
+                purpose="add",
+                state="starting",
+                line="Starting Radarr",
+                note=None,
+                failure=None,
+                wiring=(),
+                compose_ran=False,
+                started_at="2026-09-24T00:00:00+00:00",
+            ),
+        ),
+    )
+    adding_page = _client(adding_settings).get("/").text
+
+    rendered = (edit_page, install_page, adding_page)
     for hook in hooks:
-        assert hook in page.text, f"{hook!r} is read by hub.js but never rendered on the page"
+        assert any(hook in page for page in rendered), (
+            f"{hook!r} is read by hub.js but never rendered on any page"
+        )
 
 
 def test_the_script_composes_no_hub_links_url() -> None:

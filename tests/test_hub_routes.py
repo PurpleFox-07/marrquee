@@ -14,24 +14,31 @@ which state, the root's own attributes) is read with the stdlib
 from __future__ import annotations
 
 import dataclasses
+import time
 from datetime import UTC, datetime, timedelta
 from html.parser import HTMLParser
 from pathlib import Path
 
+import pytest
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
+from jinja2 import Environment, FileSystemLoader
 
+from marrquee import questions as questions_module
 from marrquee import words
 from marrquee.catalog import apps_in_order
 from marrquee.config import Settings
-from marrquee.deploy import AppProgress, DeploySnapshot, Failure
+from marrquee.deploy import AppAdd, AppProgress, DeployManager, DeploySnapshot, Failure, WiringGap
 from marrquee.docker_client import ContainerSnapshot, DockerStatus, FakeDockerEngine
 from marrquee.health import FakeLinkProbe
 from marrquee.links import LINK_COUNT_MAX, LinkCard, load_links, save_links
 from marrquee.main import create_app
+from marrquee.questions import QuestionCheck, QuestionField, QuestionStep
 from marrquee.routes.wizard import router as wizard_router
-from marrquee.state import STATE_VERSION, InstallState, save_state, write_json_atomic
-from marrquee.words import STATUS_CHIP_DONE
+from marrquee.state import STATE_VERSION, InstallState, load_state, save_state, write_json_atomic
+from marrquee.words import STATUS_CHIP_DONE, app_line_done
+
+_TEMPLATES_DIR = Path(__file__).resolve().parents[1] / "src" / "marrquee" / "templates"
 
 # --- Shared fixtures and small builders --------------------------------------
 
@@ -83,6 +90,38 @@ def _finale_snapshot(app_ids: tuple[str, ...]) -> DeploySnapshot:
 
 def _write_snapshot(settings: Settings, snapshot: DeploySnapshot) -> None:
     write_json_atomic(settings.config_dir / "deploy.json", dataclasses.asdict(snapshot))
+
+
+def _finale_with_add(
+    app_ids: tuple[str, ...],
+    *,
+    adding: AppAdd | None = None,
+    wiring_gaps: tuple[WiringGap, ...] = (),
+) -> DeploySnapshot:
+    return dataclasses.replace(_finale_snapshot(app_ids), adding=adding, wiring_gaps=wiring_gaps)
+
+
+def _adding(
+    app_id: str = "radarr",
+    *,
+    purpose: str = "add",
+    state: str = "starting",
+    line: str = "Starting Radarr",
+    note: str | None = None,
+    failure: Failure | None = None,
+    compose_ran: bool = False,
+) -> AppAdd:
+    return AppAdd(
+        app_id=app_id,
+        purpose=purpose,  # type: ignore[arg-type]
+        state=state,  # type: ignore[arg-type]
+        line=line,
+        note=note,
+        failure=failure,
+        wiring=(),
+        compose_ran=compose_ran,
+        started_at="2026-09-24T00:00:00+00:00",
+    )
 
 
 def _client(
@@ -910,7 +949,6 @@ def test_install_pane_is_truthful(tmp_path: Path) -> None:
     all_done = all_done_client.get("/?panel=install")
 
     assert words.HUB_INSTALL_ALL_DONE in all_done.text
-    assert words.HUB_INSTALL_ARRIVING not in all_done.text
 
     partial_settings = _settings(tmp_path / "partial")
     save_state(partial_settings.config_dir, _install_state(("sonarr",)))
@@ -920,7 +958,6 @@ def test_install_pane_is_truthful(tmp_path: Path) -> None:
     partial = partial_client.get("/?panel=install")
 
     assert words.HUB_INSTALL_ALL_DONE not in partial.text
-    assert words.HUB_INSTALL_ARRIVING in partial.text
     assert "Prowlarr" in partial.text
     assert "Radarr" in partial.text
 
@@ -968,3 +1005,363 @@ def test_the_edit_pane_form_actions_target_the_cards_own_id(tmp_path: Path) -> N
     assert 'data-role="edit-url"' in response.text
     assert f'value="{card.label}"' in response.text
     assert f'value="{card.url}"' in response.text
+
+
+# --- Adding an app: the Hub keeps showing while one is in flight -------------
+
+
+def test_an_add_in_flight_keeps_the_hub_and_spotlights_one_tile(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("prowlarr", "sonarr")))
+    _write_snapshot(
+        settings,
+        _finale_with_add(("prowlarr", "sonarr"), adding=_adding(line="Starting Radarr")),
+    )
+    engine = FakeDockerEngine(
+        DockerStatus(connected=True, version="27.3.1"),
+        containers=_running_containers(("prowlarr", "sonarr")),
+    )
+    client = _client(settings, engine)
+
+    response = client.get("/", follow_redirects=False)
+
+    assert response.status_code == 200
+    assert _grid_order(response.text) == ["prowlarr", "sonarr", "radarr", "+"]
+    radarr = _posters(response.text)["radarr"]
+    assert radarr["data-state"] == "starting"
+    assert radarr.get("href") is None
+    assert f">{words.HUB_CHIP_ADDING}<" in response.text
+    assert "Starting Radarr" in response.text
+
+    status_payload = client.get("/api/hub/status").json()
+    radarr_status = next(app for app in status_payload["apps"] if app["app_id"] == "radarr")
+    assert radarr_status["add_state"] == "starting"
+    assert radarr_status["url"] is None
+
+
+def test_a_failed_add_tile_has_no_link_says_the_headline_and_advice_and_offers_retry(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    failure = Failure(
+        code="port_in_use",
+        headline="Radarr couldn't be added.",
+        what_to_do="Check your NAS's Docker app and try again.",
+        technical="boom",
+    )
+    _write_snapshot(
+        settings,
+        _finale_with_add(
+            ("sonarr",),
+            adding=_adding(state="error", line=words.app_line_error("Radarr"), failure=failure),
+        ),
+    )
+    client = _client(settings)
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    radarr = _posters(response.text)["radarr"]
+    assert radarr.get("href") is None
+    # Jinja autoescapes `'`, and both sentences carry one.
+    expected_line = "Radarr couldn't be added. Check your NAS's Docker app and try again."
+    assert expected_line.replace("'", "&#39;") in response.text
+
+    status_payload = client.get("/api/hub/status").json()
+    radarr_status = next(app for app in status_payload["apps"] if app["app_id"] == "radarr")
+    assert radarr_status["actions"] == "retry"
+
+
+def test_a_gap_tile_is_up_with_the_amber_note_and_connect_again(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    _write_snapshot(
+        settings,
+        _finale_with_add(
+            ("sonarr",),
+            wiring_gaps=(
+                WiringGap(app_id="sonarr", failed_lines=("Prowlarr wasn't told about Sonarr",)),
+            ),
+        ),
+    )
+    engine = FakeDockerEngine(
+        DockerStatus(connected=True, version="27.3.1"), containers=_running_containers(("sonarr",))
+    )
+    client = _client(settings, engine)
+
+    response = client.get("/")
+    status_payload = client.get("/api/hub/status").json()
+
+    assert response.status_code == 200
+    poster = _posters(response.text)["sonarr"]
+    assert poster["data-state"] == "up"
+    sonarr_status = next(app for app in status_payload["apps"] if app["app_id"] == "sonarr")
+    assert sonarr_status["actions"] == "reconnect"
+    assert sonarr_status["note"] == words.hub_wiring_gap_note(
+        "Sonarr", ("Prowlarr wasn't told about Sonarr",)
+    )
+
+
+def test_page_and_status_agree_on_the_adding_tiles_chip_line_and_add_state(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    _write_snapshot(settings, _finale_with_add(("sonarr",), adding=_adding(state="wiring")))
+    client = _client(settings)
+
+    page = client.get("/")
+    status = client.get("/api/hub/status").json()
+
+    radarr_status = next(app for app in status["apps"] if app["app_id"] == "radarr")
+    assert radarr_status["chip"] in page.text
+    assert radarr_status["line"] in page.text
+    assert radarr_status["add_state"] == "wiring"
+
+
+# --- Retry, cancel and reconnect: form posts that always 303 to / -----------
+
+
+def test_retry_cancel_and_reconnect_for_the_wrong_app_change_nothing_and_303(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    failure = Failure(code="port_in_use", headline="x", what_to_do="y", technical="z")
+    _write_snapshot(
+        settings,
+        _finale_with_add(
+            ("sonarr",), adding=_adding(app_id="radarr", state="error", failure=failure)
+        ),
+    )
+    client = _client(settings)
+    before = (settings.config_dir / "deploy.json").read_bytes()
+
+    retry_wrong = client.post("/hub/apps/sonarr/retry", follow_redirects=False)
+    cancel_wrong = client.post("/hub/apps/sonarr/cancel", follow_redirects=False)
+    reconnect_unknown = client.post("/hub/apps/not-a-real-app/reconnect", follow_redirects=False)
+
+    for response in (retry_wrong, cancel_wrong, reconnect_unknown):
+        assert response.status_code == 303
+        assert response.headers["location"] == "/"
+    assert (settings.config_dir / "deploy.json").read_bytes() == before
+
+
+def test_retry_re_runs_a_failed_add_from_scratch(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    failure = Failure(code="port_in_use", headline="x", what_to_do="y", technical="z")
+    _write_snapshot(
+        settings,
+        _finale_with_add(
+            ("sonarr",), adding=_adding(app_id="radarr", state="error", failure=failure)
+        ),
+    )
+    engine = FakeDockerEngine(DockerStatus(connected=True, version="27.3.1"))
+    manager = DeployManager(settings, engine)
+    app = create_app(settings=settings, engine=engine, manager=manager)
+    client = TestClient(app)
+
+    response = client.post("/hub/apps/radarr/retry", follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/"
+    # `retry_add` runs in the background - whatever it settles on, its own
+    # `started_at` (always "now") proves a genuinely new run replaced the
+    # stale one, rather than the wrong-app guard silently leaving it alone.
+    time.sleep(0.05)
+    adding = manager.snapshot().adding
+    assert adding is not None
+    assert adding.started_at != "2026-09-24T00:00:00+00:00"
+
+
+def test_cancel_removes_a_created_container_and_returns_the_app_to_the_install_list(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr", "radarr")))
+    failure = Failure(code="port_in_use", headline="x", what_to_do="y", technical="z")
+    _write_snapshot(
+        settings,
+        _finale_with_add(
+            ("sonarr",),
+            adding=_adding(app_id="radarr", state="error", failure=failure, compose_ran=True),
+        ),
+    )
+    engine = FakeDockerEngine(
+        DockerStatus(connected=True, version="27.3.1"),
+        containers=_running_containers(("radarr",)),
+    )
+    manager = DeployManager(settings, engine)
+    app = create_app(settings=settings, engine=engine, manager=manager)
+    client = TestClient(app)
+
+    response = client.post("/hub/apps/radarr/cancel", follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/"
+    assert manager.snapshot().adding is None
+    assert ("remove_container", ("radarr",)) in engine.calls
+    grown = load_state(settings.config_dir)
+    assert grown is not None
+    assert grown.app_ids == ("sonarr",)
+
+
+class _FormInsideAnchorCollector(HTMLParser):
+    """Fails the moment a `<form>` opens while an `<a>` is still open around
+    it - the one shape HTML forbids, and the one an adding/reconnecting
+    tile's Try again / Cancel / Connect again forms must never take.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.open_anchors = 0
+        self.nested_form = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "a":
+            self.open_anchors += 1
+        elif tag == "form" and self.open_anchors > 0:
+            self.nested_form = True
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "a" and self.open_anchors > 0:
+            self.open_anchors -= 1
+
+
+def test_action_forms_are_siblings_of_the_poster_link_never_inside_it(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    failure = Failure(code="port_in_use", headline="x", what_to_do="y", technical="z")
+    _write_snapshot(
+        settings, _finale_with_add(("sonarr",), adding=_adding(state="error", failure=failure))
+    )
+    client = _client(settings)
+
+    response = client.get("/")
+
+    assert 'class="hub-tile-actions"' in response.text
+    collector = _FormInsideAnchorCollector()
+    collector.feed(response.text)
+    assert not collector.nested_form
+
+
+class _InstallButtonCollector(HTMLParser):
+    """Collects every `<button data-install-app="...">`'s own attributes,
+    keyed by app id.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.buttons: dict[str, dict[str, str | None]] = {}
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attrs_dict = dict(attrs)
+        app_id = attrs_dict.get("data-install-app")
+        if tag == "button" and app_id is not None:
+            self.buttons[app_id] = attrs_dict
+
+
+class _InstallFormCollector(HTMLParser):
+    """Collects every `<form data-install-form="...">`'s own attributes,
+    keyed by app id.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.forms: dict[str, dict[str, str | None]] = {}
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attrs_dict = dict(attrs)
+        app_id = attrs_dict.get("data-install-form")
+        if tag == "form" and app_id is not None:
+            self.forms[app_id] = attrs_dict
+
+
+def test_no_js_install_pane_hides_every_control_and_shows_the_noscript_sentence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no JavaScript, nothing in the install pane is a dead control -
+    the "Add" button and its question form both render `hidden` (only
+    `hub.js` ever removes that), and the pane's own `<noscript>` says so
+    plainly instead.
+    """
+    fixture_step = QuestionStep(
+        app_id="radarr",
+        step_id="fixture",
+        title="Fixture step",
+        lede="A fixture question for tests.",
+        fields=(QuestionField(name="name", label="Name", kind="text"),),
+        check=lambda answers: QuestionCheck(ok=True, answers=answers, problem=None, field=None),
+    )
+    monkeypatch.setattr(questions_module, "QUESTION_STEPS", (fixture_step,))
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("prowlarr", "sonarr")))
+    _write_snapshot(settings, _finale_snapshot(("prowlarr", "sonarr")))
+    client = _client(settings)
+
+    response = client.get("/?panel=install")
+
+    buttons = _InstallButtonCollector()
+    buttons.feed(response.text)
+    assert "hidden" in buttons.buttons["radarr"]
+
+    forms = _InstallFormCollector()
+    forms.feed(response.text)
+    assert "hidden" in forms.forms["radarr"]
+
+    assert "<noscript>" in response.text
+    assert words.HUB_INSTALL_NEEDS_JS.replace("'", "&#39;") in response.text
+
+
+def _render_question_step(
+    step: QuestionStep,
+    *,
+    answers: dict[str, str] | None = None,
+    problem: str | None = None,
+    problem_field: str | None = None,
+) -> str:
+    env = Environment(loader=FileSystemLoader(str(_TEMPLATES_DIR)), autoescape=True)
+    template = env.get_template("partials/app_questions.html")
+    return template.render(
+        step=step, answers=answers or {}, problem=problem, problem_field=problem_field
+    )
+
+
+def test_a_password_field_never_carries_a_value_attribute_even_with_a_saved_answer() -> None:
+    step = QuestionStep(
+        app_id="radarr",
+        step_id="fixture",
+        title="Fixture step",
+        lede="l",
+        fields=(QuestionField(name="token", label="Token", kind="password"),),
+        check=lambda answers: QuestionCheck(ok=True, answers=answers, problem=None, field=None),
+    )
+
+    html = _render_question_step(step, answers={"token": "super-secret-value"})
+
+    assert "value=" not in html
+    assert "super-secret-value" not in html
+    assert 'type="password"' in html
+
+
+def test_reconnect_re_runs_wiring_for_an_installed_app(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    _write_snapshot(settings, _finale_snapshot(("sonarr",)))
+    engine = FakeDockerEngine(DockerStatus(connected=True, version="27.3.1"))
+    manager = DeployManager(settings, engine)
+    app = create_app(settings=settings, engine=engine, manager=manager)
+    client = TestClient(app)
+
+    response = client.post("/hub/apps/sonarr/reconnect", follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/"
+    # `NoWiringYet` (the default runner) finishes with no real wait, so the
+    # reconnect may already be done by the time this checks - either way,
+    # sonarr's own line is rebuilt from scratch only by a reconnect actually
+    # completing, never by the wrong-app guard leaving it untouched.
+    time.sleep(0.05)
+    final = manager.snapshot()
+    assert final.adding is None
+    assert final.apps[0].line == app_line_done("Sonarr")

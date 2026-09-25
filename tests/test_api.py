@@ -16,8 +16,11 @@ import os
 import time
 from pathlib import Path, PurePosixPath
 
+import pytest
 from fastapi.testclient import TestClient
+from test_deploy import _run_to_terminal, _StatefulEngine
 
+import marrquee.questions as questions_module
 from marrquee.catalog import get_app
 from marrquee.config import Settings
 from marrquee.deploy import (
@@ -33,12 +36,20 @@ from marrquee.docker_client import (
     FakeDockerEngine,
 )
 from marrquee.main import create_app
+from marrquee.questions import QuestionCheck, QuestionField, QuestionStep, load_answers
 from marrquee.routes.api import _event_stream
 from marrquee.state import InstallState, load_state, save_state, write_json_atomic
 from marrquee.storage import write_marker
 from marrquee.wiring import NoWiringYet, WiringStep
 from marrquee.wiring.engine import WiringEngine
-from marrquee.words import PHASE_HEADLINE_READY, REFUSAL_NOTHING_CHOSEN, STORAGE_CHECK_OK_MESSAGE
+from marrquee.words import (
+    HUB_INSTALL_UNKNOWN,
+    HUB_SETUP_DONE_REFUSAL,
+    PHASE_HEADLINE_READY,
+    REFUSAL_NOTHING_CHOSEN,
+    STORAGE_CHECK_OK_MESSAGE,
+    hub_install_busy,
+)
 
 # --- Shared fixtures and small builders --------------------------------------
 
@@ -207,6 +218,126 @@ def test_install_refuses_an_unknown_app_id_with_400(tmp_path: Path) -> None:
     response = client.post("/api/install", json={"path": str(root), "app_ids": ["plex"]})
 
     assert response.status_code == 400
+
+
+def test_install_refuses_once_the_hub_exists_and_changes_nothing(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+    finished = DeploySnapshot(
+        run_id="run-1",
+        phase="finale",
+        apps=(),
+        headline="Now showing",
+        detail=None,
+        failure=None,
+        started_at="2026-09-19T00:00:00+00:00",
+        finished_at="2026-09-19T00:05:00+00:00",
+        wiring=(),
+    )
+    write_json_atomic(settings.config_dir / "deploy.json", dataclasses.asdict(finished))
+    client = _client(settings, _idle_manager(settings))
+
+    response = client.post("/api/install", json={"path": str(root), "app_ids": ["sonarr"]})
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == HUB_SETUP_DONE_REFUSAL
+    assert load_state(settings.config_dir) is None
+
+
+# --- Installing an app from the Hub's "+" panel --------------------------------
+
+
+async def test_hub_install_endpoint_starts_an_add_and_refuses_a_second(tmp_path: Path) -> None:
+    """FIRST TEST (Pre-Flight walk) - a real add, driven through the live
+    app, refuses a second POST for the same app while the first is still
+    going. Radarr's own readiness never answers, so the add stays parked
+    mid-flight (or, once it eventually times out, still `adding`) instead
+    of racing a fast fake add to "already_installed" before the second
+    request lands.
+    """
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+    save_state(settings.config_dir, _install_state(("prowlarr", "sonarr"), root))
+
+    engine = _StatefulEngine(
+        ("prowlarr", "sonarr"),
+        images={get_app(app_id).image for app_id in ("prowlarr", "sonarr", "radarr")},
+    )
+    radarr = get_app("radarr")
+    probe = FakeReadinessProbe(responses={(radarr.id, radarr.port): [False] * 1000}, default=True)
+    manager = DeployManager(settings, engine, probe=probe)
+    manager.start()
+    await _run_to_terminal(manager)
+    assert manager.snapshot().phase == "finale"
+
+    app = create_app(settings=settings, engine=engine, manager=manager)
+    with TestClient(app) as client:
+        first = client.post("/api/hub/apps/radarr/install", json={"answers": {}})
+        assert first.status_code == 202
+        assert first.json() == {"ok": True, "message": None, "step_id": None, "field": None}
+
+        second = client.post("/api/hub/apps/radarr/install", json={"answers": {}})
+
+    assert second.status_code == 409
+    assert second.json()["message"] == hub_install_busy("Radarr")
+
+
+def test_hub_install_endpoint_refuses_an_unknown_app_with_409(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    client = _client(settings, _idle_manager(settings))
+
+    response = client.post("/api/hub/apps/not-a-real-app/install", json={"answers": {}})
+
+    assert response.status_code == 409
+    assert response.json()["message"] == HUB_INSTALL_UNKNOWN
+
+
+async def test_hub_install_fixture_step_refuses_with_400_and_saves_only_after_a_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture_step = QuestionStep(
+        app_id="radarr",
+        step_id="fixture",
+        title="Fixture",
+        lede="A fixture step.",
+        fields=(QuestionField(name="name", label="Name", kind="text"),),
+        check=lambda answers: QuestionCheck(
+            ok=bool(answers.get("name")),
+            answers=answers,
+            problem=None if answers.get("name") else "Name is required.",
+            field=None if answers.get("name") else "name",
+        ),
+    )
+    monkeypatch.setattr(questions_module, "QUESTION_STEPS", (fixture_step,))
+
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+    save_state(settings.config_dir, _install_state(("prowlarr", "sonarr"), root))
+    engine = _StatefulEngine(
+        ("prowlarr", "sonarr"),
+        images={get_app(app_id).image for app_id in ("prowlarr", "sonarr", "radarr")},
+    )
+    manager = DeployManager(settings, engine, probe=FakeReadinessProbe(default=True))
+    manager.start()
+    await _run_to_terminal(manager)
+    assert manager.snapshot().phase == "finale"
+
+    app = create_app(settings=settings, engine=engine, manager=manager)
+    with TestClient(app) as client:
+        refused = client.post("/api/hub/apps/radarr/install", json={"answers": {"name": ""}})
+        assert refused.status_code == 400
+        body = refused.json()
+        assert body["ok"] is False
+        assert body["step_id"] == "fixture"
+        assert body["field"] == "name"
+        assert load_answers(settings.config_dir) == {}
+
+        accepted = client.post(
+            "/api/hub/apps/radarr/install", json={"answers": {"name": "Interesting"}}
+        )
+        assert accepted.status_code == 202
+
+    assert load_answers(settings.config_dir)["radarr"]["name"] == "Interesting"
 
 
 # --- The storage check --------------------------------------------------------
@@ -569,7 +700,7 @@ class _PausingWiringRunner:
     polling `GET /api/deploy` over the wire can observe it), then finishes.
     """
 
-    async def run(self, state: InstallState, emit: object) -> None:
+    async def run(self, state: InstallState, emit: object, *, only_app: str | None = None) -> None:
         step = WiringStep(
             index=1,
             total=1,

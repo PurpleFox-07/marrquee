@@ -160,8 +160,14 @@ class _DemoWiringRunner:
         self._scene = scene
         self._sleep = sleep
 
-    async def run(self, state: InstallState, emit: Callable[[WiringStep], None]) -> None:
-        tasks = plan_wiring(state)
+    async def run(
+        self,
+        state: InstallState,
+        emit: Callable[[WiringStep], None],
+        *,
+        only_app: str | None = None,
+    ) -> None:
+        tasks = plan_wiring(state, only_app=only_app)
         total = len(tasks)
         for position, task in enumerate(tasks, start=1):
             emit(

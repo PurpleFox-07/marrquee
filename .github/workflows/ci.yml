@@ -236,7 +236,7 @@ jobs:
   # job's `needs:` either. A red run here is loud (this job still fails, and
   # the whole workflow shows red) but it never holds back `:latest`.
   stack-smoke:
-    name: Real-Docker stack smoke (three arr apps, real deploy)
+    name: Real-Docker stack smoke (two arr apps, then add one from the Hub)
     needs: test
     runs-on: ubuntu-latest
     steps:
@@ -290,12 +290,15 @@ jobs:
 
       # The API only ever sees a HOST path - Marrquee translates it to
       # `<host_mount>/<that path>` internally, and the generated compose
-      # file carries this exact host path back out again.
-      - name: Install all three apps against the runner's own temp folder
+      # file carries this exact host path back out again. Radarr is
+      # deliberately left out of this first install - this job's whole
+      # point is proving it arrives later, through the Hub's own add
+      # endpoint, onto a stack that is already running.
+      - name: Install two apps against the runner's own temp folder
         run: |
           curl -fsS -X POST http://127.0.0.1:7788/api/install \
             -H "Content-Type: application/json" \
-            -d "{\"path\":\"${RUNNER_TEMP}/marrquee-smoke/media\",\"app_ids\":[\"prowlarr\",\"sonarr\",\"radarr\"]}"
+            -d "{\"path\":\"${RUNNER_TEMP}/marrquee-smoke/media\",\"app_ids\":[\"prowlarr\",\"sonarr\"]}"
 
       - name: Start the deploy
         run: curl -fsS -X POST http://127.0.0.1:7788/api/deploy
@@ -329,6 +332,71 @@ jobs:
           done
           echo "::error::the deploy never reached finale in time"
           exit 1
+
+      # A real daemon is the only way to prove `compose up -d --no-recreate
+      # <service>` leaves an already-running container's identity alone.
+      # Recorded now, before Radarr ever exists, so the add can be judged
+      # against a real baseline instead of an assumption.
+      - name: Record Prowlarr and Sonarr's container id and start time before the add
+        run: |
+          prowlarr_before=$(docker inspect -f '{{.Id}} {{.State.StartedAt}}' prowlarr)
+          sonarr_before=$(docker inspect -f '{{.Id}} {{.State.StartedAt}}' sonarr)
+          echo "prowlarr before: $prowlarr_before"
+          echo "sonarr before: $sonarr_before"
+          echo "PROWLARR_BEFORE=$prowlarr_before" >> "$GITHUB_ENV"
+          echo "SONARR_BEFORE=$sonarr_before" >> "$GITHUB_ENV"
+
+      # Adds one app to an already-running stack through the Hub's own
+      # endpoint, never a second full deploy.
+      - name: Add Radarr to the running stack through the Hub's install endpoint
+        run: |
+          response=$(curl -s -w '\n%{http_code}' -X POST \
+            http://127.0.0.1:7788/api/hub/apps/radarr/install \
+            -H "Content-Type: application/json" \
+            -d '{"answers":{}}')
+          code=$(echo "$response" | tail -n1)
+          body=$(echo "$response" | sed '$d')
+          echo "hub install response (${code}): ${body}"
+          if [ "$code" != "202" ]; then
+            echo "::error::POST /api/hub/apps/radarr/install returned ${code}, expected 202: ${body}"
+            exit 1
+          fi
+
+      - name: Poll GET /api/hub/status until Radarr finishes adding (5 minute budget)
+        run: |
+          for _ in $(seq 1 150); do
+            status=$(curl -fsS http://127.0.0.1:7788/api/hub/status)
+            radarr=$(echo "$status" | jq -c '.apps[] | select(.app_id == "radarr")')
+            state=$(echo "$radarr" | jq -r '.state')
+            add_state=$(echo "$radarr" | jq -r '.add_state')
+            busy=$(echo "$status" | jq -r '.busy')
+            line=$(echo "$radarr" | jq -r '.line')
+            echo "radarr state: $state / add_state: $add_state / busy: $busy"
+            if [ "$add_state" = "error" ]; then
+              MESSAGE="adding Radarr failed: ${line}" \
+                python3 -c "import os; text = os.environ['MESSAGE'].replace('%', '%25').replace(chr(13), '%0D').replace(chr(10), '%0A').replace('::', ': :'); print('::error::' + text)"
+              exit 1
+            fi
+            if [ "$state" = "up" ] && [ "$add_state" = "null" ] && [ "$busy" = "false" ]; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::Radarr never finished adding to the running stack within 5 minutes"
+          exit 1
+
+      # The recreate check itself: adding Radarr must never recreate a
+      # container that was already running.
+      - name: Assert Prowlarr and Sonarr were not recreated by adding Radarr
+        run: |
+          prowlarr_after=$(docker inspect -f '{{.Id}} {{.State.StartedAt}}' prowlarr)
+          sonarr_after=$(docker inspect -f '{{.Id}} {{.State.StartedAt}}' sonarr)
+          echo "prowlarr after: $prowlarr_after"
+          echo "sonarr after: $sonarr_after"
+          if [ "$prowlarr_after" != "$PROWLARR_BEFORE" ] || [ "$sonarr_after" != "$SONARR_BEFORE" ]; then
+            echo "::error::Prowlarr or Sonarr was recreated by adding Radarr"
+            exit 1
+          fi
 
       - name: Assert all three containers are running
         run: |

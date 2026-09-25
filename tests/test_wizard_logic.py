@@ -11,7 +11,11 @@ from __future__ import annotations
 from pathlib import PurePosixPath
 from typing import get_args
 
+import pytest
+
+import marrquee.questions as questions_module
 from marrquee import catalog, wizard, words
+from marrquee.questions import QuestionCheck, QuestionStep
 from marrquee.storage import FreshnessCheck, StorageCheck, StorageCheckReason
 
 _STORAGE_CHECK_REASONS = get_args(StorageCheckReason)
@@ -82,6 +86,59 @@ def test_wizard_steps_are_numbered_one_through_three_in_order() -> None:
         words.WIZARD_STEP_DRIVE,
         words.WIZARD_STEP_DEPLOY,
     ]
+
+
+# --- wizard_steps / step_number: today's three pills, plus a growing row ----
+
+
+def test_wizard_steps_matches_the_three_fixed_pills_when_nothing_is_registered() -> None:
+    every_subset = (
+        (),
+        ("prowlarr",),
+        ("prowlarr", "sonarr"),
+        tuple(app.id for app in catalog.CATALOG),
+    )
+    for app_ids in every_subset:
+        steps = wizard.wizard_steps(app_ids)
+        assert [(step.number, step.label, step.key) for step in steps] == [
+            (1, words.WIZARD_STEP_APPS, "apps"),
+            (2, words.WIZARD_STEP_DRIVE, "drive"),
+            (3, words.WIZARD_STEP_DEPLOY, "deploy"),
+        ]
+    assert wizard.WIZARD_STEPS == wizard.wizard_steps(())
+
+
+def test_wizard_steps_inserts_a_ticked_apps_question_step_between_apps_and_drive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture_step = QuestionStep(
+        app_id="radarr",
+        step_id="fixture",
+        title="Fixture questions",
+        lede="A fixture step for the test.",
+        fields=(),
+        check=lambda answers: QuestionCheck(ok=True, answers=answers, problem=None, field=None),
+    )
+    monkeypatch.setattr(questions_module, "QUESTION_STEPS", (fixture_step,))
+
+    steps = wizard.wizard_steps(("prowlarr", "radarr"))
+
+    assert [(step.number, step.label, step.key) for step in steps] == [
+        (1, words.WIZARD_STEP_APPS, "apps"),
+        (2, "Fixture questions", "q:radarr:fixture"),
+        (3, words.WIZARD_STEP_DRIVE, "drive"),
+        (4, words.WIZARD_STEP_DEPLOY, "deploy"),
+    ]
+
+
+def test_step_number_finds_the_matching_pill_and_raises_for_an_unknown_key() -> None:
+    steps = wizard.wizard_steps(())
+
+    assert wizard.step_number(steps, "apps") == 1
+    assert wizard.step_number(steps, "drive") == 2
+    assert wizard.step_number(steps, "deploy") == 3
+    with pytest.raises(KeyError):
+        wizard.step_number(steps, "not-a-real-key")
 
 
 # --- free_space_words --------------------------------------------------------

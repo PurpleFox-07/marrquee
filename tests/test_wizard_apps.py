@@ -9,6 +9,7 @@ checked) - a regex is fine for plain substring checks (words, css ordering).
 
 from __future__ import annotations
 
+import dataclasses
 import html
 import re
 from html.parser import HTMLParser
@@ -18,11 +19,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 from marrquee import words
-from marrquee.catalog import CATALOG
+from marrquee.catalog import CATALOG, AppRule
 from marrquee.config import Settings
+from marrquee.deploy import AppProgress, DeploySnapshot
 from marrquee.docker_client import DockerStatus, FakeDockerEngine
 from marrquee.main import create_app
-from marrquee.state import STATE_VERSION, InstallState, save_state
+from marrquee.state import STATE_VERSION, InstallState, save_state, write_json_atomic
 
 _WIZARD_CSS_PATH = (
     Path(__file__).resolve().parents[1] / "src" / "marrquee" / "static" / "css" / "wizard.css"
@@ -63,6 +65,34 @@ def _client(settings: Settings, status: DockerStatus | None = None) -> TestClien
         status = DockerStatus(connected=True, version="27.3.1")
     app = create_app(settings=settings, engine=FakeDockerEngine(status))
     return TestClient(app)
+
+
+def _write_finale_deploy(settings: Settings) -> None:
+    """Persist a `deploy.json` already at `finale` - the shape every
+    `/setup/...` guard test needs to prove the Hub is home.
+    """
+    snapshot = DeploySnapshot(
+        run_id="run-1",
+        phase="finale",
+        apps=(
+            AppProgress(
+                app_id="prowlarr",
+                name="Prowlarr",
+                state="done",
+                chip="Ready",
+                line="Prowlarr is ready",
+                note=None,
+                port=9696,
+            ),
+        ),
+        headline="Now showing: your media server",
+        detail=None,
+        failure=None,
+        started_at="2026-09-19T00:00:00+00:00",
+        finished_at="2026-09-19T00:05:00+00:00",
+        wiring=(),
+    )
+    write_json_atomic(settings.config_dir / "deploy.json", dataclasses.asdict(snapshot))
 
 
 def _install_state(*, app_ids: tuple[str, ...]) -> InstallState:
@@ -257,3 +287,52 @@ def test_wizard_css_has_no_min_width_above_343px() -> None:
 
     widths = [int(match) for match in re.findall(r"min-width:\s*(\d+)px", css)]
     assert all(width <= 343 for width in widths)
+
+
+# --- An unavailable combination is refused, not silently accepted -----------
+
+
+def test_posting_an_unavailable_combination_is_refused_with_its_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reason = "needs a search source first"
+    rule = AppRule(kind="needs_any", app_ids=("a-search-source-nothing-ticks",), reason=reason)
+    radarr = next(app for app in CATALOG if app.id == "radarr")
+    patched_radarr = dataclasses.replace(radarr, rules=(rule,))
+    patched_catalog = tuple(patched_radarr if app.id == "radarr" else app for app in CATALOG)
+    monkeypatch.setattr("marrquee.catalog.CATALOG", patched_catalog)
+    client = _client(_settings(tmp_path))
+
+    response = client.post(
+        "/setup/apps", data={"apps": ["prowlarr", "radarr"]}, follow_redirects=False
+    )
+
+    assert response.status_code == 200
+    assert words.wizard_app_unavailable("Radarr", reason) in html.unescape(response.text)
+
+
+def test_an_available_combination_is_never_refused(tmp_path: Path) -> None:
+    client = _client(_settings(tmp_path))
+
+    response = client.post(
+        "/setup/apps", data={"apps": ["prowlarr", "radarr"]}, follow_redirects=False
+    )
+
+    assert response.status_code == 303
+
+
+# --- Setup closes once the Hub exists ---------------------------------------
+
+
+def test_setup_apps_redirects_home_once_the_hub_exists(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    _write_finale_deploy(settings)
+    client = _client(settings)
+
+    get_response = client.get("/setup/apps", follow_redirects=False)
+    post_response = client.post("/setup/apps", data={"apps": ["radarr"]}, follow_redirects=False)
+
+    assert get_response.status_code == 303
+    assert get_response.headers["location"] == "/"
+    assert post_response.status_code == 303
+    assert post_response.headers["location"] == "/"

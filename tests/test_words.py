@@ -188,7 +188,6 @@ _EXPECTED_INVENTORY = (
     "HUB_PANEL_CHOOSE_LINK_TITLE",
     "HUB_PANEL_CHOOSE_LINK_ONE_LINER",
     "HUB_INSTALL_ALL_DONE",
-    "HUB_INSTALL_ARRIVING",
     "HUB_LINK_LABEL_FIELD",
     "HUB_LINK_LABEL_HINT",
     "HUB_LINK_URL_FIELD",
@@ -199,6 +198,30 @@ _EXPECTED_INVENTORY = (
     "HUB_LINK_REMOVE_NOTE",
     "HUB_LINK_EDIT_LABEL",
     "hub_link_edit_aria",
+    "HUB_INSTALL_LEDE",
+    "HUB_INSTALL_NEEDS_JS",
+    "hub_install_button",
+    "hub_install_unavailable",
+    "hub_install_busy",
+    "hub_install_resolve_first",
+    "HUB_INSTALL_ALREADY",
+    "HUB_INSTALL_NOT_READY",
+    "HUB_INSTALL_UNKNOWN",
+    "HUB_CHIP_ADDING",
+    "HUB_CHIP_ADD_FAILED",
+    "hub_line_connecting",
+    "HUB_TRY_AGAIN",
+    "HUB_CANCEL_ADD",
+    "HUB_CONNECT_AGAIN",
+    "hub_wiring_gap_note",
+    "hub_cancel_failed",
+    "hub_announce_adding",
+    "hub_announce_add_failed",
+    "QUESTION_PICK_ONE",
+    "QUESTIONS_NEXT",
+    "QUESTIONS_BACK",
+    "wizard_app_unavailable",
+    "HUB_SETUP_DONE_REFUSAL",
 )
 
 _DEPLOY_ENGINE_WORD_COUNT = 40
@@ -206,6 +229,8 @@ _WIZARD_WORD_COUNT = 35
 _WIRING_WORD_COUNT = 17
 _DEPLOY_SCREEN_WORD_COUNT = 28
 _HUB_WORD_COUNT = 26
+_HUB_LINK_WORD_COUNT = 31
+_HUB_INSTALL_WORD_COUNT = 24
 
 
 def test_words_inventory_is_pinned() -> None:
@@ -375,8 +400,8 @@ def test_the_hub_names_are_the_last_section() -> None:
 
 
 def test_the_hub_links_section_is_last() -> None:
-    """Hub: your own links is the newest section, so its slice is
-    open-ended - later chunks in this story append more names to it.
+    """Hub: your own links precedes Hub: install an app now, so its slice is
+    closed - the install section is the newest and comes after it.
     """
     hub_end = (
         _DEPLOY_ENGINE_WORD_COUNT
@@ -385,13 +410,36 @@ def test_the_hub_links_section_is_last() -> None:
         + _DEPLOY_SCREEN_WORD_COUNT
         + _HUB_WORD_COUNT
     )
+    link_end = hub_end + _HUB_LINK_WORD_COUNT
 
-    link_names = words.WORDS_INVENTORY[hub_end:]
+    link_names = words.WORDS_INVENTORY[hub_end:link_end]
 
-    assert link_names == _EXPECTED_INVENTORY[hub_end:]
+    assert link_names == _EXPECTED_INVENTORY[hub_end:link_end]
     assert link_names[0] == "LINK_PROBLEM_LABEL_MISSING"
     assert link_names[-1] == "hub_link_edit_aria"
     assert "HUB_TITLE" not in link_names
+    assert "HUB_INSTALL_LEDE" not in link_names
+
+
+def test_the_hub_install_section_is_last() -> None:
+    """Hub: install an app is the newest section, so its slice is
+    open-ended - later chunks in this story append more names to it.
+    """
+    install_start = (
+        _DEPLOY_ENGINE_WORD_COUNT
+        + _WIZARD_WORD_COUNT
+        + _WIRING_WORD_COUNT
+        + _DEPLOY_SCREEN_WORD_COUNT
+        + _HUB_WORD_COUNT
+        + _HUB_LINK_WORD_COUNT
+    )
+
+    install_names = words.WORDS_INVENTORY[install_start:]
+
+    assert install_names == _EXPECTED_INVENTORY[install_start:]
+    assert install_names[0] == "HUB_INSTALL_LEDE"
+    assert install_names[-1] == "HUB_SETUP_DONE_REFUSAL"
+    assert "HUB_LINK_LABEL_FIELD" not in install_names
 
 
 def test_wizard_headline_tuples_carry_the_gradient_word_in_the_middle() -> None:
@@ -792,7 +840,6 @@ def test_the_panels_two_choices_are_install_and_link() -> None:
 
 def test_the_install_pane_has_two_truthful_states() -> None:
     assert words.HUB_INSTALL_ALL_DONE == "Everything Marrquee offers is already installed."
-    assert "next Marrquee update" in words.HUB_INSTALL_ARRIVING
 
 
 def test_removing_a_link_uninstalls_nothing() -> None:
@@ -804,3 +851,75 @@ def test_removing_a_link_uninstalls_nothing() -> None:
 
 def test_hub_link_edit_aria_names_the_card() -> None:
     assert words.hub_link_edit_aria("Router") == "Edit Router"
+
+
+def test_hub_install_button_and_unavailable_words_name_the_app_and_reason() -> None:
+    assert words.hub_install_button("Radarr") == "Add Radarr"
+    unavailable = words.hub_install_unavailable("needs a search source")
+    assert unavailable == "Not available yet - needs a search source"
+
+
+def test_hub_install_busy_and_resolve_first_name_the_in_flight_app() -> None:
+    assert "Radarr" in words.hub_install_busy("Radarr")
+    assert "Radarr" in words.hub_install_resolve_first("Radarr")
+
+
+def test_hub_install_refusal_words_are_distinct() -> None:
+    refusals = {
+        words.HUB_INSTALL_ALREADY,
+        words.HUB_INSTALL_NOT_READY,
+        words.HUB_INSTALL_UNKNOWN,
+    }
+    assert len(refusals) == 3
+
+
+def test_hub_chip_adding_and_add_failed_are_distinct_from_the_health_chips() -> None:
+    assert words.HUB_CHIP_ADDING == "Adding…"
+    assert words.HUB_CHIP_ADD_FAILED == "Didn't install"
+    assert words.HUB_CHIP_ADDING not in (
+        words.HUB_CHIP_UP,
+        words.HUB_CHIP_STARTING,
+        words.HUB_CHIP_DOWN,
+        words.HUB_CHIP_UNKNOWN,
+    )
+
+
+def test_hub_line_connecting_names_the_app() -> None:
+    assert words.hub_line_connecting("Radarr") == "Connecting Radarr to your other apps…"
+
+
+def test_hub_wiring_gap_note_names_every_failed_line_and_the_app() -> None:
+    one = words.hub_wiring_gap_note("Radarr", ("Introducing Prowlarr to Radarr",))
+    assert one == "Radarr is up, but one connection didn't finish: Introducing Prowlarr to Radarr."
+
+    two = words.hub_wiring_gap_note(
+        "Radarr", ("Introducing Prowlarr to Radarr", "Telling Radarr where your movies live")
+    )
+    assert "Introducing Prowlarr to Radarr" in two
+    assert "Telling Radarr where your movies live" in two
+    assert "Radarr is up, but these connections didn't finish" in two
+
+
+def test_hub_cancel_failed_and_announce_words_name_the_app() -> None:
+    assert "Radarr" in words.hub_cancel_failed("Radarr")
+    assert words.hub_announce_adding("Radarr") == "Adding Radarr."
+    assert words.hub_announce_add_failed("Radarr") == "Radarr didn't install."
+
+
+def test_question_words_are_short_button_labels() -> None:
+    assert words.QUESTION_PICK_ONE == "Pick one of the options."
+    assert words.QUESTIONS_NEXT == "Next"
+    assert words.QUESTIONS_BACK == "Back"
+
+
+def test_wizard_app_unavailable_names_the_app_and_reason() -> None:
+    message = words.wizard_app_unavailable("Seerr", "you already have a media server")
+
+    assert "Seerr" in message
+    assert "you already have a media server" in message
+
+
+def test_hub_setup_done_refusal_points_at_the_hub() -> None:
+    assert words.HUB_SETUP_DONE_REFUSAL == (
+        "Marrquee is already set up. Add more apps from the + on your Hub."
+    )
