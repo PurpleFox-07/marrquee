@@ -99,6 +99,17 @@ def test_status_fields_include_login_banner() -> None:
     assert "login_banner" in arrays["STATUS_FIELDS"]
 
 
+def test_status_fields_include_running_without_vpn() -> None:
+    """The badge appearing or disappearing is its own shape change - without
+    `running_without_vpn` in `STATUS_FIELDS`, the reload guard could never
+    see a move start or finish.
+    """
+    script = _HUB_JS_PATH.read_text()
+    arrays = _field_arrays(script)
+
+    assert "running_without_vpn" in arrays["STATUS_FIELDS"]
+
+
 def test_app_fields_include_paused() -> None:
     """A paused downloader tile has to repaint on every poll - without
     `paused` in `APP_FIELDS`, `paintTile` would never see the field it sets
@@ -125,12 +136,19 @@ def test_the_reload_guard_signature_folds_in_the_login_banner() -> None:
     assert re.search(r"return\s+actions\b.*loginBanner", body, re.DOTALL), (
         "structureSignature must combine both actions and loginBanner in its return value"
     )
+    # A third argument folds in the badge's own shape (running without a
+    # VPN) - a version that dropped back to the two-argument form would
+    # still combine actions and loginBanner fine, but a move starting or
+    # finishing would never trigger the reload that repaints the badge.
+    assert re.search(r"return\s+actions\b.*loginBanner.*runningWithoutVpn", body, re.DOTALL), (
+        "structureSignature must also combine runningWithoutVpn in its return value"
+    )
 
     # And the reload guard must actually call it with the *incoming* login
     # banner (the payload's) on one side and the *page's own* current one
     # (`data-login-banner`, via `root.dataset.loginBanner`) on the other -
     # comparing two signatures built from the same side would never detect
-    # a change at all.
+    # a change at all. Same for the badge's own field.
     guard_match = re.search(
         r"function reloadIfStructureChanged\([^)]*\)\s*\{.*?\n  \}", script, re.DOTALL
     )
@@ -138,6 +156,8 @@ def test_the_reload_guard_signature_folds_in_the_login_banner() -> None:
     guard_body = guard_match.group(0)
     assert "payload.login_banner" in guard_body
     assert "root.dataset.loginBanner" in guard_body
+    assert "payload.running_without_vpn" in guard_body
+    assert "root.dataset.runningWithoutVpn" in guard_body
 
 
 # --- FIRST TEST: every hook the panel script queries exists on the page ----

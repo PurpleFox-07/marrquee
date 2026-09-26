@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Request
@@ -46,6 +47,7 @@ from marrquee.questions import (
 )
 from marrquee.state import load_state
 from marrquee.storage import shared_roots
+from marrquee.without_vpn import clear_without_vpn, next_stage, save_without_vpn
 from marrquee.wizard import (
     DEFAULT_APP_IDS,
     TIMEZONE_ALIASES,
@@ -162,6 +164,12 @@ def _first_unavailable_ticked_app(selected: tuple[str, ...]) -> str | None:
 async def post_setup_apps(request: Request) -> Response:
     if _hub_exists(request):
         return RedirectResponse("/", status_code=303)
+    settings: Settings = request.app.state.settings
+    # A confirmation saved on an earlier try must never outlive the choice
+    # of apps it was given for - cleared on EVERY submission, before the
+    # ticked apps are even read, so a stale file can't silently skip the
+    # VPN question for a fresh app list that includes qBittorrent again.
+    clear_without_vpn(settings.config_dir)
     templates: Jinja2Templates = request.app.state.templates
     form = await request.form()
     submitted = [value for value in form.getlist("apps") if isinstance(value, str)]
@@ -179,7 +187,7 @@ async def post_setup_apps(request: Request) -> Response:
     # already sees it as part of the choice.
     companions: list[str] = []
     for app_id in ticked:
-        for companion_id in companions_for(app_id, ticked):
+        for companion_id in companions_for(app_id, ticked, without_vpn=False):
             if companion_id not in ticked and companion_id not in companions:
                 companions.append(companion_id)
     selected = tuple(app.id for app in apps_in_order((*ticked, *companions)))
@@ -340,6 +348,16 @@ async def _questions_context(
         back_url = f"/setup/questions/{previous.app_id}/{previous.step_id}?apps={apps_csv}"
     else:
         back_url = f"/setup/apps?apps={apps_csv}"
+    # The escape hatch is only ever reachable from Gluetun's own VPN
+    # question, and only while qBittorrent - the one app that needs the
+    # VPN - is actually part of this run. Every other step gets no
+    # `escape_url` at all, so `app_questions.html`'s own guard never has
+    # anything to draw.
+    escape_url = (
+        f"/setup/without-vpn?apps={apps_csv}"
+        if step.app_id == "gluetun" and step.step_id == "vpn" and "qbittorrent" in app_ids
+        else None
+    )
     return {
         "steps": steps,
         "current_step": step_number(steps, key),
@@ -349,6 +367,7 @@ async def _questions_context(
         "problem_field": problem_field,
         "apps_csv": apps_csv,
         "back_url": back_url,
+        "escape_url": escape_url,
         "warning": await _platform_warning(request),
         "words": words,
     }
@@ -410,6 +429,85 @@ async def post_setup_question(app_id: str, step_id: str, request: Request) -> Re
         return RedirectResponse(
             f"/setup/questions/{next_step.app_id}/{next_step.step_id}?apps={apps_csv}",
             status_code=303,
+        )
+    return RedirectResponse(f"/setup/drive?apps={apps_csv}", status_code=303)
+
+
+# --- Break the glass: run qBittorrent without a VPN, from the fresh install -
+#
+# Reachable only from Gluetun's own VPN question (the escape link
+# `_questions_context` draws there), and only while qBittorrent is actually
+# part of this run - `question_steps_for` never registers the VPN step
+# without qBittorrent asking for it, so a run that reaches this far always
+# has both ids. The three stages are the same shared partial the Hub's own
+# panel uses; only the third, typed one ever writes anything.
+
+
+async def _without_vpn_context(
+    request: Request, *, app_ids: tuple[str, ...], stage: Literal[1, 2, 3], problem: str | None
+) -> dict[str, object]:
+    apps_csv = ",".join(app_ids)
+    steps = wizard_steps(app_ids)
+    return {
+        "steps": steps,
+        "current_step": step_number(steps, "q:gluetun:vpn"),
+        "stage": stage,
+        "problem": problem,
+        "action": "/setup/without-vpn",
+        "back_url": f"/setup/questions/gluetun/vpn?apps={apps_csv}",
+        "back_panel": None,
+        "hidden": {"apps": apps_csv},
+        "warning": await _platform_warning(request),
+        "words": words,
+    }
+
+
+@router.get("/setup/without-vpn", response_class=HTMLResponse)
+async def get_setup_without_vpn(request: Request) -> Response:
+    if _hub_exists(request):
+        return RedirectResponse("/", status_code=303)
+    templates: Jinja2Templates = request.app.state.templates
+
+    app_ids = parse_app_ids(request.query_params.get("apps", ""))
+    if "qbittorrent" not in app_ids or "gluetun" not in app_ids:
+        return RedirectResponse("/setup/apps", status_code=303)
+
+    context = await _without_vpn_context(request, app_ids=app_ids, stage=1, problem=None)
+    return templates.TemplateResponse(request, "wizard_without_vpn.html", context)
+
+
+@router.post("/setup/without-vpn", response_class=HTMLResponse)
+async def post_setup_without_vpn(request: Request) -> Response:
+    if _hub_exists(request):
+        return RedirectResponse("/", status_code=303)
+    settings: Settings = request.app.state.settings
+    templates: Jinja2Templates = request.app.state.templates
+    form = await request.form()
+
+    app_ids = parse_app_ids(_form_value(form, "apps"))
+    if "qbittorrent" not in app_ids or "gluetun" not in app_ids:
+        return RedirectResponse("/setup/apps", status_code=303)
+
+    outcome = next_stage(_form_value(form, "stage"), _form_value(form, "typed"))
+    if not outcome.confirmed:
+        context = await _without_vpn_context(
+            request, app_ids=app_ids, stage=outcome.stage, problem=outcome.problem
+        )
+        return templates.TemplateResponse(request, "wizard_without_vpn.html", context)
+
+    save_without_vpn(settings.config_dir, now=datetime.now(UTC))
+
+    # Gluetun's own place in `app_ids` was only ever there because
+    # qBittorrent needed it - now that the owner has confirmed running
+    # without it, it drops out of every screen from here on, the same way
+    # a companion never posted in the first place would.
+    remaining_ids = tuple(app_id for app_id in app_ids if app_id != "gluetun")
+    apps_csv = ",".join(remaining_ids)
+    first_question = question_steps_for(remaining_ids)
+    if first_question:
+        step = first_question[0]
+        return RedirectResponse(
+            f"/setup/questions/{step.app_id}/{step.step_id}?apps={apps_csv}", status_code=303
         )
     return RedirectResponse(f"/setup/drive?apps={apps_csv}", status_code=303)
 

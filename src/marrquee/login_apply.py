@@ -193,7 +193,7 @@ class HttpLoginApplier:
         if not api_key:
             return LoginApplyResult(ok=False, technical=f"{app.id}: no API key generated yet")
 
-        base_url = app_base_url(app)
+        base_url = app_base_url(app, install.app_ids)
         path = f"{app.api_base}/{_CONFIG_HOST_PATH}"
 
         get_response = await self._request_with_retry("GET", base_url, path, api_key)
@@ -236,7 +236,7 @@ class HttpLoginApplier:
         if not api_key:
             return LoginApplyResult(ok=False, technical=f"{app.id}: no API key generated yet")
 
-        base_url = app_base_url(app)
+        base_url = app_base_url(app, install.app_ids)
         path = f"{app.api_base}/app/setPreferences"
         form = preferences_form(
             {"web_ui_username": login.username, "web_ui_password": login.password}

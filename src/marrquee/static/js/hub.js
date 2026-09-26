@@ -37,6 +37,7 @@
     "docker_unreachable",
     "busy",
     "login_banner",
+    "running_without_vpn",
   ];
   var APP_FIELDS = [
     "app_id",
@@ -215,8 +216,17 @@
   // folded into the same signature rather than given its own guard.
 
   function reloadIfStructureChanged(payload) {
-    var incoming = structureSignature(actionsSignature(payload.apps || []), payload.login_banner);
-    if (incoming === structureSignature(actionsSignature(pageApps()), root.dataset.loginBanner)) {
+    var incoming = structureSignature(
+      actionsSignature(payload.apps || []),
+      payload.login_banner,
+      payload.running_without_vpn
+    );
+    var current = structureSignature(
+      actionsSignature(pageApps()),
+      root.dataset.loginBanner,
+      root.dataset.runningWithoutVpn === "true"
+    );
+    if (incoming === current) {
       return false;
     }
     if (window.sessionStorage.getItem(RELOAD_GUARD_KEY) === incoming) {
@@ -229,8 +239,11 @@
     return true;
   }
 
-  function structureSignature(actions, loginBanner) {
-    return actions + "|" + (loginBanner || "");
+  // The badge appearing or disappearing is its own shape change (a move
+  // starting or finishing) - folded into this same signature rather than
+  // given its own guard, the same way the login banner already is.
+  function structureSignature(actions, loginBanner, runningWithoutVpn) {
+    return actions + "|" + (loginBanner || "") + "|" + (runningWithoutVpn ? "true" : "false");
   }
 
   function pageApps() {

@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from marrquee import storage
-from marrquee.catalog import CatalogApp, apps_in_order, riders_of
+from marrquee.catalog import CatalogApp, apps_in_order, description_for, get_app, riders_of
 from marrquee.config import Settings
 from marrquee.state import InstallState
 from marrquee.storage import ChownFn, to_host_view
@@ -31,6 +31,7 @@ from marrquee.words import (
     COMPOSE_FILE_HEADER_COMMENT,
     DATA_MOUNT_COMMENT,
     DOWNLOADER_COMPOSE_COMMENT,
+    DOWNLOADER_NO_VPN_COMPOSE_COMMENT,
     VPN_SECRETS_MOUNT_COMMENT,
 )
 
@@ -108,22 +109,29 @@ class StackPlan:
 
 
 def build_stack_plan(
-    state: InstallState, answers: Mapping[str, Mapping[str, str]] | None = None
+    state: InstallState,
+    answers: Mapping[str, Mapping[str, str]] | None = None,
+    *,
+    without_vpn: bool = False,
 ) -> StackPlan:
     """Turn a saved `InstallState` into the stack this compose file describes.
 
     `answers` is the saved per-app question answers (`questions.load_answers`)
     - every caller passes them, even when nothing in `state.app_ids` needs
     one yet, so a later app added to `state` never has to be threaded
-    through as a special case. Pure and total given the same two inputs:
-    the same `InstallState` and the same answers always produce the same
-    `StackPlan`, which is what keeps a re-deploy from producing a spurious
-    diff in the file the owner reads.
+    through as a special case. Pure and total given the same three inputs:
+    the same `InstallState`, the same answers and the same `without_vpn`
+    always produce the same `StackPlan`, which is what keeps a re-deploy
+    from producing a spurious diff in the file the owner reads.
 
     The ONE place "the downloader never runs outside the VPN" is enforced
     for compose: an app with `network_via` set (qBittorrent) but whose
     companion (Gluetun) isn't part of this same install raises `ValueError`
-    rather than rendering a service with nothing to share a network with.
+    rather than rendering a service with nothing to share a network with -
+    UNLESS `without_vpn` is True and the missing companion is itself the
+    VPN (`kind == "vpn"`), the one deliberate break-glass exception. An app
+    riding a non-VPN companion that's missing (there is none today) still
+    raises regardless of `without_vpn`.
     """
     if state.storage_root is None:
         raise ValueError("cannot build a stack plan before a storage root is chosen")
@@ -132,6 +140,8 @@ def build_stack_plan(
     apps = apps_in_order(state.app_ids)
     for app in apps:
         if app.network_via is not None and app.network_via not in state.app_ids:
+            if without_vpn and get_app(app.network_via).kind == "vpn":
+                continue
             raise ValueError(f"{app.id} needs {app.network_via}")
 
     resolved_answers: Mapping[str, Mapping[str, str]] = answers if answers is not None else {}
@@ -267,12 +277,20 @@ def _vpn_service_plan(
 def _downloader_service_plan(
     app: CatalogApp, state: InstallState, root: PurePosixPath
 ) -> ServicePlan:
-    """qBittorrent's own branch: it rides its companion's whole network
-    namespace instead of joining `marrquee` or publishing a port on its
-    own, and it takes no API key through the environment - its door is the
-    key pre-written into its own settings file
-    (`qbittorrent.write_qbit_conf`), never the arr `*__AUTH__*` shape.
+    """qBittorrent's own branch: it takes no API key through the
+    environment either way - its door is the key pre-written into its own
+    settings file (`qbittorrent.write_qbit_conf`), never the arr
+    `*__AUTH__*` shape.
+
+    Normally it rides its companion's whole network namespace instead of
+    joining `marrquee` or publishing a port on its own. The one deliberate
+    exception is a confirmed break-glass install: `build_stack_plan`'s own
+    refusal is the only gate on this branch existing at all, so by the
+    time this runs, an absent `network_via` companion always means the
+    owner has actually confirmed running without one.
     """
+    via_present = app.network_via is not None and app.network_via in state.app_ids
+
     environment: tuple[tuple[str, str], ...] = (
         ("PUID", str(state.puid)),
         ("PGID", str(state.pgid)),
@@ -286,16 +304,33 @@ def _downloader_service_plan(
     if app.needs_data_mount:
         volumes.append(f"{root / 'data'}{_DATA_MOUNT_SUFFIX}")
 
+    description = description_for(app, state.app_ids)
+    if via_present:
+        return ServicePlan(
+            app_id=app.id,
+            service=app.id,
+            image=app.image,
+            container_name=app.id,
+            ports=(),
+            environment=environment,
+            volumes=tuple(volumes),
+            comment=f"{description} {DOWNLOADER_COMPOSE_COMMENT}",
+            network_mode=f"service:{app.network_via}",
+        )
+
+    # No VPN companion: an ordinary service on `marrquee`, publishing its
+    # own port. The incoming BitTorrent port is deliberately never
+    # published here - that would open the NAS to the internet for a mode
+    # that is already an emergency.
     return ServicePlan(
         app_id=app.id,
         service=app.id,
         image=app.image,
         container_name=app.id,
-        ports=(),
+        ports=((app.port, app.port),),
         environment=environment,
         volumes=tuple(volumes),
-        comment=f"{app.description} {DOWNLOADER_COMPOSE_COMMENT}",
-        network_mode=f"service:{app.network_via}",
+        comment=f"{description} {DOWNLOADER_NO_VPN_COMPOSE_COMMENT}",
     )
 
 

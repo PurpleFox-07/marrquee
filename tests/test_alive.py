@@ -19,6 +19,7 @@ from marrquee.docker_client import (
     ComposeResult,
     ContainerRemoveResult,
     ContainerSnapshot,
+    ContainerStopResult,
     DockerFailure,
     DockerStatus,
     FakeDockerEngine,
@@ -66,6 +67,9 @@ class _CountingDockerEngine:
     async def remove_container(self, name: str) -> ContainerRemoveResult:
         raise NotImplementedError("the alive page never removes a container")
 
+    async def stop_container(self, name: str, *, timeout_seconds: int = 30) -> ContainerStopResult:
+        raise NotImplementedError("the alive page never stops a container")
+
 
 class _ExplodingDockerEngine:
     """A DockerEngine whose every method always raises.
@@ -97,6 +101,9 @@ class _ExplodingDockerEngine:
         raise RuntimeError("healthz must never call the Docker engine")
 
     async def remove_container(self, name: str) -> ContainerRemoveResult:
+        raise RuntimeError("healthz must never call the Docker engine")
+
+    async def stop_container(self, name: str, *, timeout_seconds: int = 30) -> ContainerStopResult:
         raise RuntimeError("healthz must never call the Docker engine")
 
 

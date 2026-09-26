@@ -333,6 +333,38 @@ async def test_the_qbittorrent_branch_posts_username_and_password_with_the_key()
     assert body == {"web_ui_username": "owner", "web_ui_password": "new-owner-password"}
 
 
+async def test_the_qbittorrent_branch_reaches_its_own_host_without_a_vpn() -> None:
+    """Without Gluetun installed, qBittorrent answers at its own id, not
+    at `gluetun` - the login must follow it there.
+    """
+    qbit = FakeQbitClient(
+        {
+            ("POST", "http://qbittorrent:8080", "api/v2/app/setPreferences"): [
+                QbitResponse(ok=True, status=200, payload="Ok.", detail=None)
+            ]
+        }
+    )
+    applier = HttpLoginApplier(qbit=qbit)
+    install = InstallState(
+        version=2,
+        storage_root="/volume1/media",
+        app_ids=("sonarr", "qbittorrent"),
+        api_keys={"qbittorrent": "qbt_" + "a" * 28},
+        puid=1000,
+        pgid=1000,
+        umask="002",
+        timezone="Etc/UTC",
+        created="2026-09-24T00:00:00+00:00",
+    )
+
+    result = await applier.apply(_QBITTORRENT, install, _login(password="new-owner-password"))
+
+    assert result.ok is True
+    assert len(qbit.calls) == 1
+    _, base_url, _, _ = qbit.calls[0]
+    assert base_url == "http://qbittorrent:8080"
+
+
 async def test_the_qbittorrent_branch_defaults_to_a_real_http_client_when_none_is_given() -> None:
     # CI calls a bare HttpLoginApplier() - the qbit keyword must default to a
     # real HttpQbitClient, the same way `client` defaults to HttpArrClient.

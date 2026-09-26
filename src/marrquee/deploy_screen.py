@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 
 from marrquee.addresses import app_url
-from marrquee.catalog import CATALOG, apps_in_order
+from marrquee.catalog import CATALOG, apps_in_order, description_for
 from marrquee.deploy import AppProgress, AppState, DeployPhase, DeploySnapshot, Failure
 from marrquee.state import InstallState
 from marrquee.storage import host_media_path, plan_folders
@@ -118,7 +118,7 @@ def deploy_view(
 ) -> DeployView:
     return DeployView(
         phase=snapshot.phase,
-        tiles=_build_tiles(snapshot),
+        tiles=_build_tiles(snapshot, state.app_ids),
         bill=_bill(state.app_ids),
         summary=_summary(state.storage_root, state.app_ids),
         back_href=f"/setup/drive?apps={','.join(state.app_ids)}",
@@ -132,7 +132,7 @@ def deploy_view(
     )
 
 
-def _build_tiles(snapshot: DeploySnapshot) -> tuple[TileView, ...]:
+def _build_tiles(snapshot: DeploySnapshot, app_ids: tuple[str, ...] = ()) -> tuple[TileView, ...]:
     linking_ids = _linking_app_ids(snapshot)
     tiles = []
     for order, app in enumerate(snapshot.apps, start=1):
@@ -142,7 +142,7 @@ def _build_tiles(snapshot: DeploySnapshot) -> tuple[TileView, ...]:
         # sensible rather than raise - two letters from the name and no
         # description read as "unknown" without ever crashing the page.
         glyph = catalog_app.glyph if catalog_app is not None else app.name[:2].upper()
-        description = catalog_app.description if catalog_app is not None else ""
+        description = description_for(catalog_app, app_ids) if catalog_app is not None else ""
         tiles.append(
             TileView(
                 app_id=app.app_id,

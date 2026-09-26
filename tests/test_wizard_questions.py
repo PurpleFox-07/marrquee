@@ -210,6 +210,22 @@ def test_qbittorrent_ticked_asks_gluetuns_vpn_step_before_its_own_seeding(
     )
 
 
+def test_the_escape_link_is_on_the_vpn_question_only_when_qbittorrent_is_chosen(
+    tmp_path: Path,
+) -> None:
+    client = _client(_settings(tmp_path))
+
+    with_qbittorrent = client.get(
+        "/setup/questions/gluetun/vpn", params={"apps": "gluetun,qbittorrent"}
+    )
+    assert 'data-role="without-vpn-link"' in with_qbittorrent.text
+    assert 'href="/setup/without-vpn?apps=gluetun,qbittorrent"' in with_qbittorrent.text
+    assert "data-panel-choice" not in with_qbittorrent.text
+
+    without_qbittorrent = client.get("/setup/questions/gluetun/vpn", params={"apps": "gluetun"})
+    assert 'data-role="without-vpn-link"' not in without_qbittorrent.text
+
+
 def test_a_password_field_never_carries_a_value_even_with_a_saved_answer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

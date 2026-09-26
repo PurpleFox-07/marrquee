@@ -336,6 +336,38 @@ _EXPECTED_INVENTORY = (
     "HUB_SEEDING_BUSY",
     "wiring_line_downloader_settings",
     "wiring_line_download_client",
+    "WITHOUT_VPN_PHRASE",
+    "QUESTION_NO_VPN_LINK",
+    "WITHOUT_VPN_STEP1_TITLE",
+    "WITHOUT_VPN_STEP1_BODY",
+    "WITHOUT_VPN_STEP1_GO",
+    "WITHOUT_VPN_STEP2_TITLE",
+    "WITHOUT_VPN_STEP2_BODY",
+    "WITHOUT_VPN_STEP2_GO",
+    "WITHOUT_VPN_STEP3_TITLE",
+    "WITHOUT_VPN_STEP3_BODY",
+    "WITHOUT_VPN_TYPED_LABEL",
+    "WITHOUT_VPN_STEP3_GO",
+    "WITHOUT_VPN_USE_VPN",
+    "WITHOUT_VPN_PROBLEM_MISMATCH",
+    "WITHOUT_VPN_ROW_NOTE",
+    "WITHOUT_VPN_UNDO",
+    "QBITTORRENT_DESCRIPTION_NO_VPN",
+    "DOWNLOADER_NO_VPN_COMPOSE_COMMENT",
+    "HUB_NO_VPN_BADGE",
+    "HUB_NO_VPN_BADGE_ACTION",
+    "HUB_CHANGE_VPN",
+    "HUB_VPN_ADD_TITLE",
+    "HUB_VPN_ADD_LEDE",
+    "HUB_VPN_ADD_SUBMIT",
+    "HUB_VPN_CHANGE_TITLE",
+    "HUB_VPN_CHANGE_LEDE",
+    "HUB_VPN_CHANGE_SUBMIT",
+    "HUB_VPN_BUSY",
+    "HUB_CHIP_VPN_CHANGING",
+    "HUB_CHIP_VPN_CHANGE_FAILED",
+    "HUB_KEEP_WITHOUT_VPN",
+    "HUB_LINE_RESTARTING_WITHOUT_VPN",
 )
 
 _DEPLOY_ENGINE_WORD_COUNT = 40
@@ -348,6 +380,7 @@ _HUB_INSTALL_WORD_COUNT = 24
 _LOGIN_WORD_COUNT = 40
 _VPN_WORD_COUNT = 45
 _QBIT_WORD_COUNT = 29
+_VPN_CHANGE_WORD_COUNT = 32
 
 
 def test_words_inventory_is_pinned() -> None:
@@ -611,10 +644,9 @@ def test_the_vpn_section_precedes_the_qbittorrent_section() -> None:
     assert "QBITTORRENT_DESCRIPTION" not in vpn_names
 
 
-def test_the_qbittorrent_section_is_last() -> None:
-    """qBittorrent is the newest section, and words.py is the only file
-    this story touches - so unlike every earlier "is last" test, this
-    slice is closed for good: nothing later in this story appends to it.
+def test_the_qbittorrent_section_precedes_the_vpn_change_section() -> None:
+    """qBittorrent used to be the newest section - VPN changes now follows
+    it, so this slice is closed the same move every earlier story made.
     """
     qbit_start = (
         _DEPLOY_ENGINE_WORD_COUNT
@@ -627,15 +659,45 @@ def test_the_qbittorrent_section_is_last() -> None:
         + _LOGIN_WORD_COUNT
         + _VPN_WORD_COUNT
     )
+    qbit_end = qbit_start + _QBIT_WORD_COUNT
 
-    qbit_names = words.WORDS_INVENTORY[qbit_start:]
+    qbit_names = words.WORDS_INVENTORY[qbit_start:qbit_end]
 
-    assert qbit_names == _EXPECTED_INVENTORY[qbit_start:]
+    assert qbit_names == _EXPECTED_INVENTORY[qbit_start:qbit_end]
     assert qbit_names[0] == "QBITTORRENT_DESCRIPTION"
     assert qbit_names[-1] == "wiring_line_download_client"
-    assert len(words.WORDS_INVENTORY) == len(_EXPECTED_INVENTORY)
     assert len(qbit_names) == _QBIT_WORD_COUNT
     assert "VPN_SECRETS_MOUNT_COMMENT" not in qbit_names
+    assert "WITHOUT_VPN_PHRASE" not in qbit_names
+
+
+def test_the_vpn_change_section_is_last() -> None:
+    """VPN changes (the break-glass phrase, Add your VPN, Change VPN) is
+    the newest section, and words.py is the only file this story touches -
+    so unlike every earlier "is last" test, this slice is closed for good:
+    nothing later in this story appends to it.
+    """
+    vpn_change_start = (
+        _DEPLOY_ENGINE_WORD_COUNT
+        + _WIZARD_WORD_COUNT
+        + _WIRING_WORD_COUNT
+        + _DEPLOY_SCREEN_WORD_COUNT
+        + _HUB_WORD_COUNT
+        + _HUB_LINK_WORD_COUNT
+        + _HUB_INSTALL_WORD_COUNT
+        + _LOGIN_WORD_COUNT
+        + _VPN_WORD_COUNT
+        + _QBIT_WORD_COUNT
+    )
+
+    vpn_change_names = words.WORDS_INVENTORY[vpn_change_start:]
+
+    assert vpn_change_names == _EXPECTED_INVENTORY[vpn_change_start:]
+    assert vpn_change_names[0] == "WITHOUT_VPN_PHRASE"
+    assert vpn_change_names[-1] == "HUB_LINE_RESTARTING_WITHOUT_VPN"
+    assert len(words.WORDS_INVENTORY) == len(_EXPECTED_INVENTORY)
+    assert len(vpn_change_names) == _VPN_CHANGE_WORD_COUNT
+    assert "QBITTORRENT_DESCRIPTION" not in vpn_change_names
 
 
 def test_wizard_headline_tuples_carry_the_gradient_word_in_the_middle() -> None:

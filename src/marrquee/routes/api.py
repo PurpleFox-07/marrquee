@@ -60,6 +60,7 @@ from marrquee.routes.hub import read_hub_view
 from marrquee.state import load_state
 from marrquee.storage import StorageCheck, check_storage_root
 from marrquee.wiring import WiringStep, WiringStepState
+from marrquee.without_vpn import without_vpn_confirmed
 from marrquee.words import (
     HUB_INSTALL_ALREADY,
     HUB_INSTALL_LOGIN_FIRST,
@@ -218,10 +219,11 @@ class HubTileOut(BaseModel):
     aria: str | None
     add_state: AddState | None
     note: str
-    actions: Literal["none", "retry", "reconnect"]
+    actions: Literal["none", "retry", "reconnect", "try_again", "retry_or_restore"]
     kind: AppKind
     paused: bool
     can_change_seeding: bool
+    can_change_vpn: bool
 
 
 class LinkTileOut(BaseModel):
@@ -248,6 +250,7 @@ class HubStatusOut(BaseModel):
     busy: bool
     login_banner: LoginBanner | None
     vpn_tunnel: TunnelState | None
+    running_without_vpn: bool
 
 
 class HubInstallRequest(BaseModel):
@@ -329,6 +332,7 @@ def _hub_tile_out(tile: HubTile) -> HubTileOut:
         kind=tile.kind,
         paused=tile.paused,
         can_change_seeding=tile.can_change_seeding,
+        can_change_vpn=tile.can_change_vpn,
     )
 
 
@@ -528,6 +532,7 @@ async def get_hub_status(request: Request) -> HubStatusOut:
         busy=view.busy,
         login_banner=view.login.banner if view.login is not None else None,
         vpn_tunnel=view.vpn_tunnel,
+        running_without_vpn=view.running_without_vpn,
     )
 
 
@@ -574,7 +579,14 @@ async def post_hub_install(
         )
 
     installed_ids = tuple(progress.app_id for progress in manager.snapshot().apps)
-    steps = question_steps_for((*companions_for(app_id, installed_ids), app_id))
+    steps = question_steps_for(
+        (
+            *companions_for(
+                app_id, installed_ids, without_vpn=without_vpn_confirmed(settings.config_dir)
+            ),
+            app_id,
+        )
+    )
     saved = load_answers(settings.config_dir)
     checks: list[tuple[QuestionStep, QuestionCheck]] = []
     for step in steps:

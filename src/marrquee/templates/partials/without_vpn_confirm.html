@@ -1,0 +1,78 @@
+{#
+  The break-glass three-step confirmation - shared by the Hub's own
+  "without-vpn" panel pane (hub.html) and the wizard's full page
+  (wizard_without_vpn.html), so the two can never quietly ask something
+  different.
+
+  Expects, in scope: `stage` (1, 2 or 3), `problem` (stage 3's own mismatch
+  sentence, or `none`), `action` (this form's own POST target), `back_url`
+  (where "Use a VPN instead" leads), `back_panel` (a panel-switch choice for
+  the Hub's own dialog, `none` for the wizard's plain page navigation), and
+  `hidden` (extra hidden fields the caller needs carried along - `{}` on
+  the Hub, `{"apps": csv}` on the wizard).
+#}
+<section
+  class="no-vpn-confirm"
+  data-role="without-vpn"
+  data-stage="{{ stage }}"
+  aria-labelledby="without-vpn-title"
+>
+  <h2 id="without-vpn-title">
+    {% if stage == 1 %}{{ words.WITHOUT_VPN_STEP1_TITLE }}
+    {%- elif stage == 2 %}{{ words.WITHOUT_VPN_STEP2_TITLE }}
+    {%- else %}{{ words.WITHOUT_VPN_STEP3_TITLE }}{% endif %}
+  </h2>
+
+  {% if stage == 1 %}
+  <p>{{ words.WITHOUT_VPN_STEP1_BODY }}</p>
+  {% elif stage == 2 %}
+  <p>{{ words.WITHOUT_VPN_STEP2_BODY }}</p>
+  {% else %}
+  <p>{{ words.WITHOUT_VPN_STEP3_BODY }}</p>
+  {% endif %}
+
+  {% if stage == 3 %}
+  <p class="no-vpn-phrase" data-role="without-vpn-phrase">{{ words.WITHOUT_VPN_PHRASE }}</p>
+  {% endif %}
+
+  {% if problem %}
+  <div class="refusal-banner" role="alert">
+    <span class="refusal-banner__glyph" aria-hidden="true">&#10007;</span>
+    <p>{{ problem }}</p>
+  </div>
+  {% endif %}
+
+  <form method="post" action="{{ action }}">
+    <input type="hidden" name="stage" value="{{ stage }}">
+    {% for key, value in hidden.items() %}
+    <input type="hidden" name="{{ key }}" value="{{ value }}">
+    {% endfor %}
+    {% if stage == 3 %}
+    <label class="field-label" for="without-vpn-typed">{{ words.WITHOUT_VPN_TYPED_LABEL }}</label>
+    <input
+      class="path-input"
+      id="without-vpn-typed"
+      name="typed"
+      type="text"
+      autocomplete="off"
+      autocapitalize="off"
+      spellcheck="false"
+      required
+      {% if problem %}autofocus{% endif %}
+    >
+    {% endif %}
+    <div class="no-vpn-actions">
+      <a
+        class="btn-primary"
+        data-role="use-vpn"
+        href="{{ back_url }}"
+        {% if back_panel %}data-panel-choice="{{ back_panel }}"{% endif %}
+      >{{ words.WITHOUT_VPN_USE_VPN }}</a>
+      <button type="submit" class="btn-ghost">
+        {%- if stage == 1 %}{{ words.WITHOUT_VPN_STEP1_GO }}
+        {%- elif stage == 2 %}{{ words.WITHOUT_VPN_STEP2_GO }}
+        {%- else %}{{ words.WITHOUT_VPN_STEP3_GO }}{% endif %}
+      </button>
+    </div>
+  </form>
+</section>

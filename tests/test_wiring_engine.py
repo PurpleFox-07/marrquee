@@ -717,6 +717,38 @@ async def test_a_forwarded_port_is_included_a_missing_one_is_not() -> None:
     assert "listen_port" not in body_without_port
 
 
+async def test_no_listen_port_and_no_control_call_without_a_vpn() -> None:
+    """A stale `api_keys["gluetun"]` left over from an earlier install
+    (`with_app_removed` keeps a departed app's own key) must never be read
+    once gluetun has actually left `app_ids` - that would call a Gluetun
+    that no longer exists. Gluetun is deliberately ABSENT from `app_ids`
+    here while its key lingers in `api_keys`, so a guard keyed on the key
+    alone would pass this test vacuously.
+    """
+    fake_qbit = FakeQbitClient(
+        {
+            ("GET", "http://qbittorrent:8080", "api/v2/app/preferences"): [_qbit_ok({})],
+            ("POST", "http://qbittorrent:8080", "api/v2/app/setPreferences"): [_qbit_ok()],
+        }
+    )
+    fake_vpn = FakeGluetunControl(port=51413)
+    state = _install_state(
+        ("sonarr", "qbittorrent"),
+        api_keys={"sonarr": "s" * 32, "qbittorrent": "qbt_" + "q" * 28, "gluetun": "g" * 32},
+    )
+    engine = WiringEngine(client=FakeArrClient({}), qbit=fake_qbit, vpn=fake_vpn)
+    steps: list[WiringStep] = []
+
+    await engine.run(state, steps.append)
+
+    post_calls = [call for call in fake_qbit.calls if call[0] == "POST"]
+    assert len(post_calls) == 1
+    body = _posted_json(post_calls[0])
+    assert isinstance(body, dict)
+    assert "listen_port" not in body
+    assert fake_vpn.calls == []
+
+
 # --- WiringEngine.run: Sonarr/Radarr's download client ----------------------
 
 

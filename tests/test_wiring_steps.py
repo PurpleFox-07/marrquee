@@ -30,6 +30,10 @@ QBIT_KEY = "qbt_" + "k" * 28
 
 _ROOT = "/volume1/media"
 
+# The installed ids every qBittorrent-behind-Gluetun fixture in this file
+# shares - qBittorrent answers at "gluetun" only while both are present.
+_GLUETUN_PRESENT = ("gluetun", "qbittorrent")
+
 
 def _ok(payload: object = None, status: int = 200) -> ArrResponse:
     return ArrResponse(ok=True, status=status, payload=payload, failures=(), detail=None)
@@ -229,8 +233,8 @@ async def test_the_application_is_created_from_the_schema_with_fullsync() -> Non
     assert body["name"] == "Sonarr"
     assert "id" not in body
     fields = {entry["name"]: entry["value"] for entry in body["fields"]}
-    assert fields["prowlarrUrl"] == steps.app_base_url(PROWLARR)
-    assert fields["baseUrl"] == steps.app_base_url(SONARR)
+    assert fields["prowlarrUrl"] == steps.app_base_url(PROWLARR, ())
+    assert fields["baseUrl"] == steps.app_base_url(SONARR, ())
     assert fields["apiKey"] == SONARR_KEY
     assert fields["syncCategories"] == [5000, 5010]
     assert all("forceSave" not in call[2] for call in fake.calls)
@@ -291,7 +295,7 @@ async def test_an_application_pointing_somewhere_else_is_repaired_with_a_put() -
     fields = {entry["name"]: entry["value"] for entry in body["fields"]}
     assert fields["apiKey"] == SONARR_KEY
     assert fields["apiKey"] != "********"
-    assert fields["prowlarrUrl"] == steps.app_base_url(PROWLARR)
+    assert fields["prowlarrUrl"] == steps.app_base_url(PROWLARR, ())
 
 
 async def test_a_schema_prowlarr_does_not_recognise_is_reported_not_guessed() -> None:
@@ -434,13 +438,19 @@ def test_no_media_folder_name_is_hardcoded_in_steps_py() -> None:
 
 
 def test_app_base_url_for_an_ordinary_app_is_its_own_id() -> None:
-    assert steps.app_base_url(SONARR) == "http://sonarr:8989"
+    assert steps.app_base_url(SONARR, ()) == "http://sonarr:8989"
 
 
-def test_app_base_url_for_qbittorrent_is_gluetun() -> None:
+@pytest.mark.parametrize("ids", [(), ("sonarr",), ("gluetun", "sonarr")])
+def test_arr_base_urls_are_unchanged_for_any_installed_ids(ids: tuple[str, ...]) -> None:
+    assert steps.app_base_url(SONARR, ids) == "http://sonarr:8989"
+
+
+def test_app_base_url_for_qbittorrent_follows_the_installed_ids() -> None:
     qbittorrent = catalog.get_app("qbittorrent")
 
-    assert steps.app_base_url(qbittorrent) == "http://gluetun:8080"
+    assert steps.app_base_url(qbittorrent, ("gluetun", "qbittorrent")) == "http://gluetun:8080"
+    assert steps.app_base_url(qbittorrent, ("sonarr", "qbittorrent")) == "http://qbittorrent:8080"
 
 
 # --- ensure_qbit_preferences --------------------------------------------------
@@ -464,7 +474,11 @@ async def test_equal_preferences_never_post() -> None:
     )
 
     outcome = await steps.ensure_qbit_preferences(
-        fake, QBITTORRENT, QBIT_KEY, {"max_ratio_act": 0, "max_ratio": 1.0}
+        fake,
+        QBITTORRENT,
+        QBIT_KEY,
+        {"max_ratio_act": 0, "max_ratio": 1.0},
+        present=_GLUETUN_PRESENT,
     )
 
     assert outcome.state == "done"
@@ -482,7 +496,9 @@ async def test_a_float_within_tolerance_still_counts_as_equal() -> None:
         }
     )
 
-    outcome = await steps.ensure_qbit_preferences(fake, QBITTORRENT, QBIT_KEY, {"max_ratio": 1.0})
+    outcome = await steps.ensure_qbit_preferences(
+        fake, QBITTORRENT, QBIT_KEY, {"max_ratio": 1.0}, present=_GLUETUN_PRESENT
+    )
 
     assert outcome.state == "done"
     assert outcome.changed is False
@@ -499,7 +515,7 @@ async def test_a_changed_preference_posts_the_new_json() -> None:
     )
 
     outcome = await steps.ensure_qbit_preferences(
-        fake, QBITTORRENT, QBIT_KEY, {"max_seeding_time": 10080}
+        fake, QBITTORRENT, QBIT_KEY, {"max_seeding_time": 10080}, present=_GLUETUN_PRESENT
     )
 
     assert outcome.state == "done"
@@ -515,7 +531,9 @@ async def test_preferences_read_failure_is_unreachable_against_qbittorrent() -> 
         {("GET", "http://gluetun:8080", "api/v2/app/preferences"): [_qbit_failed(0, "boom")]}
     )
 
-    outcome = await steps.ensure_qbit_preferences(fake, QBITTORRENT, QBIT_KEY, {"max_ratio": 1.0})
+    outcome = await steps.ensure_qbit_preferences(
+        fake, QBITTORRENT, QBIT_KEY, {"max_ratio": 1.0}, present=_GLUETUN_PRESENT
+    )
 
     assert outcome.state == "error"
     assert outcome.note == words.wiring_failure_unreachable("qBittorrent")
@@ -535,7 +553,12 @@ async def test_an_existing_category_with_the_right_save_path_is_left_alone() -> 
     )
 
     outcome = await steps.ensure_qbit_category(
-        fake, QBITTORRENT, QBIT_KEY, media_folder="tv", save_path="/data/torrents/tv"
+        fake,
+        QBITTORRENT,
+        QBIT_KEY,
+        media_folder="tv",
+        save_path="/data/torrents/tv",
+        present=_GLUETUN_PRESENT,
     )
 
     assert outcome.state == "done"
@@ -552,7 +575,12 @@ async def test_a_missing_category_is_created() -> None:
     )
 
     outcome = await steps.ensure_qbit_category(
-        fake, QBITTORRENT, QBIT_KEY, media_folder="tv", save_path="/data/torrents/tv"
+        fake,
+        QBITTORRENT,
+        QBIT_KEY,
+        media_folder="tv",
+        save_path="/data/torrents/tv",
+        present=_GLUETUN_PRESENT,
     )
 
     assert outcome.state == "done"
@@ -579,7 +607,12 @@ async def test_a_category_with_the_wrong_save_path_is_edited() -> None:
     )
 
     outcome = await steps.ensure_qbit_category(
-        fake, QBITTORRENT, QBIT_KEY, media_folder="movies", save_path="/data/torrents/movies"
+        fake,
+        QBITTORRENT,
+        QBIT_KEY,
+        media_folder="movies",
+        save_path="/data/torrents/movies",
+        present=_GLUETUN_PRESENT,
     )
 
     assert outcome.state == "done"
@@ -601,7 +634,12 @@ async def test_category_failures_are_reported_against_qbittorrent() -> None:
     )
 
     outcome = await steps.ensure_qbit_category(
-        fake, QBITTORRENT, QBIT_KEY, media_folder="tv", save_path="/data/torrents/tv"
+        fake,
+        QBITTORRENT,
+        QBIT_KEY,
+        media_folder="tv",
+        save_path="/data/torrents/tv",
+        present=_GLUETUN_PRESENT,
     )
 
     assert outcome.state == "error"
@@ -673,6 +711,7 @@ async def test_sonarr_creates_a_qbittorrent_download_client_from_the_schema() ->
         QBIT_KEY,
         category_field="tvCategory",
         category="tv",
+        present=_GLUETUN_PRESENT,
     )
 
     assert outcome.state == "done"
@@ -698,6 +737,108 @@ async def test_sonarr_creates_a_qbittorrent_download_client_from_the_schema() ->
     assert fields["tvCategory"] == "tv"
 
 
+async def test_download_client_host_is_qbittorrent_without_a_vpn_and_gluetun_with_one() -> None:
+    """Two fresh adds, two different `present` sets: the same downloader
+    lands on a different host depending only on whether the VPN is part
+    of this install.
+    """
+    without_vpn_fake = FakeArrClient(
+        {
+            ("GET", "http://sonarr:8989", "api/v3/downloadclient"): [_ok([])],
+            ("GET", "http://sonarr:8989", "api/v3/downloadclient/schema"): [
+                _ok(_DOWNLOAD_CLIENT_SCHEMA)
+            ],
+            ("POST", "http://sonarr:8989", "api/v3/downloadclient"): [_created({"id": 7})],
+        }
+    )
+    outcome = await steps.ensure_download_client(
+        without_vpn_fake,
+        SONARR,
+        SONARR_KEY,
+        QBITTORRENT,
+        QBIT_KEY,
+        category_field="tvCategory",
+        category="tv",
+        present=("sonarr", "qbittorrent"),
+    )
+    body = [call for call in without_vpn_fake.calls if call[0] == "POST"][0][3]
+    assert isinstance(body, dict)
+    fields = {entry["name"]: entry["value"] for entry in body["fields"]}
+    assert fields["host"] == "qbittorrent"
+    assert outcome.state == "done"
+
+    with_vpn_fake = FakeArrClient(
+        {
+            ("GET", "http://sonarr:8989", "api/v3/downloadclient"): [_ok([])],
+            ("GET", "http://sonarr:8989", "api/v3/downloadclient/schema"): [
+                _ok(_DOWNLOAD_CLIENT_SCHEMA)
+            ],
+            ("POST", "http://sonarr:8989", "api/v3/downloadclient"): [_created({"id": 7})],
+        }
+    )
+    outcome = await steps.ensure_download_client(
+        with_vpn_fake,
+        SONARR,
+        SONARR_KEY,
+        QBITTORRENT,
+        QBIT_KEY,
+        category_field="tvCategory",
+        category="tv",
+        present=_GLUETUN_PRESENT,
+    )
+    body = [call for call in with_vpn_fake.calls if call[0] == "POST"][0][3]
+    assert isinstance(body, dict)
+    fields = {entry["name"]: entry["value"] for entry in body["fields"]}
+    assert fields["host"] == "gluetun"
+    assert outcome.state == "done"
+
+
+async def test_an_existing_client_on_the_other_host_is_put_to_the_new_host() -> None:
+    """The name fallback finds a client that still points at the OLD host
+    (a mover whose VPN just came online) and repairs it with a PUT.
+    """
+    existing = {
+        "id": 4,
+        "name": "qBittorrent",
+        "implementation": "QBittorrent",
+        "enable": True,
+        "priority": 1,
+        "removeCompletedDownloads": True,
+        "removeFailedDownloads": True,
+        "fields": [
+            {"name": "host", "value": "qbittorrent"},
+            {"name": "port", "value": 8080},
+            {"name": "tvCategory", "value": "tv"},
+        ],
+    }
+    fake = FakeArrClient(
+        {
+            ("GET", "http://sonarr:8989", "api/v3/downloadclient"): [_ok([existing])],
+            ("PUT", "http://sonarr:8989", "api/v3/downloadclient/4"): [_ok({"id": 4})],
+        }
+    )
+
+    outcome = await steps.ensure_download_client(
+        fake,
+        SONARR,
+        SONARR_KEY,
+        QBITTORRENT,
+        QBIT_KEY,
+        category_field="tvCategory",
+        category="tv",
+        present=_GLUETUN_PRESENT,
+    )
+
+    assert outcome.state == "done"
+    assert outcome.changed is True
+    put_calls = [call for call in fake.calls if call[0] == "PUT"]
+    assert len(put_calls) == 1
+    body = put_calls[0][3]
+    assert isinstance(body, dict)
+    fields = {entry["name"]: entry["value"] for entry in body["fields"]}
+    assert fields["host"] == "gluetun"
+
+
 async def test_radarr_uses_moviecategory() -> None:
     fake = FakeArrClient(
         {
@@ -717,6 +858,7 @@ async def test_radarr_uses_moviecategory() -> None:
         QBIT_KEY,
         category_field="movieCategory",
         category="movies",
+        present=_GLUETUN_PRESENT,
     )
 
     assert outcome.state == "done"
@@ -753,6 +895,7 @@ async def test_an_up_to_date_client_is_left_alone() -> None:
         QBIT_KEY,
         category_field="tvCategory",
         category="tv",
+        present=_GLUETUN_PRESENT,
     )
 
     assert outcome.state == "done"
@@ -791,6 +934,7 @@ async def test_a_client_pointing_elsewhere_is_put_back() -> None:
         QBIT_KEY,
         category_field="tvCategory",
         category="tv",
+        present=_GLUETUN_PRESENT,
     )
 
     assert outcome.state == "done"
@@ -820,6 +964,7 @@ async def test_a_missing_schema_entry_is_reported_against_the_partner() -> None:
         QBIT_KEY,
         category_field="tvCategory",
         category="tv",
+        present=_GLUETUN_PRESENT,
     )
 
     assert outcome.state == "error"
@@ -839,6 +984,7 @@ async def test_download_client_unreachable_is_reported_against_the_partner() -> 
         QBIT_KEY,
         category_field="tvCategory",
         category="tv",
+        present=_GLUETUN_PRESENT,
     )
 
     assert outcome.state == "error"

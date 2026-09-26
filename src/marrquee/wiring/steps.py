@@ -72,18 +72,18 @@ class StepOutcome:
     transient: bool
 
 
-def app_base_url(app: CatalogApp) -> str:
+def app_base_url(app: CatalogApp, present: Iterable[str]) -> str:
     """Where Marrquee, and every other app on the same network, reaches `app`.
 
     Every app's compose service name and container name are both its
     catalog id, so an ordinary app is reachable at its own id - the same
     address the deploy engine's own readiness probe already reaches it at.
     An app that rides another one's network instead (qBittorrent, sharing
-    Gluetun's `network_mode: service:gluetun`) has no DNS name of its own;
-    `app_host` is what routes it to the app whose network it actually
-    joined.
+    Gluetun's `network_mode: service:gluetun`, only while Gluetun is part
+    of `present`) has no DNS name of its own; `app_host` is what routes it
+    to the app whose network it actually joined.
     """
-    return f"http://{app_host(app)}:{app.port}"
+    return f"http://{app_host(app, present)}:{app.port}"
 
 
 def _transient(status: int) -> bool:
@@ -159,7 +159,8 @@ async def ensure_root_folder(
     host_path: PurePosixPath,
 ) -> StepOutcome:
     """Make sure `app` has `container_path` as a root folder, writing only if needed."""
-    base_url = app_base_url(app)
+    assert app.network_via is None  # arr apps always answer on their own network
+    base_url = app_base_url(app, ())
     path = f"{app.api_base}/{_ROOT_FOLDER_PATH}"
 
     listing = await client.request("GET", base_url, path, api_key)
@@ -225,7 +226,9 @@ async def ensure_application(
     target_key: str,
 ) -> StepOutcome:
     """Make sure Prowlarr has a full-sync application entry pointing at `target`."""
-    base_url = app_base_url(prowlarr)
+    assert prowlarr.network_via is None  # arr apps always answer on their own network
+    assert target.network_via is None
+    base_url = app_base_url(prowlarr, ())
     applications_path = f"{prowlarr.api_base}/{_APPLICATIONS_PATH}"
 
     listing = await client.request("GET", base_url, applications_path, prowlarr_key)
@@ -235,8 +238,8 @@ async def ensure_application(
     entries = listing.payload if isinstance(listing.payload, list) else []
     existing = _find_application(entries, target)
 
-    desired_prowlarr_url = app_base_url(prowlarr)
-    desired_base_url = app_base_url(target)
+    desired_prowlarr_url = app_base_url(prowlarr, ())
+    desired_base_url = app_base_url(target, ())
 
     if existing is not None:
         if (
@@ -304,7 +307,8 @@ def _find_application(entries: Iterable[object], target: CatalogApp) -> dict[str
     hand-edited or oddly-configured entry is still found and repaired
     instead of duplicated.
     """
-    target_base_url = app_base_url(target)
+    assert target.network_via is None  # arr apps always answer on their own network
+    target_base_url = app_base_url(target, ())
     fallback: dict[str, object] | None = None
     for entry in entries:
         if not isinstance(entry, dict):
@@ -395,7 +399,12 @@ def _preferences_match(current: Mapping[str, object], desired: Mapping[str, obje
 
 
 async def ensure_qbit_preferences(
-    client: QbitClient, app: CatalogApp, api_key: str, prefs: Mapping[str, object]
+    client: QbitClient,
+    app: CatalogApp,
+    api_key: str,
+    prefs: Mapping[str, object],
+    *,
+    present: Iterable[str],
 ) -> StepOutcome:
     """Make sure qBittorrent's global preferences hold `prefs`, writing only
     on a genuine difference.
@@ -403,8 +412,10 @@ async def ensure_qbit_preferences(
     Marrquee re-asserts its own seeding choice (and its listen port) on
     every wiring run, so an owner's hand-edit outside `prefs`'s own keys is
     left alone - only the keys Marrquee actually cares about are compared.
+    `present` is the install's own app ids, so this reaches qBittorrent at
+    whichever host it actually answers on.
     """
-    base_url = app_base_url(app)
+    base_url = app_base_url(app, present)
     prefs_path = f"{app.api_base}/{_QBIT_PREFERENCES_PATH}"
     set_prefs_path = f"{app.api_base}/{_QBIT_SET_PREFERENCES_PATH}"
 
@@ -441,15 +452,18 @@ async def ensure_qbit_category(
     *,
     media_folder: str,
     save_path: str,
+    present: Iterable[str],
 ) -> StepOutcome:
     """Make sure qBittorrent has a category named `media_folder` saving to
     `save_path`, creating or repairing it as needed.
 
     `media_folder` and `save_path` are handed in by the caller rather than
     known here - this module never hardcodes which media folders exist,
-    that is the catalog's and the wiring plan's job.
+    that is the catalog's and the wiring plan's job. `present` is the
+    install's own app ids, so this reaches qBittorrent at whichever host it
+    actually answers on.
     """
-    base_url = app_base_url(app)
+    base_url = app_base_url(app, present)
     categories_path = f"{app.api_base}/{_QBIT_CATEGORIES_PATH}"
 
     listing = await client.request("GET", base_url, categories_path, api_key)
@@ -481,15 +495,18 @@ async def ensure_qbit_category(
 
 
 def _find_download_client(
-    entries: Iterable[object], downloader: CatalogApp
+    entries: Iterable[object], downloader: CatalogApp, *, present: Iterable[str]
 ) -> dict[str, object] | None:
     """The existing download-client entry pointing at `downloader`, or None.
 
     Matches by implementation and host first - the pairing that actually
     proves this entry talks to `downloader`. Falls back to a name match so a
-    hand-edited entry is still found and repaired instead of duplicated.
+    hand-edited entry is still found and repaired instead of duplicated -
+    including one still pointing at its OLD host (a mover whose VPN just
+    changed, or an add whose host just became `qbittorrent` instead of
+    `gluetun`), which counts as a difference and is PUT to the new one.
     """
-    target_host = app_host(downloader)
+    target_host = app_host(downloader, present)
     fallback: dict[str, object] | None = None
     for entry in entries:
         if not isinstance(entry, dict):
@@ -534,6 +551,7 @@ def _with_download_client_fields(
     *,
     category_field: str,
     category: str,
+    present: Iterable[str],
 ) -> dict[str, object]:
     """`resource` with every field Marrquee asserts on every wiring run set.
 
@@ -547,7 +565,7 @@ def _with_download_client_fields(
     updated["priority"] = 1
     updated["removeCompletedDownloads"] = True
     updated["removeFailedDownloads"] = True
-    updated = _with_field(updated, "host", app_host(downloader))
+    updated = _with_field(updated, "host", app_host(downloader, present))
     updated = _with_field(updated, "port", downloader.port)
     updated = _with_field(updated, "useSsl", False)
     updated = _with_field(updated, "urlBase", "")
@@ -567,6 +585,7 @@ async def ensure_download_client(
     *,
     category_field: str,
     category: str,
+    present: Iterable[str],
 ) -> StepOutcome:
     """Make sure `partner` (Sonarr or Radarr) has a download-client entry
     for `downloader` (qBittorrent), with the key and "remove completed" on.
@@ -575,9 +594,13 @@ async def ensure_download_client(
     `partner`: this call only ever proves whether Marrquee's own request to
     `partner` succeeded, never whether `partner` can in turn reach
     `downloader` (that live round-trip is Sonarr's own connection test, a
-    Pitch condition proven for real in Chunk 7).
+    Pitch condition proven for real in Chunk 7). `present` is the install's
+    own app ids - it decides `downloader`'s host (`gluetun` behind the VPN,
+    `qbittorrent` on its own network), never `partner`'s, which always
+    answers on its own arr network.
     """
-    base_url = app_base_url(partner)
+    assert partner.network_via is None  # arr apps always answer on their own network
+    base_url = app_base_url(partner, ())
     path = f"{partner.api_base}/{_DOWNLOAD_CLIENT_PATH}"
 
     listing = await client.request("GET", base_url, path, partner_key)
@@ -585,8 +608,8 @@ async def ensure_download_client(
         return _unreachable_outcome(partner.name, listing)
 
     entries = listing.payload if isinstance(listing.payload, list) else []
-    existing = _find_download_client(entries, downloader)
-    host = app_host(downloader)
+    existing = _find_download_client(entries, downloader, present=present)
+    host = app_host(downloader, present)
 
     if existing is not None:
         if _download_client_matches(
@@ -605,7 +628,12 @@ async def ensure_download_client(
             )
 
         updated = _with_download_client_fields(
-            existing, downloader, qbit_key, category_field=category_field, category=category
+            existing,
+            downloader,
+            qbit_key,
+            category_field=category_field,
+            category=category,
+            present=present,
         )
         put_path = f"{path}/{existing.get('id')}"
         result = await client.request("PUT", base_url, put_path, partner_key, json_body=updated)
@@ -633,7 +661,12 @@ async def ensure_download_client(
 
     new_entry: dict[str, object] = {key: value for key, value in template.items() if key != "id"}
     new_entry = _with_download_client_fields(
-        new_entry, downloader, qbit_key, category_field=category_field, category=category
+        new_entry,
+        downloader,
+        qbit_key,
+        category_field=category_field,
+        category=category,
+        present=present,
     )
 
     result = await client.request("POST", base_url, path, partner_key, json_body=new_entry)

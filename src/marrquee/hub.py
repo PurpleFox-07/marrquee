@@ -18,7 +18,7 @@ the whole page be proven with no HTML and no Docker.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Final, Literal
@@ -30,6 +30,7 @@ from marrquee.catalog import (
     CatalogApp,
     apps_in_order,
     companions_for,
+    description_for,
     get_app,
     unavailable_reason,
 )
@@ -39,7 +40,7 @@ from marrquee.health import AppHealth, HubState, LinkHealth, LinkState
 from marrquee.links import LinkCard, link_address, link_glyph
 from marrquee.login import LoginRecord, LoginStatus, login_status, pending_app_ids, reset_reminder
 from marrquee.questions import QuestionStep, question_steps_for
-from marrquee.vpn import TunnelPlace, tunnel_place_line
+from marrquee.vpn import VPN_APP_ID, TunnelPlace, tunnel_place_line
 from marrquee.words import (
     HUB_ALL_UP,
     HUB_CHIP_ADD_FAILED,
@@ -49,9 +50,12 @@ from marrquee.words import (
     HUB_CHIP_STARTING,
     HUB_CHIP_UNKNOWN,
     HUB_CHIP_UP,
+    HUB_CHIP_VPN_CHANGE_FAILED,
+    HUB_CHIP_VPN_CHANGING,
     HUB_INSTALL_BUSY_LOGIN,
     HUB_INSTALL_LOGIN_FIRST,
     HUB_LINE_PAUSED_FOR_VPN,
+    HUB_LINE_RESTARTING_WITHOUT_VPN,
     HUB_LINK_LINE_DOWN,
     HUB_LINKS_ALL_UP,
     HUB_NOTHING_SET_UP,
@@ -135,7 +139,16 @@ class HubTile:
     is true only for a downloader whose own container is up but the tunnel
     it rides is down or connecting - a truthful "down" with its own wording,
     never an error. `can_change_seeding` offers the Hub's "Change seeding"
-    link on an already-installed downloader's own tile.
+    link on an already-installed downloader's own tile. `try_again` is a
+    failed run whose only recovery is pressing it again (a failed Change
+    VPN, or a failed "restore" mover) - never paired with a Cancel button,
+    unlike `retry`, which still offers one. `retry_or_restore` is a failed
+    "Add your VPN" that moved an already-installed app: Cancel there means
+    "Keep running without VPN", never "remove it" the way a plain `retry`
+    tile's Cancel does. `can_change_vpn` offers the "Change VPN" link -
+    Gluetun's own tile once it's installed and no VPN run is touching it,
+    or a fresh "Add your VPN" that's already moved a rider and failed (the
+    one place the owner can still edit the VPN answers before trying again).
     """
 
     app_id: str
@@ -149,10 +162,11 @@ class HubTile:
     aria: str | None
     add_state: AddState | None = None
     note: str = ""
-    actions: Literal["none", "retry", "reconnect"] = "none"
+    actions: Literal["none", "retry", "reconnect", "try_again", "retry_or_restore"] = "none"
     kind: AppKind = "arr"
     paused: bool = False
     can_change_seeding: bool = False
+    can_change_vpn: bool = False
 
 
 @dataclass(frozen=True)
@@ -180,11 +194,17 @@ class InstallRow:
     """One row in the "+" panel's install pane - one not-yet-installed app,
     whether it can be added right now, and whatever questions it asks
     before it can be.
+
+    `without_vpn` is true only for qBittorrent's own row, once the owner
+    has confirmed the break-glass phrase - the row then shows the
+    "no VPN" description and an undo, instead of Gluetun's own question
+    step (already dropped from `steps` by the same confirmation).
     """
 
     app: CatalogApp
     unavailable: str | None
     steps: tuple[QuestionStep, ...]
+    without_vpn: bool = False
 
 
 @dataclass(frozen=True)
@@ -194,6 +214,17 @@ class HubView:
     `vpn_tunnel` is `None` when no VPN is installed - the one signal Story 5
     needs before it can ever let qBittorrent run, read straight off the
     same tile the poster itself draws so the two can never disagree.
+
+    `running_without_vpn` is what lights the amber badge - true only while
+    some installed app's own `network_via` companion is genuinely missing
+    (qBittorrent with no Gluetun), and never while a move is already under
+    way (the badge would lie mid-move, when qBittorrent isn't running at
+    all). `vpn_pane` is which VPN form the "vpn" panel pane should draw -
+    `None` closes that pane no matter what `?panel=` a request carries.
+    `without_vpn_offer` is whether the escape hatch is still reachable at
+    all: only before qBittorrent (or the VPN) exists, and only once, since
+    a saved confirmation already answered the question the escape hatch
+    asks.
     """
 
     tiles: tuple[HubTile, ...]
@@ -209,6 +240,9 @@ class HubView:
     empty: bool
     login: LoginView | None = None
     vpn_tunnel: TunnelState | None = None
+    running_without_vpn: bool = False
+    vpn_pane: Literal["add", "change"] | None = None
+    without_vpn_offer: bool = False
 
 
 LoginBanner = Literal["none", "choose", "reset", "applying", "pending"]
@@ -273,7 +307,9 @@ def login_view(
     )
 
 
-PanelMode = Literal["closed", "choose", "install", "link", "edit", "login", "seeding"]
+PanelMode = Literal[
+    "closed", "choose", "install", "link", "edit", "login", "seeding", "vpn", "without-vpn"
+]
 
 
 @dataclass(frozen=True)
@@ -327,6 +363,43 @@ class SeedingFormState:
     problem_field: str | None
 
 
+# The only VPN answer keys ever safe to show back on the Hub's own LAN page
+# - never the username, a password or a key, even when re-rendering a
+# refusal (the Hub has no login of its own, so anyone on the LAN who can
+# reach it could otherwise read a saved VPN username straight off the
+# page).
+_VPN_SAFE_ANSWER_KEYS: Final = frozenset(
+    {"provider", "vpn_type", "server_countries", "wireguard_addresses"}
+)
+
+
+def vpn_prefill(answers: Mapping[str, str]) -> dict[str, str]:
+    """`answers`, kept to only the keys `_VPN_SAFE_ANSWER_KEYS` allows."""
+    return {key: value for key, value in answers.items() if key in _VPN_SAFE_ANSWER_KEYS}
+
+
+@dataclass(frozen=True)
+class VpnFormState:
+    """What the "Add your VPN"/"Change VPN" pane's form should show back -
+    never the username, a password or a key, whether this is a plain open
+    or a refusal's own re-render.
+    """
+
+    answers: Mapping[str, str]
+    problem: str | None
+    problem_field: str | None
+
+
+@dataclass(frozen=True)
+class WithoutVpnState:
+    """Which break-glass step the "without-vpn" pane should draw, and that
+    step's own refusal (stage 3's mismatched phrase), if any.
+    """
+
+    stage: Literal[1, 2, 3]
+    problem: str | None
+
+
 def hub_view(
     app_ids: Sequence[str],
     healths: Sequence[AppHealth],
@@ -341,6 +414,7 @@ def hub_view(
     busy: bool = False,
     login: LoginView | None = None,
     vpn_place: TunnelPlace | None = None,
+    without_vpn: bool = False,
 ) -> HubView:
     healths_by_id = {health.app_id: health for health in healths}
     gaps_by_id = {gap.app_id: gap for gap in wiring_gaps}
@@ -356,9 +430,14 @@ def hub_view(
 
     def _build_tile(app: CatalogApp) -> tuple[HubTile, TunnelState | None]:
         if adding_new and adding is not None and app.id == adding.app_id:
-            return _adding_tile(app, adding), None
+            return _adding_tile(app, adding, deployed_ids), None
         tile, tunnel = _tile(
-            app, healths_by_id.get(app.id), authority=authority, now=now, vpn_place=vpn_place
+            app,
+            healths_by_id.get(app.id),
+            authority=authority,
+            now=now,
+            vpn_place=vpn_place,
+            present=deployed_ids,
         )
         return _apply_add_overlay(tile, app, adding, gaps_by_id.get(app.id)), tunnel
 
@@ -399,7 +478,10 @@ def hub_view(
         InstallRow(
             app=app,
             unavailable=unavailable_reason(app, deployed_ids),
-            steps=question_steps_for((*companions_for(app.id, deployed_ids), app.id)),
+            steps=question_steps_for(
+                (*companions_for(app.id, deployed_ids, without_vpn=without_vpn), app.id)
+            ),
+            without_vpn=without_vpn and app.network_via is not None,
         )
         for app in installable
         if app.id != excluded_id
@@ -417,6 +499,21 @@ def hub_view(
         elif adding.state == "error":
             install_block = hub_install_resolve_first(name)
 
+    # A run's own mover(s) (paused, or restarting on their own network) and,
+    # while a Change VPN is going, Gluetun's own tile never belong in
+    # "something needs your attention" - the down-note's "start it again
+    # from your NAS" advice is actively wrong for all three; the owner's own
+    # Try again/Cancel on the tile itself is the only advice that fits.
+    exempt_ids: set[str] = set()
+    if adding is not None:
+        if adding.purpose in ("add", "change_vpn", "restore"):
+            exempt_ids.update(adding.moves)
+        if adding.purpose == "change_vpn":
+            exempt_ids.add(adding.app_id)
+
+    running_without_vpn_ = running_without_vpn(app_ids, adding)
+    has_qbittorrent_row = any(row.app.id == "qbittorrent" for row in install_rows)
+
     return HubView(
         tiles=tiles,
         links=link_tiles,
@@ -426,7 +523,9 @@ def hub_view(
         busy=busy,
         announce=announce,
         any_down=any(
-            _counts_toward_any_down(tile, healths_by_id.get(tile.app_id)) for tile in regular_tiles
+            _counts_toward_any_down(tile, healths_by_id.get(tile.app_id))
+            for tile in regular_tiles
+            if tile.app_id not in exempt_ids
         ),
         docker_unreachable=bool(regular_tiles)
         and all(tile.state == "unknown" for tile in regular_tiles),
@@ -434,7 +533,51 @@ def hub_view(
         empty=not regular_tiles,
         login=login,
         vpn_tunnel=vpn_tunnel,
+        running_without_vpn=running_without_vpn_,
+        vpn_pane=_vpn_pane(deployed_ids, adding, running_without_vpn_),
+        without_vpn_offer=(
+            has_qbittorrent_row
+            and "gluetun" not in deployed_ids
+            and "qbittorrent" not in deployed_ids
+            and adding is None
+            and not without_vpn
+        ),
     )
+
+
+def running_without_vpn(app_ids: Iterable[str], adding: AppAdd | None) -> bool:
+    """Whether some already-installed app's own `network_via` companion is
+    genuinely missing - qBittorrent with no Gluetun, the one shape today's
+    catalog can produce.
+
+    Never true for an app currently being moved (`adding.moves`, while an
+    "add" or "change_vpn" run is going) - the badge would otherwise lie the
+    moment that app is stopped for the move, before it's back up behind (or,
+    on a failed move, still without) the VPN.
+    """
+    ids = set(app_ids)
+    moved = adding.moves if adding is not None and adding.purpose in ("add", "change_vpn") else ()
+    return any(
+        app.network_via is not None and app.network_via not in ids and app.id not in moved
+        for app in apps_in_order(ids)
+    )
+
+
+def _vpn_pane(
+    app_ids: Iterable[str], adding: AppAdd | None, running_without_vpn_: bool
+) -> Literal["add", "change"] | None:
+    ids = set(app_ids)
+    if VPN_APP_ID in ids:
+        return "change"
+    add_with_moves_in_error = (
+        adding is not None
+        and adding.purpose == "add"
+        and bool(adding.moves)
+        and adding.state == "error"
+    )
+    if running_without_vpn_ or add_with_moves_in_error:
+        return "add"
+    return None
 
 
 def _paused_for_vpn(tile: HubTile) -> HubTile:
@@ -475,7 +618,7 @@ def _counts_toward_any_down(tile: HubTile, health: AppHealth | None) -> bool:
     return True
 
 
-def _adding_tile(app: CatalogApp, adding: AppAdd) -> HubTile:
+def _adding_tile(app: CatalogApp, adding: AppAdd, present: Iterable[str]) -> HubTile:
     """The one tile for a brand-new app while it's being added - never a
     health-driven tile, since Docker has no opinion about it yet.
     """
@@ -484,7 +627,7 @@ def _adding_tile(app: CatalogApp, adding: AppAdd) -> HubTile:
             app_id=app.id,
             glyph=app.glyph,
             name=app.name,
-            description=app.description,
+            description=description_for(app, present),
             state="starting",
             chip=HUB_CHIP_ADDING,
             line=adding.note or adding.line,
@@ -498,7 +641,7 @@ def _adding_tile(app: CatalogApp, adding: AppAdd) -> HubTile:
             app_id=app.id,
             glyph=app.glyph,
             name=app.name,
-            description=app.description,
+            description=description_for(app, present),
             state="starting",
             chip=WIRING_CHIP_RUNNING,
             line=hub_line_connecting(app.name),
@@ -509,20 +652,28 @@ def _adding_tile(app: CatalogApp, adding: AppAdd) -> HubTile:
         )
 
     # adding.state == "error": a failed add, waiting for "Try again" or
-    # "Cancel".
+    # "Cancel". `adding.moves` (a failed "Add your VPN" that already
+    # stopped a rider) widens both what the tile offers and what it lets
+    # the owner reach: "retry_or_restore" pairs Try again with "Keep
+    # running without VPN" instead of a plain remove, and `can_change_vpn`
+    # reopens the VPN pane so the owner can fix a wrong answer before
+    # trying again - the one place that's true for a brand-new VPN add,
+    # since an already-installed Gluetun's own failed Change VPN never
+    # offers it (Try again alone; see `_apply_add_overlay`).
     return HubTile(
         app_id=app.id,
         glyph=app.glyph,
         name=app.name,
-        description=app.description,
+        description=description_for(app, present),
         state="down",
         chip=HUB_CHIP_ADD_FAILED,
         line=_add_failure_line(app, adding),
         url=None,
         aria=None,
         add_state="error",
-        actions="retry",
+        actions="retry_or_restore" if adding.moves else "retry",
         kind=app.kind,
+        can_change_vpn=bool(adding.moves),
     )
 
 
@@ -543,28 +694,96 @@ def _add_failure_line(app: CatalogApp, adding: AppAdd) -> str:
 def _apply_add_overlay(
     tile: HubTile, app: CatalogApp, adding: AppAdd | None, gap: WiringGap | None
 ) -> HubTile:
-    """Layer a reconnect (in flight or failed) and/or a lingering wiring gap
-    onto an already-installed app's normal, health-driven tile.
+    """Layer a reconnect (in flight or failed), a Change VPN, a mover being
+    moved or restored, and/or a lingering wiring gap onto an
+    already-installed app's normal, health-driven tile.
     """
     if gap is not None:
         tile = replace(
             tile, note=hub_wiring_gap_note(app.name, gap.failed_lines), actions="reconnect"
         )
-    if adding is not None and adding.purpose == "reconnect" and adding.app_id == app.id:
+
+    if adding is not None and app.id in adding.moves:
+        if adding.purpose in ("add", "change_vpn"):
+            # Paused whatever Docker says about it - a mover is being
+            # stopped, recreated and rewired behind (or, on a failure, back
+            # off) the VPN, so its own container state is never the truth
+            # to draw right now.
+            tile = _paused_for_vpn(tile)
+        elif adding.purpose == "restore":
+            tile = _restore_mover_tile(tile, app, adding)
+
+    if tile.kind == "vpn":
+        # "No gluetun run in progress" - reachable to the owner exactly
+        # when nothing about the VPN is already in flight or already
+        # failed (a failed Change VPN offers only Try again; see below).
+        gluetun_run_active = adding is not None and adding.app_id == app.id
+        tile = replace(tile, can_change_vpn=not gluetun_run_active)
+
+    if adding is None or adding.app_id != app.id:
+        return tile
+
+    if adding.purpose == "reconnect":
         if adding.state == "error":
             # Never "retry" here: that action pairs with a Cancel button,
             # and Cancel must never remove an already-installed, working
             # app's own container - "Connect again" is this tile's only
             # way back.
-            tile = replace(
+            return replace(
                 tile,
                 add_state="error",
                 line=_add_failure_line(app, adding),
                 actions="reconnect",
             )
-        else:
-            tile = replace(tile, add_state=adding.state, line=hub_line_connecting(app.name))
+        return replace(tile, add_state=adding.state, line=hub_line_connecting(app.name))
+
+    if adding.purpose == "change_vpn":
+        if adding.state == "error":
+            return replace(
+                tile,
+                state="down",
+                chip=HUB_CHIP_VPN_CHANGE_FAILED,
+                line=_add_failure_line(app, adding),
+                url=None,
+                aria=None,
+                actions="try_again",
+            )
+        return replace(
+            tile,
+            state="starting",
+            chip=HUB_CHIP_VPN_CHANGING,
+            line=adding.note or adding.line,
+            add_state="starting",
+        )
+
     return tile
+
+
+def _restore_mover_tile(tile: HubTile, app: CatalogApp, adding: AppAdd) -> HubTile:
+    """A mover being brought back onto its own network after "Keep running
+    without VPN" - never linked while it's still starting (wiring isn't
+    done yet, even once the container itself answers), and a plain failed
+    line with only Try again on a failure (Cancel has nothing left to undo:
+    the VPN is already gone).
+    """
+    if adding.state == "error":
+        return replace(
+            tile,
+            state="down",
+            chip=HUB_CHIP_ADD_FAILED,
+            line=_add_failure_line(app, adding),
+            url=None,
+            aria=None,
+            actions="try_again",
+        )
+    return replace(
+        tile,
+        state="starting",
+        chip=HUB_CHIP_STARTING,
+        line=HUB_LINE_RESTARTING_WITHOUT_VPN,
+        url=None,
+        aria=None,
+    )
 
 
 def _link_tile(card: LinkCard, health: LinkHealth | None) -> LinkTile:
@@ -594,9 +813,10 @@ def _tile(
     authority: str | None,
     now: datetime,
     vpn_place: TunnelPlace | None = None,
+    present: Iterable[str] = (),
 ) -> tuple[HubTile, TunnelState | None]:
     if app.kind == "vpn":
-        return _vpn_tile(app, health, vpn_place, now)
+        return _vpn_tile(app, health, vpn_place, now, present)
 
     # No matching health reading (a deployed app Docker was never asked
     # about, or whose id it didn't recognise) is honestly "unknown", never
@@ -611,7 +831,7 @@ def _tile(
         app_id=app.id,
         glyph=app.glyph,
         name=app.name,
-        description=app.description,
+        description=description_for(app, present),
         state=state,
         chip=chip,
         line=_line(app, state, url, health, now),
@@ -628,7 +848,11 @@ def _tile(
 
 
 def _vpn_tile(
-    app: CatalogApp, health: AppHealth | None, vpn_place: TunnelPlace | None, now: datetime
+    app: CatalogApp,
+    health: AppHealth | None,
+    vpn_place: TunnelPlace | None,
+    now: datetime,
+    present: Iterable[str] = (),
 ) -> tuple[HubTile, TunnelState]:
     """The VPN poster: never linked (Gluetun has no web page of its own),
     and coloured by Gluetun's OWN health check once its container is
@@ -652,7 +876,7 @@ def _vpn_tile(
         app_id=app.id,
         glyph=app.glyph,
         name=app.name,
-        description=app.description,
+        description=description_for(app, present),
         state=hub_state,
         chip=_CHIP_BY_STATE[hub_state],
         line=line,
@@ -768,6 +992,14 @@ def hub_panel(panel: str | None, link_id: str | None, links: Sequence[LinkCard])
         # reading the query string against the saved links) - the caller
         # (`get_hub`) closes this back down when it isn't.
         return HubPanel(mode="seeding", edit=None, label="", url="", error=None)
+    if panel == "vpn":
+        # Whether "Add your VPN"/"Change VPN" is actually reachable right
+        # now (`HubView.vpn_pane`) is, likewise, a question this function
+        # never sees the answer to - `get_hub` closes it back down when
+        # `vpn_pane is None`.
+        return HubPanel(mode="vpn", edit=None, label="", url="", error=None)
+    if panel == "without-vpn":
+        return HubPanel(mode="without-vpn", edit=None, label="", url="", error=None)
     if panel == "edit":
         card = next((link for link in links if link.id == link_id), None)
         if card is not None:

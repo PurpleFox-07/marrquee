@@ -523,6 +523,74 @@ def test_hub_status_carries_paused_and_can_change_seeding_for_the_downloader(
     assert by_id["gluetun"]["paused"] is False
 
 
+def test_hub_status_carries_running_without_vpn_and_can_change_vpn(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+    save_state(settings.config_dir, _install_state(("gluetun", "qbittorrent"), root))
+    finished = DeploySnapshot(
+        run_id="run-1",
+        phase="finale",
+        apps=(
+            AppProgress(
+                app_id="gluetun",
+                name="VPN",
+                state="done",
+                chip="chip",
+                line="Ready",
+                note=None,
+                port=8000,
+            ),
+            AppProgress(
+                app_id="qbittorrent",
+                name="qBittorrent",
+                state="done",
+                chip="chip",
+                line="Ready",
+                note=None,
+                port=8080,
+            ),
+        ),
+        headline="Now showing",
+        detail=None,
+        failure=None,
+        started_at="2026-09-19T00:00:00+00:00",
+        finished_at="2026-09-19T00:05:00+00:00",
+        wiring=(),
+    )
+    write_json_atomic(settings.config_dir / "deploy.json", dataclasses.asdict(finished))
+    engine = FakeDockerEngine(
+        DockerStatus(connected=True),
+        containers={
+            "qbittorrent": _running_container("qbittorrent"),
+            "gluetun": ContainerSnapshot(
+                name="gluetun",
+                exists=True,
+                state="running",
+                exit_code=None,
+                image=get_app("gluetun").image,
+                detail=None,
+                health="healthy",
+            ),
+        },
+    )
+    client = _client(settings, _idle_manager(settings), engine=engine)
+
+    response = client.get("/api/hub/status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    by_id = {app["app_id"]: app for app in payload["apps"]}
+    assert payload["running_without_vpn"] is False
+    assert by_id["gluetun"]["can_change_vpn"] is True
+    assert by_id["gluetun"]["actions"] in (
+        "none",
+        "retry",
+        "reconnect",
+        "try_again",
+        "retry_or_restore",
+    )
+
+
 # --- Installing an app from the Hub's "+" panel --------------------------------
 
 

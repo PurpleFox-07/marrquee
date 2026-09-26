@@ -12,12 +12,14 @@ import socket
 import struct
 from pathlib import Path
 
+import httpx
 import pytest
 
 from marrquee.docker_client import (
     ComposeResult,
     ContainerRemoveResult,
     ContainerSnapshot,
+    ContainerStopResult,
     DockerEngine,
     DockerFailure,
     DockerStatus,
@@ -750,6 +752,122 @@ async def test_remove_container_reports_a_connection_error_as_not_ok(
     assert result.detail is not None
 
 
+# --- stop_container() -------------------------------------------------------
+
+
+async def test_stop_container_sends_post_with_the_timeout_as_a_query_param(docker_stub):
+    """FIRST TEST - the plan's weakest assumption: does the exact POST the
+    plan promised go out, with Docker's own `t=` query parameter carrying
+    the gentle-stop budget?
+    """
+    stub, socket_path = docker_stub
+    stub.respond_with("HTTP/1.1 204 No Content", b"")
+    engine = SocketDockerEngine(socket_path=socket_path)
+
+    result = await engine.stop_container("qbittorrent")
+
+    assert stub.request_lines[0] == "POST /containers/qbittorrent/stop?t=30 HTTP/1.1"
+    assert result == ContainerStopResult(ok=True, detail=None)
+
+
+async def test_stop_container_honours_a_custom_timeout_in_the_query_string(docker_stub):
+    stub, socket_path = docker_stub
+    stub.respond_with("HTTP/1.1 204 No Content", b"")
+    engine = SocketDockerEngine(socket_path=socket_path)
+
+    await engine.stop_container("qbittorrent", timeout_seconds=5)
+
+    assert stub.request_lines[0] == "POST /containers/qbittorrent/stop?t=5 HTTP/1.1"
+
+
+@pytest.mark.parametrize("status_line", ["HTTP/1.1 204 No Content", "HTTP/1.1 304 Not Modified"])
+async def test_stop_container_treats_204_and_304_as_ok(docker_stub, status_line: str) -> None:
+    stub, socket_path = docker_stub
+    stub.respond_with(status_line, b"")
+    engine = SocketDockerEngine(socket_path=socket_path)
+
+    result = await engine.stop_container("qbittorrent")
+
+    assert result == ContainerStopResult(ok=True, detail=None)
+
+
+async def test_stop_container_treats_a_missing_container_as_ok(docker_stub):
+    """A mover already gone (an idempotent retry after a resume) must
+    never turn a stop into a failure - the removal that follows is what
+    actually has to succeed.
+    """
+    stub, socket_path = docker_stub
+    stub.respond_with("HTTP/1.1 404 Not Found", b'{"message": "no such container: qbittorrent"}')
+    engine = SocketDockerEngine(socket_path=socket_path)
+
+    result = await engine.stop_container("qbittorrent")
+
+    assert result == ContainerStopResult(ok=True, detail=None)
+
+
+async def test_stop_container_reports_a_500_as_not_ok_with_dockers_own_message(docker_stub):
+    stub, socket_path = docker_stub
+    stub.respond_with_json({"message": "server error"}, status_line="HTTP/1.1 500 Server Error")
+    engine = SocketDockerEngine(socket_path=socket_path)
+
+    result = await engine.stop_container("qbittorrent")
+
+    assert result.ok is False
+    assert result.detail is not None
+    assert "500" in result.detail
+    assert "server error" in result.detail
+
+
+async def test_stop_container_sends_a_request_timeout_ten_seconds_past_the_stop_budget() -> None:
+    """The client's own 2s default (`_DEFAULT_TIMEOUT`) would give up long
+    before a real 30s Docker stop finishes - this request must carry its
+    own, generous timeout instead.
+    """
+    captured: dict[str, httpx.Request] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["request"] = request
+        return httpx.Response(204)
+
+    transport = httpx.MockTransport(handler)
+    engine = SocketDockerEngine(socket_path=Path("/dev/null"))
+    original_client = engine._client  # type: ignore[attr-defined]
+
+    def patched_client() -> httpx.AsyncClient:
+        client = original_client()
+        client._transport = transport  # type: ignore[attr-defined]
+        return client
+
+    engine._client = patched_client  # type: ignore[method-assign]
+
+    result = await engine.stop_container("qbittorrent", timeout_seconds=30)
+
+    assert result == ContainerStopResult(ok=True, detail=None)
+    request = captured["request"]
+    assert request.method == "POST"
+    assert request.url.path == "/containers/qbittorrent/stop"
+    assert request.url.query == b"t=30"
+    timeout = request.extensions["timeout"]
+    assert timeout["connect"] >= 40
+    assert timeout["read"] >= 40
+
+
+async def test_stop_container_reports_a_connection_error_as_not_ok(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    relative_name = "refusing.sock"
+    raw_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    raw_socket.bind(relative_name)
+    raw_socket.close()
+
+    engine = SocketDockerEngine(socket_path=tmp_path / relative_name)
+    result = await engine.stop_container("qbittorrent")
+
+    assert result.ok is False
+    assert result.detail is not None
+
+
 # --- FakeDockerEngine -----------------------------------------------------
 
 
@@ -786,6 +904,7 @@ async def test_the_fake_satisfies_the_widened_protocol_and_records_its_calls() -
     await fake.compose_up("marrquee", Path("/tmp/compose.yaml"), "sonarr")
     await fake.self_container_id()
     await fake.remove_container("sonarr")
+    await fake.stop_container("sonarr")
 
     assert [name for name, _args in fake.calls] == [
         "status",
@@ -796,6 +915,7 @@ async def test_the_fake_satisfies_the_widened_protocol_and_records_its_calls() -
         "compose_up",
         "self_container_id",
         "remove_container",
+        "stop_container",
     ]
 
 
@@ -834,6 +954,32 @@ async def test_a_failed_compose_up_does_not_create_the_network() -> None:
     result = await fake.connect_network("marrquee", "abc")
 
     assert result.ok is False
+
+
+async def test_the_fake_stop_container_models_an_exited_container_and_ignores_an_absent_one() -> (
+    None
+):
+    running = ContainerSnapshot(
+        name="qbittorrent",
+        exists=True,
+        state="running",
+        exit_code=None,
+        image="lscr.io/linuxserver/qbittorrent:5.2.3",
+        detail=None,
+    )
+    fake = FakeDockerEngine(DockerStatus(connected=True), containers={"qbittorrent": running})
+
+    stopped = await fake.stop_container("qbittorrent")
+    absent = await fake.stop_container("does-not-exist")
+
+    assert stopped == ContainerStopResult(ok=True, detail=None)
+    assert absent == ContainerStopResult(ok=True, detail=None)
+    snapshot = await fake.inspect("qbittorrent")
+    assert snapshot.state == "exited"
+    assert [name for name, _args in fake.calls if name == "stop_container"] == [
+        "stop_container",
+        "stop_container",
+    ]
 
 
 async def test_the_fake_records_a_recreate_call_under_its_own_name() -> None:

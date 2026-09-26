@@ -25,6 +25,7 @@ from marrquee.state import InstallState
 from marrquee.wiring import WiringStep, WiringStepState
 from marrquee.words import (
     DOWNLOADS_LABEL,
+    QBITTORRENT_DESCRIPTION_NO_VPN,
     REFUSAL_NOTHING_CHOSEN,
     STATUS_CHIP_ERROR,
     app_line_error,
@@ -137,6 +138,22 @@ def test_ready_view_lists_apps_in_snapshot_order_with_catalog_glyphs() -> None:
     assert view.tiles[1].glyph == "PR"
     assert view.tiles[0].description
     assert view.back_href == "/setup/drive?apps=prowlarr,sonarr,radarr"
+
+
+def test_the_deploy_poster_says_running_without_a_vpn_when_gluetun_isnt_in_the_install() -> None:
+    state = _install_state(("sonarr", "qbittorrent"), "/volume1/media")
+    snapshot = _snapshot(
+        phase="finale",
+        apps=(
+            _progress("sonarr", "Sonarr", "done"),
+            _progress("qbittorrent", "qBittorrent", "done"),
+        ),
+    )
+
+    view = deploy_view(state, snapshot, authority=None)
+
+    tile = next(tile for tile in view.tiles if tile.app_id == "qbittorrent")
+    assert tile.description == QBITTORRENT_DESCRIPTION_NO_VPN
 
 
 def test_unknown_app_id_falls_back_to_a_derived_glyph_and_empty_description() -> None:

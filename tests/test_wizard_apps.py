@@ -12,6 +12,7 @@ from __future__ import annotations
 import dataclasses
 import html
 import re
+from datetime import UTC, datetime
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -25,6 +26,7 @@ from marrquee.deploy import AppProgress, DeploySnapshot
 from marrquee.docker_client import DockerStatus, FakeDockerEngine
 from marrquee.main import create_app
 from marrquee.state import STATE_VERSION, InstallState, save_state, write_json_atomic
+from marrquee.without_vpn import save_without_vpn, without_vpn_confirmed
 
 _WIZARD_CSS_PATH = (
     Path(__file__).resolve().parents[1] / "src" / "marrquee" / "static" / "css" / "wizard.css"
@@ -279,6 +281,25 @@ def test_ticking_qbittorrent_with_gluetun_already_posted_never_duplicates_it(
 
     assert response.status_code == 303
     assert response.headers["location"] == "/setup/login?apps=sonarr,gluetun,qbittorrent"
+
+
+def test_posting_the_app_list_clears_a_saved_confirmation_and_brings_the_vpn_step_back(
+    tmp_path: Path,
+) -> None:
+    """A confirmation from an earlier try must never outlive the choice of
+    apps it was given for - posting the app list again clears it, even
+    when qBittorrent is ticked right back in, so "Add your VPN"'s own
+    question is asked fresh.
+    """
+    settings = _settings(tmp_path)
+    save_without_vpn(settings.config_dir, now=datetime(2026, 9, 26, tzinfo=UTC))
+    client = _client(settings)
+
+    response = client.post("/setup/apps", data={"apps": ["qbittorrent"]}, follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/setup/login?apps=gluetun,qbittorrent"
+    assert without_vpn_confirmed(settings.config_dir) is False
 
 
 def test_posting_nothing_rerenders_at_200_with_refusal_and_every_checkbox(

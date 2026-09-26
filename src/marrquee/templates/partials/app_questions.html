@@ -6,7 +6,12 @@
   Expects, in scope: `step` (a QuestionStep), `answers` (a mapping of this
   step's already-saved values, `{}` when there are none), `problem` (this
   step's own refusal sentence, or `none`) and `problem_field` (the field
-  name that refusal names, or `none`).
+  name that refusal names, or `none`). `escape_url` / `escape_panel` are
+  optional - when `escape_url` is set AND this is Gluetun's own VPN step,
+  a "Can't use a VPN right now?" link is drawn after the fields, leading to
+  the break-glass confirmation. Every other step, and every step drawn with
+  no `escape_url` in scope (the Change VPN pane's own form, among others),
+  never gets one.
 #}
 {% set step_key = step.app_id ~ ":" ~ step.step_id %}
 <fieldset class="question-step" data-question-step="{{ step_key }}">
@@ -90,4 +95,14 @@
   {% if field.hint %}<p class="field-hint" id="{{ field_id }}-hint">{{ field.hint }}</p>{% endif %}
   {% endif %}{% if field.shown_when %}</div>{% endif %}
   {% endfor %}
+  {% if escape_url and step.app_id == "gluetun" %}
+  <p class="question-escape">
+    <a
+      class="question-guide"
+      data-role="without-vpn-link"
+      href="{{ escape_url }}"
+      {% if escape_panel %}data-panel-choice="{{ escape_panel }}"{% endif %}
+    >{{ words.QUESTION_NO_VPN_LINK }}</a>
+  </p>
+  {% endif %}
 </fieldset>

@@ -246,6 +246,25 @@
   outline-offset: 2px;
 }
 
+/* --- The break-glass confirmation: the typed phrase and its two actions -
+ * shared by the Hub's own "without-vpn" pane and the wizard's full page. */
+
+.no-vpn-phrase {
+  font-family: var(--font-mono);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: var(--space-3) var(--space-4);
+  color: var(--text-primary);
+}
+
+.no-vpn-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  margin-top: var(--space-6);
+}
+
 /* --- Panels: the folder box and the time zone box share one look ----------- */
 
 .panel {

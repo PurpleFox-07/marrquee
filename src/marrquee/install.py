@@ -68,7 +68,7 @@ def _unknown_app_ids(app_ids: list[str]) -> list[str]:
     offered_posted = tuple(app_id for app_id in app_ids if app_id in _OFFERED_APP_IDS)
     allowed_companions: set[str] = set()
     for app_id in offered_posted:
-        allowed_companions.update(companions_for(app_id, offered_posted))
+        allowed_companions.update(companions_for(app_id, offered_posted, without_vpn=False))
     allowed = _OFFERED_APP_IDS | allowed_companions
     return [app_id for app_id in app_ids if app_id not in allowed]
 

@@ -20,10 +20,24 @@
   data-poll-ms="{{ poll_ms }}"
   data-add-poll-ms="{{ add_poll_ms }}"
   data-login-banner="{{ view.login.banner if view.login else 'none' }}"
+  data-running-without-vpn="{{ 'true' if view.running_without_vpn else 'false' }}"
 >
   <p class="eyebrow">{{ words.HUB_EYEBROW }}</p>
   <h1>{{ words.HUB_HEADLINE[0] }}<br><span class="accent">{{ words.HUB_HEADLINE[1] }}</span></h1>
   <p class="lede">{{ words.HUB_LEDE }}</p>
+
+  {% if view.running_without_vpn %}
+  <a
+    class="no-vpn-badge"
+    href="/?panel=vpn#hub-panel"
+    data-panel-open="vpn"
+    data-role="no-vpn-badge"
+  >
+    <span class="no-vpn-badge__glyph" aria-hidden="true">&#9888;</span>
+    <span>{{ words.HUB_NO_VPN_BADGE }}</span>
+    <span class="no-vpn-badge__action">{{ words.HUB_NO_VPN_BADGE_ACTION }}</span>
+  </a>
+  {% endif %}
 
   <p class="visually-hidden" aria-live="polite" data-role="announce">{{ view.announce }}</p>
 
@@ -112,6 +126,9 @@
         {% if tile.can_change_seeding %}
         <a class="hub-tile-link" href="/?panel=seeding#hub-panel" data-panel-open="seeding">{{ words.HUB_CHANGE_SEEDING }}</a>
         {% endif %}
+        {% if tile.can_change_vpn %}
+        <a class="hub-tile-link" href="/?panel=vpn#hub-panel" data-panel-open="vpn">{{ words.HUB_CHANGE_VPN }}</a>
+        {% endif %}
         {% if tile.actions == "retry" %}
         <div class="hub-tile-actions">
           <form method="post" action="/hub/apps/{{ tile.app_id }}/retry">
@@ -125,6 +142,21 @@
         <div class="hub-tile-actions">
           <form method="post" action="/hub/apps/{{ tile.app_id }}/reconnect">
             <button type="submit" class="btn-primary">{{ words.HUB_CONNECT_AGAIN }}</button>
+          </form>
+        </div>
+        {% elif tile.actions == "try_again" %}
+        <div class="hub-tile-actions">
+          <form method="post" action="/hub/apps/{{ tile.app_id }}/retry">
+            <button type="submit" class="btn-primary">{{ words.HUB_TRY_AGAIN }}</button>
+          </form>
+        </div>
+        {% elif tile.actions == "retry_or_restore" %}
+        <div class="hub-tile-actions">
+          <form method="post" action="/hub/apps/{{ tile.app_id }}/retry">
+            <button type="submit" class="btn-primary">{{ words.HUB_TRY_AGAIN }}</button>
+          </form>
+          <form method="post" action="/hub/apps/{{ tile.app_id }}/cancel">
+            <button type="submit" class="btn-ghost">{{ words.HUB_KEEP_WITHOUT_VPN }}</button>
           </form>
         </div>
         {% endif %}
@@ -234,7 +266,13 @@
           data-available="{{ 'false' if row.unavailable else 'true' }}"
         >
           <span class="install-row__name">{{ row.app.name }}</span>
-          <p class="install-row__desc">{{ row.app.description }}</p>
+          <p class="install-row__desc">{{ row.app.description_without_vpn if row.without_vpn else row.app.description }}</p>
+          {% if row.without_vpn %}
+          <p class="install-row__note" data-role="without-vpn-note">{{ words.WITHOUT_VPN_ROW_NOTE }}</p>
+          <form method="post" action="/hub/without-vpn/undo">
+            <button type="submit" class="btn-ghost">{{ words.WITHOUT_VPN_UNDO }}</button>
+          </form>
+          {% endif %}
           {% if row.unavailable %}
           <p class="install-row__reason">{{ words.hub_install_unavailable(row.unavailable) }}</p>
           {% else %}
@@ -254,6 +292,8 @@
         {% set problem = none %}
         {% set problem_field = none %}
         {% for step in row.steps %}
+        {% set escape_url = "/?panel=without-vpn#hub-panel" if row.app.id == "qbittorrent" else none %}
+        {% set escape_panel = "without-vpn" if row.app.id == "qbittorrent" else none %}
         {% include "partials/app_questions.html" %}
         {% endfor %}
         <div class="hub-question-actions">
@@ -381,7 +421,45 @@
       {% endif %}
     </div>
 
+    <div data-panel-pane="vpn">
+      {% if view.vpn_pane %}
+      {# Gated on `view.vpn_pane` - never drawn at the same time as
+         qBittorrent's own "+" row, which carries this very same
+         `gluetun:vpn` step as a companion question whenever gluetun isn't
+         installed yet (`view.vpn_pane is None` then). Two live copies of
+         the same field ids on one page would break every `id="q-gluetun-*"`
+         hook `questions.js` and this partial's own labels rely on. #}
+      <h2>{{ words.HUB_VPN_CHANGE_TITLE if view.vpn_pane == "change" else words.HUB_VPN_ADD_TITLE }}</h2>
+      <p>{{ words.HUB_VPN_CHANGE_LEDE if view.vpn_pane == "change" else words.HUB_VPN_ADD_LEDE }}</p>
+      <form method="post" action="/hub/vpn">
+        {% set step = vpn_step %}
+        {% set answers = vpn_form.answers %}
+        {% set problem = vpn_form.problem %}
+        {% set problem_field = vpn_form.problem_field %}
+        {% include "partials/app_questions.html" %}
+        <button type="submit" class="btn-primary">{{ words.HUB_VPN_CHANGE_SUBMIT if view.vpn_pane == "change" else words.HUB_VPN_ADD_SUBMIT }}</button>
+      </form>
+      {% endif %}
+    </div>
+
+    <div data-panel-pane="without-vpn">
+      {% set stage = without_vpn_state.stage %}
+      {% set problem = without_vpn_state.problem %}
+      {% set action = "/hub/without-vpn" %}
+      {% set back_url = "/?panel=install#hub-panel" %}
+      {% set back_panel = "install" %}
+      {% set hidden = {} %}
+      {% include "partials/without_vpn_confirm.html" %}
+    </div>
+
     <div data-panel-pane="seeding">
+      {% if view.tiles|selectattr("app_id", "equalto", "qbittorrent")|list %}
+      {# Gated on qBittorrent already having a tile (installed, or mid-add
+         under its own row) - never drawn at the same time as qBittorrent's
+         own "+" row, which carries this very same `qbittorrent:seeding`
+         step whenever it isn't installed yet. Two live copies of the same
+         field ids on one page would break every `id="q-qbittorrent-seed*"`
+         hook this partial's own labels rely on. #}
       <h3>{{ words.HUB_SEEDING_PANEL_TITLE }}</h3>
       <form method="post" action="/hub/seeding">
         {% set step = seeding_step %}
@@ -391,6 +469,7 @@
         {% include "partials/app_questions.html" %}
         <button type="submit" class="btn-primary">{{ words.HUB_SEEDING_SAVE }}</button>
       </form>
+      {% endif %}
     </div>
   </dialog>
 </main>

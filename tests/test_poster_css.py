@@ -206,3 +206,14 @@ def test_the_tile_links_tap_target_comes_from_padding_not_a_fixed_height() -> No
 
     assert "padding-block: var(--space-3);" in body
     assert "height" not in body
+
+
+def test_the_no_vpn_badge_gets_its_tap_target_from_padding_not_a_fixed_height() -> None:
+    # Colour-literal and undeclared-variable checks already run over every
+    # stylesheet in `test_app_css.py` - this only pins the one shape that's
+    # specific to the badge: its padding-block comes from `--space-3`
+    # (the shorthand's first value), never a fixed height.
+    body = _block_for(_HUB_CSS.read_text(), ".no-vpn-badge")
+
+    assert "padding: var(--space-3) var(--space-4);" in body
+    assert "height" not in body

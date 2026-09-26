@@ -16,7 +16,7 @@ import os
 import socket
 import struct
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal, Protocol
@@ -139,6 +139,24 @@ class ContainerRemoveResult:
 
 
 @dataclass(frozen=True)
+class ContainerStopResult:
+    """The outcome of asking Docker to gently stop one container.
+
+    A gentle stop (SIGTERM, then SIGKILL only after `timeout_seconds`) is
+    what keeps a mover's own resume data and torrent list intact when it's
+    about to be removed and recreated behind (or in front of) a VPN -
+    `remove_container`'s own `force=true` skips straight to a kill, which
+    would lose whatever a graceful shutdown would have flushed to disk.
+    `detail` carries the status code and Docker's own message, for logs and
+    the diagnostics file only - same contract as every other `detail`-shaped
+    field in this codebase.
+    """
+
+    ok: bool
+    detail: str | None
+
+
+@dataclass(frozen=True)
 class NetworkConnectResult:
     """The outcome of asking Docker to join our own container to a network.
 
@@ -170,6 +188,9 @@ class DockerEngine(Protocol):
     ) -> ComposeResult: ...
     async def self_container_id(self) -> str | None: ...
     async def remove_container(self, name: str) -> ContainerRemoveResult: ...
+    async def stop_container(
+        self, name: str, *, timeout_seconds: int = 30
+    ) -> ContainerStopResult: ...
 
 
 class SocketDockerEngine:
@@ -400,6 +421,24 @@ class SocketDockerEngine:
 
         return _classify_remove_response(response)
 
+    async def stop_container(self, name: str, *, timeout_seconds: int = 30) -> ContainerStopResult:
+        # The client's own default timeout (`_DEFAULT_TIMEOUT`) is far too
+        # short for Docker's own wait-then-kill window - this request gets
+        # its own, generous timeout instead, ten seconds past however long
+        # Docker itself has been told to wait before killing the container.
+        request_timeout = timeout_seconds + 10
+        try:
+            async with self._client() as client:
+                response = await client.post(
+                    f"/containers/{name}/stop",
+                    params={"t": timeout_seconds},
+                    timeout=request_timeout,
+                )
+        except (httpx.TimeoutException, httpx.ConnectError) as error:
+            return ContainerStopResult(ok=False, detail=str(error))
+
+        return _classify_stop_response(response)
+
 
 def _classify_remove_response(response: httpx.Response) -> ContainerRemoveResult:
     """204 means removed, 404 means already gone - Cancel treats both as
@@ -409,6 +448,20 @@ def _classify_remove_response(response: httpx.Response) -> ContainerRemoveResult
     if response.status_code in (204, 404):
         return ContainerRemoveResult(ok=True, detail=None)
     return ContainerRemoveResult(
+        ok=False, detail=f"HTTP {response.status_code}: {_docker_error_message(response)}"
+    )
+
+
+def _classify_stop_response(response: httpx.Response) -> ContainerStopResult:
+    """204 means it stopped, 304 means it was already stopped, and 404
+    means there's nothing left to stop - a mover that's already gone (a
+    resumed, idempotent retry) is not a failure here either. Anything else
+    is a genuine failure, carrying Docker's own message for the
+    diagnostics file.
+    """
+    if response.status_code in (204, 304, 404):
+        return ContainerStopResult(ok=True, detail=None)
+    return ContainerStopResult(
         ok=False, detail=f"HTTP {response.status_code}: {_docker_error_message(response)}"
     )
 
@@ -819,3 +872,9 @@ class FakeDockerEngine:
             self._containers.pop(name, None)
             return ContainerRemoveResult(ok=True, detail=None)
         return ContainerRemoveResult(ok=False, detail=f"scripted failure removing {name!r}")
+
+    async def stop_container(self, name: str, *, timeout_seconds: int = 30) -> ContainerStopResult:
+        self.calls.append(("stop_container", (name,)))
+        if name in self._containers:
+            self._containers[name] = replace(self._containers[name], state="exited")
+        return ContainerStopResult(ok=True, detail=None)

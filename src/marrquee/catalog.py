@@ -19,6 +19,7 @@ from typing import Literal
 from marrquee.words import (
     PROWLARR_DESCRIPTION,
     QBITTORRENT_DESCRIPTION,
+    QBITTORRENT_DESCRIPTION_NO_VPN,
     RADARR_DESCRIPTION,
     SONARR_DESCRIPTION,
     VPN_DESCRIPTION,
@@ -83,6 +84,12 @@ class CatalogApp:
     picks the shape of the key `install.api_key_for` generates: "hex32" is
     the arr apps' own 32 lowercase-hex-character key; "qbt" is
     qBittorrent's own `qbt_`-prefixed, 28-character format.
+
+    `description_without_vpn`, when non-empty, is what `description_for`
+    returns instead of `description` while `network_via` isn't part of the
+    install - an app whose normal description promises "only ever through
+    your VPN" needs a second, honest sentence for the one deliberate
+    exception that lets it run without one.
     """
 
     id: str
@@ -104,6 +111,7 @@ class CatalogApp:
     offered: bool = True
     api_key_style: Literal["hex32", "qbt"] = "hex32"
     network_via: str | None = None
+    description_without_vpn: str = ""
 
 
 # Prowlarr, Sonarr, Radarr, Gluetun (the VPN tunnel) and qBittorrent (the
@@ -193,6 +201,7 @@ CATALOG: tuple[CatalogApp, ...] = (
         login_kind="qbittorrent",
         network_via="gluetun",
         api_key_style="qbt",
+        description_without_vpn=QBITTORRENT_DESCRIPTION_NO_VPN,
     ),
 )
 
@@ -238,33 +247,64 @@ def unavailable_reason(app: CatalogApp, present: Iterable[str]) -> str | None:
     return None
 
 
-def app_host(app: CatalogApp) -> str:
+def app_host(app: CatalogApp, present: Iterable[str]) -> str:
     """The hostname another container reaches `app` at, on the `marrquee`
     network.
 
-    An app with no `network_via` has its own DNS name, `app.id`. An app
-    that rides another one's network (qBittorrent, today) has none of its
-    own - it answers only at that other app's hostname, since Docker's
-    `network_mode: service:<x>` shares `<x>`'s whole network namespace.
+    An app with no `network_via`, or whose `network_via` isn't part of
+    this install, has its own DNS name, `app.id`. An app that rides
+    another one's network AND that other app is actually present
+    (qBittorrent behind Gluetun) has none of its own - it answers only at
+    that other app's hostname, since Docker's `network_mode: service:<x>`
+    shares `<x>`'s whole network namespace. `present` is required, never
+    defaulted - every caller must say which ids are actually installed, so
+    a stale one-argument assumption ("the VPN is always there") can never
+    creep back in unnoticed.
     """
-    return app.network_via or app.id
+    present_ids = set(present)
+    if app.network_via is not None and app.network_via in present_ids:
+        return app.network_via
+    return app.id
 
 
-def companions_for(app_id: str, present: Iterable[str]) -> tuple[str, ...]:
+def companions_for(app_id: str, present: Iterable[str], *, without_vpn: bool) -> tuple[str, ...]:
     """The extra app(s) adding `app_id` must bring along with it.
 
     Today this is at most one id: the app `app_id` rides the network of,
     when it isn't already present. Returns `()` for an app with no
-    `network_via`, or when its companion is already installed - adding
+    `network_via`, when its companion is already installed - adding
     qBittorrent a second time (after Gluetun already exists) brings nothing
-    else with it.
+    else with it - or, when `without_vpn` is True, when that companion is
+    the VPN itself: the owner's break-glass confirmation is the one thing
+    that turns "needs a VPN" into "runs on its own network instead".
     """
     app = get_app(app_id)
     if app.network_via is None:
         return ()
     if app.network_via in set(present):
         return ()
+    if without_vpn and get_app(app.network_via).kind == "vpn":
+        return ()
     return (app.network_via,)
+
+
+def description_for(app: CatalogApp, present: Iterable[str]) -> str:
+    """The one description every screen that names `app` shows.
+
+    `app.description` almost always promises "only ever through your VPN"
+    for a downloader - once the owner has broken the glass, that becomes a
+    lie, so this reads `description_without_vpn` instead whenever the app's
+    `network_via` isn't part of `present`. An app with no
+    `description_without_vpn` set (everything but qBittorrent, today) is
+    unaffected either way.
+    """
+    if (
+        app.description_without_vpn
+        and app.network_via is not None
+        and app.network_via not in set(present)
+    ):
+        return app.description_without_vpn
+    return app.description
 
 
 def riders_of(app_id: str, present: Iterable[str]) -> tuple[CatalogApp, ...]:

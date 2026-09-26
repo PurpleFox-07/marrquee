@@ -41,6 +41,7 @@ from marrquee.catalog import (
     unavailable_reason,
 )
 from marrquee.compose import (
+    StackPlan,
     build_stack_plan,
     clear_vpn_secrets,
     gluetun_config_for,
@@ -81,6 +82,7 @@ from marrquee.vpn_control import (
 from marrquee.wiring import NoWiringYet, WiringRunner, WiringStep, WiringStepState
 from marrquee.wiring.qbit_client import HttpQbitClient, QbitClient
 from marrquee.wiring.steps import app_base_url
+from marrquee.without_vpn import clear_without_vpn, without_vpn_confirmed
 from marrquee.words import (
     FAILURE_DOCKER_UNREACHABLE,
     FAILURE_VPN_NO_TUN,
@@ -148,7 +150,13 @@ FailureCode = Literal[
 AddState = Literal["starting", "wiring", "error"]
 # "add" is a brand new app; "reconnect" re-runs only the wiring steps for an
 # app that is already `done` in `apps` - it never touches Docker at all.
-AddPurpose = Literal["add", "reconnect"]
+# "change_vpn" removes and recreates an already-installed Gluetun from
+# freshly saved secrets (a login-only change never shows up in compose.yaml,
+# so a plain recreate would keep the old login forever); "restore" is the
+# "Keep running without VPN" recovery from a failed "add" or "change_vpn" -
+# it brings the mover(s) a failed move stopped back up, never touching a
+# VPN app at all.
+AddPurpose = Literal["add", "reconnect", "change_vpn", "restore"]
 AddStart = Literal[
     "started", "busy", "not_ready", "no_login", "unknown_app", "already_installed", "unavailable"
 ]
@@ -224,6 +232,12 @@ class AppAdd:
     # ever starts, so a resumed add reads the exact same set rather than
     # re-deriving it against an install that may have grown since.
     with_apps: tuple[str, ...] = ()
+    # The already-INSTALLED app(s) this run stops and brings back behind
+    # (or, for "restore", back OFF) the VPN - qBittorrent, for an
+    # `app_id="gluetun"` add or a `change_vpn`. Set once, before the run
+    # ever starts, for the same resume-reads-the-same-set reason as
+    # `with_apps` above. Empty for every plain app add and every reconnect.
+    moves: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -473,7 +487,14 @@ class DeployManager:
         except KeyError:
             return self.snapshot()
         if adding.purpose == "add":
+            # Idempotent: a mover's stop/remove (or its own bring-up, or
+            # Gluetun's) against a container a real daemon already
+            # actioned before the restart just repeats, never rolls back.
             self._task = asyncio.create_task(self._run_add(app, install))
+        elif adding.purpose == "change_vpn":
+            self._task = asyncio.create_task(self._run_change_vpn())
+        elif adding.purpose == "restore":
+            self._task = asyncio.create_task(self._run_restore())
         else:
             self._task = asyncio.create_task(self._run_reconnect(app, install))
         return self.snapshot()
@@ -554,7 +575,19 @@ class DeployManager:
         # re-brings it up on its own, so its key/secrets stay current for
         # the new rider. Only a genuinely absent companion is brought along.
         via_already_installed = app.network_via is not None and app.network_via in present_ids
-        companions = () if via_already_installed else companions_for(app_id, present_ids)
+        companions = (
+            ()
+            if via_already_installed
+            else companions_for(
+                app_id, present_ids, without_vpn=without_vpn_confirmed(self._settings.config_dir)
+            )
+        )
+        # Adding the VPN itself moves every already-installed rider behind
+        # it - the one case this add stops and brings BACK an already
+        # running app rather than only creating new ones.
+        moves = (
+            tuple(rider.id for rider in riders_of(app_id, present_ids)) if app.kind == "vpn" else ()
+        )
 
         started_at = _now_iso()
         adding = AppAdd(
@@ -568,17 +601,30 @@ class DeployManager:
             compose_ran=False,
             started_at=started_at,
             with_apps=companions,
+            moves=moves,
         )
         self._emit(replace(snapshot, adding=adding))
         self._task = asyncio.create_task(self._run_add(app, install))
         return "started"
 
     def retry_add(self) -> AddStart:
-        """Re-run a failed add from scratch - the add-path "press Deploy again"."""
+        """Re-run a failed add, change or restore from scratch - the
+        add-path "press Deploy again", widened to the other two run kinds
+        that can also end in `state="error"`.
+        """
         if self._is_running():
             return "busy"
         current = self._snapshot.adding
-        if current is None or current.state != "error" or current.purpose != "add":
+        if (
+            current is None
+            or current.state != "error"
+            or current.purpose
+            not in (
+                "add",
+                "change_vpn",
+                "restore",
+            )
+        ):
             return "busy"
         install = load_state(self._settings.config_dir)
         if install is None:
@@ -588,7 +634,7 @@ class DeployManager:
         started_at = _now_iso()
         adding = AppAdd(
             app_id=app.id,
-            purpose="add",
+            purpose=current.purpose,
             state="starting",
             line=app_line_starting(app.name),
             note=None,
@@ -597,9 +643,15 @@ class DeployManager:
             compose_ran=current.compose_ran,
             started_at=started_at,
             with_apps=current.with_apps,
+            moves=current.moves,
         )
         self._emit(self._replace_finale(adding=adding))
-        self._task = asyncio.create_task(self._run_add(app, install))
+        if current.purpose == "change_vpn":
+            self._task = asyncio.create_task(self._run_change_vpn())
+        elif current.purpose == "restore":
+            self._task = asyncio.create_task(self._run_restore())
+        else:
+            self._task = asyncio.create_task(self._run_add(app, install))
         return "started"
 
     async def cancel_add(self) -> bool:
@@ -617,10 +669,25 @@ class DeployManager:
         at all, so that flag alone can't tell "we created this" apart from
         "this was already installed and running"). A failed reconnect is
         already-installed, working app - Cancel must never remove it;
-        `reconnect(app_id)` is the only recovery this offers.
+        `reconnect(app_id)` is the only recovery this offers. A failed
+        `change_vpn` or `restore` refuses too - the VPN was already the
+        one installed (there is nothing to "put back in the + list"); Try
+        again is the only recovery those two offer.
+
+        When this add brought a VPN's rider(s) along (`current.moves`),
+        cancelling is "Keep running without VPN": the confirmation must
+        already be on disk (it is what lets the rewritten compose file put
+        qBittorrent back on its own network instead of raising), and
+        instead of leaving `adding=None`, a `restore` run brings the
+        rider(s) back up.
         """
         current = self._snapshot.adding
         if current is None or current.state != "error" or current.purpose != "add":
+            return False
+
+        if current.moves and not without_vpn_confirmed(self._settings.config_dir):
+            failed = replace(current, line=hub_cancel_failed(get_app(current.app_id).name))
+            self._emit(self._replace_finale(adding=failed))
             return False
 
         # Every app this add brought along, in REVERSE catalog order
@@ -645,7 +712,6 @@ class DeployManager:
             if shrunk.storage_root is not None:
                 root = PurePosixPath(shrunk.storage_root)
                 write_marker(self._settings, root, shrunk.app_ids, shrunk.puid, shrunk.pgid)
-                answers = load_answers(self._settings.config_dir)
                 # A DIFFERENT app's failed add is being cancelled while
                 # Gluetun (already installed) has since been left with
                 # unusable saved answers - rewriting compose can't succeed,
@@ -653,11 +719,30 @@ class DeployManager:
                 # 500: `build_gluetun_config` raises with no value in its
                 # message, so logging it directly is already safe.
                 try:
-                    write_compose(self._settings, build_stack_plan(shrunk, answers))
+                    write_compose(self._settings, self._stack_plan(shrunk))
                 except ValueError as error:
                     logger.error("cancel: could not rewrite compose.yaml: %s", error)
                 if any(removed_app.kind == "vpn" for removed_app in brought):
                     clear_vpn_secrets(self._settings, root)
+
+        if current.moves:
+            first_mover = get_app(current.moves[0])
+            restore_adding = AppAdd(
+                app_id=first_mover.id,
+                purpose="restore",
+                state="starting",
+                line=app_line_starting(first_mover.name),
+                note=None,
+                failure=None,
+                wiring=(),
+                compose_ran=True,
+                started_at=_now_iso(),
+                with_apps=(),
+                moves=current.moves,
+            )
+            self._emit(self._replace_finale(adding=restore_adding))
+            self._task = asyncio.create_task(self._run_restore())
+            return True
 
         self._emit(self._replace_finale(adding=None))
         return True
@@ -695,6 +780,49 @@ class DeployManager:
         )
         self._emit(replace(snapshot, adding=adding))
         self._task = asyncio.create_task(self._run_reconnect(app, install))
+        return "started"
+
+    def change_vpn(self) -> AddStart:
+        """Start replacing an already-connected Gluetun's login: stop and
+        remove its rider(s), remove Gluetun itself, create it again from
+        freshly saved secrets, prove the tunnel, then bring the rider(s)
+        back.
+
+        Synchronous, and refuses before ever touching Docker - the same
+        "nothing can slip between the checks and `create_task`" shape
+        `add_app` already uses. The route calling this saves the new
+        answers itself, right after this returns `"started"` and before
+        its own next `await` - by the time `_run_change_vpn` reaches its
+        first `load_answers` call, the new answers are already on disk.
+        """
+        install = load_state(self._settings.config_dir)
+        snapshot = self.snapshot()
+        if install is None or snapshot.phase != "finale":
+            return "not_ready"
+        if self._is_running() or snapshot.adding is not None:
+            return "busy"
+        present_ids = tuple(progress.app_id for progress in snapshot.apps)
+        if VPN_APP_ID not in present_ids:
+            return "unknown_app"
+        app = get_app(VPN_APP_ID)
+        moves = tuple(rider.id for rider in riders_of(VPN_APP_ID, present_ids))
+
+        started_at = _now_iso()
+        adding = AppAdd(
+            app_id=VPN_APP_ID,
+            purpose="change_vpn",
+            state="starting",
+            line=app_line_starting(app.name),
+            note=None,
+            failure=None,
+            wiring=(),
+            compose_ran=True,
+            started_at=started_at,
+            with_apps=(),
+            moves=moves,
+        )
+        self._emit(replace(snapshot, adding=adding))
+        self._task = asyncio.create_task(self._run_change_vpn())
         return "started"
 
     # --- Choosing, changing or retrying the one saved login --------------
@@ -816,6 +944,17 @@ class DeployManager:
         except (KeyError, TypeError, ValueError):
             return None
 
+    def _stack_plan(self, install: InstallState) -> StackPlan:
+        """The one place `build_stack_plan` is ever called from: threads
+        the saved answers AND the break-glass confirmation through on
+        every call, so a compose file can never be written by a caller
+        that forgot either one.
+        """
+        answers = load_answers(self._settings.config_dir)
+        return build_stack_plan(
+            install, answers, without_vpn=without_vpn_confirmed(self._settings.config_dir)
+        )
+
     # --- The run itself ------------------------------------------------------
 
     async def _run(self, install: InstallState) -> None:
@@ -928,7 +1067,7 @@ class DeployManager:
         if vpn_failure is not None:
             await self._fail(run_id, started_at, progresses, install, vpn_failure)
             return
-        plan = build_stack_plan(install, answers)
+        plan = self._stack_plan(install)
         compose_path = write_compose(self._settings, plan)
 
         # Marrquee has no label on the stack's own compose project, so this
@@ -1164,7 +1303,7 @@ class DeployManager:
 
             container = await self._engine.inspect(app.id)
             if container.state == "running":
-                if await self._app_ready(app, api_key):
+                if await self._app_ready(app, api_key, install.app_ids):
                     await report("done", app_line_done(app.name), None)
                     return None
                 candidate_line = app_line_warming_up(app.name)
@@ -1182,16 +1321,19 @@ class DeployManager:
 
             await self._sleep(self.POLL_INTERVAL_SECONDS)
 
-    async def _app_ready(self, app: CatalogApp, api_key: str) -> bool:
+    async def _app_ready(self, app: CatalogApp, api_key: str, present: Iterable[str]) -> bool:
         """Whether `app` has finished booting and will accept its key.
 
         qBittorrent has no `system/status` (it isn't an arr app) - proof
         is a live, keyed call to its own `app/version` instead, through
         the same `QbitClient` its settings step and its login use.
+        `present` is the install's own app ids, so this reaches qBittorrent
+        at whichever host it actually answers on - `gluetun` behind the
+        VPN, `qbittorrent` on its own network.
         """
         if app.kind == "downloader":
             response = await self._qbit.request(
-                "GET", app_base_url(app), f"{app.api_base}/app/version", api_key
+                "GET", app_base_url(app, present), f"{app.api_base}/app/version", api_key
             )
             return response.ok
         return await self._probe.check(app.id, app.port, app.api_base, api_key)
@@ -1391,6 +1533,7 @@ class DeployManager:
         # have grown in the meantime.
         current = self._current_adding()
         companions = current.with_apps if current is not None else ()
+        movers = apps_in_order(current.moves) if current is not None else ()
         via_id = app.network_via
         via_already_installed = via_id is not None and via_id in set(install.app_ids)
 
@@ -1461,7 +1604,7 @@ class DeployManager:
         if vpn_failure is not None:
             await self._fail_add(app, grown, vpn_failure, record_diagnostics)
             return
-        plan = build_stack_plan(grown, answers)
+        plan = self._stack_plan(grown)
         compose_path = write_compose(self._settings, plan)
 
         self_id = await self._engine.self_container_id()
@@ -1479,6 +1622,12 @@ class DeployManager:
             self._emit(self._replace_finale(adding=replace(current, compose_ran=True)))
 
         report = self._add_reporter()
+
+        if movers:
+            take_down_failure = await self._take_down(movers)
+            if take_down_failure is not None:
+                await self._fail_add(app, grown, take_down_failure, record_diagnostics)
+                return
 
         if via_already_installed and via_id is not None:
             # The via app already exists, running its OWN key/settings -
@@ -1523,6 +1672,19 @@ class DeployManager:
             await self._fail_add(app, grown, failure, record_diagnostics)
             return
 
+        # Only reached once the VPN app's own proof (above) has succeeded -
+        # a refused or never-up tunnel returns before this point, so a
+        # mover is never recreated behind a VPN that was never proven.
+        for mover in movers:
+            mover_failure = await self._bring_up_app(
+                mover, grown, root, compose_path, plan.network, self_id, report
+            )
+            if mover_failure is not None:
+                await self._fail_add(app, grown, mover_failure, record_diagnostics)
+                return
+            if mover.id in pending_app_ids(load_login(self._settings.config_dir), grown.app_ids):
+                await self._put_login(mover, grown, record_diagnostics=record_diagnostics)
+
         for new_id in new_ids:
             await self._put_login(get_app(new_id), grown, record_diagnostics=record_diagnostics)
 
@@ -1534,7 +1696,15 @@ class DeployManager:
                 )
             )
 
-        await self._run_wiring_for_add(app, grown, record_diagnostics, also_ids=companions)
+        mover_ids = tuple(mover.id for mover in movers)
+        await self._run_wiring_for_add(
+            app, grown, record_diagnostics, also_ids=companions, wire_ids=mover_ids or (app.id,)
+        )
+
+        if movers:
+            # A successful move is the one thing that turns the badge off -
+            # a failed one (caught above, before this line) keeps it lit.
+            clear_without_vpn(self._settings.config_dir)
 
     def _add_reporter(self) -> Callable[[AppState, str, str | None], Awaitable[None]]:
         """The add path's own `report` callback for `_bring_up_app`.
@@ -1560,10 +1730,12 @@ class DeployManager:
         record_diagnostics: Callable[[str], None],
         *,
         also_ids: tuple[str, ...] = (),
+        wire_ids: tuple[str, ...] = (),
     ) -> None:
-        """Run only the wiring steps about `app`, then fold it (and every id
-        in `also_ids` - the companion(s) this same add brought along, a
-        fresh Gluetun beside a fresh qBittorrent) into `apps`.
+        """Run the wiring steps about each id in `wire_ids` (`app.id` alone
+        when not given), then fold `app.id` (and every id in `also_ids` -
+        the companion(s) this same add brought along, a fresh Gluetun
+        beside a fresh qBittorrent) into `apps`.
 
         Shared by a fresh add and a resumed one - the wiring runner is
         idempotent (look-before-write), so re-running it for an app whose
@@ -1571,28 +1743,41 @@ class DeployManager:
         is a repeat, not a risk. `also_ids` is `()` for a plain reconnect
         and for an add whose companion already existed (the CONTRACT FIX
         remove-then-recreate case) - that app is already `done` in `apps`.
+        `wire_ids` is what "Add your VPN" and Change VPN wire instead of
+        `app.id`: the mover(s) whose download-client host just changed,
+        never Gluetun itself, which nothing points at directly.
         """
-        wiring_rows: dict[int, WiringStep] = {}
+        ids_to_wire = wire_ids or (app.id,)
+        for wire_id in ids_to_wire:
+            wiring_rows: dict[int, WiringStep] = {}
 
-        def collect_wiring_step(step: WiringStep) -> None:
-            if step.technical:
-                record_diagnostics(self._redact(step.technical, install))
-            wiring_rows[step.index] = replace(step, technical=None)
-            current = self._current_adding()
-            if current is not None:
-                ordered_steps = tuple(wiring_rows[index] for index in sorted(wiring_rows))
-                self._emit(self._replace_finale(adding=replace(current, wiring=ordered_steps)))
+            def collect_wiring_step(
+                step: WiringStep, _rows: dict[int, WiringStep] = wiring_rows
+            ) -> None:
+                if step.technical:
+                    record_diagnostics(self._redact(step.technical, install))
+                _rows[step.index] = replace(step, technical=None)
+                current = self._current_adding()
+                if current is not None:
+                    ordered_steps = tuple(_rows[index] for index in sorted(_rows))
+                    self._emit(self._replace_finale(adding=replace(current, wiring=ordered_steps)))
 
-        try:
-            await self._wiring.run(install, collect_wiring_step, only_app=app.id)
-        except Exception:
-            # A wiring problem is not an add failure - the app is already
-            # up and done, so this never turns a successful add into one
-            # that looks failed.
-            logger.exception("wiring runner raised during an add; continuing anyway")
+            try:
+                await self._wiring.run(install, collect_wiring_step, only_app=wire_id)
+            except Exception:
+                # A wiring problem is not an add failure - the app is already
+                # up and done, so this never turns a successful add into one
+                # that looks failed.
+                logger.exception("wiring runner raised during an add; continuing anyway")
 
-        wiring_steps = tuple(wiring_rows[index] for index in sorted(wiring_rows))
-        failed_lines = tuple(step.line for step in wiring_steps if step.state == "error")
+            wiring_steps = tuple(wiring_rows[index] for index in sorted(wiring_rows))
+            failed_lines = tuple(step.line for step in wiring_steps if step.state == "error")
+            self._emit(
+                self._replace_finale(
+                    adding=self._current_adding(),
+                    wiring_gaps=self._gaps_with(wire_id, failed_lines),
+                )
+            )
 
         progresses_by_id = {progress.app_id: progress for progress in self._snapshot.apps}
         for finished_app in apps_in_order((*also_ids, app.id)):
@@ -1608,11 +1793,7 @@ class DeployManager:
         ordered_ids = tuple(catalog_app.id for catalog_app in apps_in_order(progresses_by_id))
         new_apps = tuple(progresses_by_id[app_id] for app_id in ordered_ids)
 
-        await self._publish(
-            self._replace_finale(
-                adding=None, apps=new_apps, wiring_gaps=self._gaps_with(app.id, failed_lines)
-            )
-        )
+        await self._publish(self._replace_finale(adding=None, apps=new_apps))
 
     async def _run_reconnect(self, app: CatalogApp, install: InstallState) -> None:
         record_diagnostics = self._diagnostics_recorder()
@@ -1632,6 +1813,267 @@ class DeployManager:
                 ),
                 record_diagnostics,
             )
+
+    # --- Moving qBittorrent: shared by "Add your VPN" and Change VPN ------
+
+    async def _take_down(self, movers: tuple[CatalogApp, ...]) -> Failure | None:
+        """Stop, then force-remove, each of `movers` - in REVERSE catalog
+        order, so a rider's own container goes before the network
+        namespace it shares disappears with its companion's.
+
+        A failed stop is logged and ignored - the removal that follows
+        forces whatever is left, the same way Cancel's own removal always
+        has. A failed removal is a real failure: nothing about the VPN is
+        touched while an old container might still be holding the port
+        (8080) it needs to publish.
+        """
+        for mover in reversed(movers):
+            stop_result = await self._engine.stop_container(mover.id)
+            if not stop_result.ok:
+                logger.warning(
+                    "could not gently stop %s before moving it: %s", mover.id, stop_result.detail
+                )
+            remove_result = await self._engine.remove_container(mover.id)
+            if not remove_result.ok:
+                headline, what_to_do = _split_failure_text(failure_compose_failed(mover.name))
+                return Failure(
+                    code="compose_failed",
+                    headline=headline,
+                    what_to_do=what_to_do,
+                    technical=remove_result.detail or f"could not remove {mover.id!r}",
+                )
+        return None
+
+    async def _run_change_vpn(self) -> None:
+        """Re-enter Change VPN from scratch - a fresh start, a retry, or a
+        resume all call this the same, zero-argument way: everything it
+        needs (the install, which app, which rider(s)) is read fresh from
+        disk and from the persisted `adding` record, never carried in from
+        a caller that might hand it something stale after a restart.
+        """
+        record_diagnostics = self._diagnostics_recorder()
+        app = get_app(VPN_APP_ID)
+        install = load_state(self._settings.config_dir)
+        if install is None:
+            logger.error("change VPN run started with no install state on disk")
+            current = self._current_adding()
+            if current is not None:
+                headline, what_to_do = _split_failure_text(failure_compose_failed(app.name))
+                failure = Failure(
+                    code="compose_failed",
+                    headline=headline,
+                    what_to_do=what_to_do,
+                    technical="no install state found for change_vpn",
+                )
+                await self._publish(
+                    self._replace_finale(
+                        adding=replace(
+                            current, state="error", line=app_line_error(app.name), failure=failure
+                        )
+                    )
+                )
+            return
+        try:
+            await self._run_change_vpn_steps(app, install, record_diagnostics)
+        except Exception as error:  # the background task must never die silently
+            logger.exception("change VPN run crashed unexpectedly")
+            headline, what_to_do = _split_failure_text(failure_compose_failed(app.name))
+            await self._fail_add(
+                app,
+                install,
+                Failure(
+                    code="compose_failed",
+                    headline=headline,
+                    what_to_do=what_to_do,
+                    technical=f"{type(error).__name__}: {error}",
+                ),
+                record_diagnostics,
+            )
+
+    async def _run_change_vpn_steps(
+        self, app: CatalogApp, install: InstallState, record_diagnostics: Callable[[str], None]
+    ) -> None:
+        current = self._current_adding()
+        movers = apps_in_order(current.moves) if current is not None else ()
+
+        docker_status = await self._engine.status()
+        if not docker_status.connected:
+            await self._fail_add(
+                app,
+                install,
+                _docker_unreachable_failure(docker_status.detail or "Docker did not answer"),
+                record_diagnostics,
+            )
+            return
+
+        answers = load_answers(self._settings.config_dir)
+        vpn_failure = _vpn_settings_failure(install.app_ids, answers)
+        if vpn_failure is not None:
+            await self._fail_add(app, install, vpn_failure, record_diagnostics)
+            return
+
+        plan = self._stack_plan(install)
+        compose_path = write_compose(self._settings, plan)
+
+        self_id = await self._engine.self_container_id()
+        if self_id is None:
+            await self._fail_add(
+                app,
+                install,
+                _docker_unreachable_failure("could not identify Marrquee's own container"),
+                record_diagnostics,
+            )
+            return
+
+        if movers:
+            take_down_failure = await self._take_down(movers)
+            if take_down_failure is not None:
+                await self._fail_add(app, install, take_down_failure, record_diagnostics)
+                return
+
+        # Gluetun only reads its secrets when it starts - a login-only
+        # change never shows up in compose.yaml, so `recreate=True` would
+        # leave it running the OLD login forever. Remove-then-create is
+        # the only honest recreate; the rider(s) are already gone by now,
+        # so there is no container whose network points at a dead Gluetun.
+        remove_result = await self._engine.remove_container(app.id)
+        if not remove_result.ok:
+            await self._fail_add(
+                app,
+                install,
+                _docker_unreachable_failure(remove_result.detail or f"could not remove {app.id!r}"),
+                record_diagnostics,
+            )
+            return
+
+        report = self._add_reporter()
+        failure = await self._bring_up_app(
+            app, install, plan.storage_root, compose_path, plan.network, self_id, report
+        )
+        if failure is not None:
+            await self._fail_add(app, install, failure, record_diagnostics)
+            return
+
+        for mover in movers:
+            mover_failure = await self._bring_up_app(
+                mover, install, plan.storage_root, compose_path, plan.network, self_id, report
+            )
+            if mover_failure is not None:
+                await self._fail_add(app, install, mover_failure, record_diagnostics)
+                return
+            if mover.id in pending_app_ids(load_login(self._settings.config_dir), install.app_ids):
+                await self._put_login(mover, install, record_diagnostics=record_diagnostics)
+
+        current = self._current_adding()
+        if current is not None:
+            self._emit(
+                self._replace_finale(
+                    adding=replace(current, state="wiring", line=hub_line_connecting(app.name))
+                )
+            )
+
+        mover_ids = tuple(mover.id for mover in movers)
+        await self._run_wiring_for_add(app, install, record_diagnostics, wire_ids=mover_ids)
+
+    async def _run_restore(self) -> None:
+        """Bring the mover(s) a failed move stopped back up on their own
+        network - "Keep running without VPN". Zero-argument for the same
+        reason as `_run_change_vpn`: a fresh start, a retry and a resume
+        all call it the same way.
+        """
+        record_diagnostics = self._diagnostics_recorder()
+        current = self._current_adding()
+        movers = apps_in_order(current.moves) if current is not None else ()
+        install = load_state(self._settings.config_dir)
+        if install is None or not movers:
+            logger.error("restore run started with no install state or no movers to restore")
+            if current is not None:
+                lead_name = get_app(current.app_id).name
+                headline, what_to_do = _split_failure_text(failure_compose_failed(lead_name))
+                failure = Failure(
+                    code="compose_failed",
+                    headline=headline,
+                    what_to_do=what_to_do,
+                    technical="no install state or movers found for restore",
+                )
+                await self._publish(
+                    self._replace_finale(
+                        adding=replace(
+                            current, state="error", line=app_line_error(lead_name), failure=failure
+                        )
+                    )
+                )
+            return
+        try:
+            await self._run_restore_steps(movers, install, record_diagnostics)
+        except Exception as error:  # the background task must never die silently
+            logger.exception("restore run crashed unexpectedly")
+            lead = movers[0]
+            headline, what_to_do = _split_failure_text(failure_compose_failed(lead.name))
+            await self._fail_add(
+                lead,
+                install,
+                Failure(
+                    code="compose_failed",
+                    headline=headline,
+                    what_to_do=what_to_do,
+                    technical=f"{type(error).__name__}: {error}",
+                ),
+                record_diagnostics,
+            )
+
+    async def _run_restore_steps(
+        self,
+        movers: tuple[CatalogApp, ...],
+        install: InstallState,
+        record_diagnostics: Callable[[str], None],
+    ) -> None:
+        lead = movers[0]
+
+        docker_status = await self._engine.status()
+        if not docker_status.connected:
+            await self._fail_add(
+                lead,
+                install,
+                _docker_unreachable_failure(docker_status.detail or "Docker did not answer"),
+                record_diagnostics,
+            )
+            return
+
+        plan = self._stack_plan(install)
+        compose_path = write_compose(self._settings, plan)
+
+        self_id = await self._engine.self_container_id()
+        if self_id is None:
+            await self._fail_add(
+                lead,
+                install,
+                _docker_unreachable_failure("could not identify Marrquee's own container"),
+                record_diagnostics,
+            )
+            return
+
+        report = self._add_reporter()
+        for mover in movers:
+            failure = await self._bring_up_app(
+                mover, install, plan.storage_root, compose_path, plan.network, self_id, report
+            )
+            if failure is not None:
+                await self._fail_add(lead, install, failure, record_diagnostics)
+                return
+            if mover.id in pending_app_ids(load_login(self._settings.config_dir), install.app_ids):
+                await self._put_login(mover, install, record_diagnostics=record_diagnostics)
+
+        current = self._current_adding()
+        if current is not None:
+            self._emit(
+                self._replace_finale(
+                    adding=replace(current, state="wiring", line=hub_line_connecting(lead.name))
+                )
+            )
+
+        mover_ids = tuple(mover.id for mover in movers)
+        await self._run_wiring_for_add(lead, install, record_diagnostics, wire_ids=mover_ids)
 
     async def _fail_add(
         self,
@@ -1819,7 +2261,7 @@ class DeployManager:
             record_diagnostics(self._redact(vpn_failure.technical, install))
             logger.error("login run: %s", vpn_failure.technical)
             return
-        plan = build_stack_plan(install, answers)
+        plan = self._stack_plan(install)
         compose_path = write_compose(self._settings, plan)
         self_id = await self._engine.self_container_id()
         if self_id is None:
@@ -2202,9 +2644,17 @@ def _app_add_from_payload(payload: dict[str, object]) -> AppAdd:
         isinstance(item, str) for item in with_apps_payload
     ):
         raise TypeError(f"expected a list of strings, got {with_apps_payload!r}")
+    moves_payload = payload.get("moves", [])
+    if not isinstance(moves_payload, list) or not all(
+        isinstance(item, str) for item in moves_payload
+    ):
+        raise TypeError(f"expected a list of strings, got {moves_payload!r}")
     return AppAdd(
         app_id=_require_str(payload.get("app_id")),
-        purpose=cast(AddPurpose, _require_choice(payload.get("purpose"), ("add", "reconnect"))),
+        purpose=cast(
+            AddPurpose,
+            _require_choice(payload.get("purpose"), ("add", "reconnect", "change_vpn", "restore")),
+        ),
         state=cast(
             AddState, _require_choice(payload.get("state"), ("starting", "wiring", "error"))
         ),
@@ -2215,6 +2665,7 @@ def _app_add_from_payload(payload: dict[str, object]) -> AppAdd:
         compose_ran=_require_bool(payload.get("compose_ran")),
         started_at=_require_str(payload.get("started_at")),
         with_apps=tuple(with_apps_payload),
+        moves=tuple(moves_payload),
     )
 
 

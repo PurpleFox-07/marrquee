@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+
+{% block title %}{{ words.QUESTION_NO_VPN_LINK }} &middot; Marrquee{% endblock %}
+
+{% block head %}
+<link rel="stylesheet" href="{{ url_for('static', path='css/wizard.css') }}">
+{% endblock %}
+
+{% block content %}
+<div class="wrap wizard">
+  <p class="eyebrow">{{ words.WIZARD_EYEBROW }}</p>
+  {% include "partials/steps.html" %}
+
+  {% include "partials/platform_warning.html" %}
+
+  {% include "partials/without_vpn_confirm.html" %}
+</div>
+{% endblock %}

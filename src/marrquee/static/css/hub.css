@@ -360,7 +360,9 @@
 .hub-panel[data-panel-mode="link"] [data-panel-pane="link"],
 .hub-panel[data-panel-mode="edit"] [data-panel-pane="edit"],
 .hub-panel[data-panel-mode="login"] [data-panel-pane="login"],
-.hub-panel[data-panel-mode="seeding"] [data-panel-pane="seeding"] {
+.hub-panel[data-panel-mode="seeding"] [data-panel-pane="seeding"],
+.hub-panel[data-panel-mode="vpn"] [data-panel-pane="vpn"],
+.hub-panel[data-panel-mode="without-vpn"] [data-panel-pane="without-vpn"] {
   display: block;
 }
 
@@ -440,6 +442,55 @@
   margin: var(--space-1) 0 0;
   font-size: var(--text-sm);
   color: var(--text-muted);
+}
+
+/* qBittorrent's own row while a break-glass confirmation is saved but the
+ * app isn't installed yet - an amber note, matching the badge's own
+ * colour, plus its own undo button. */
+.install-row__note {
+  color: var(--warning);
+  font-size: var(--text-sm);
+  margin-top: var(--space-2);
+}
+
+/* --- The amber "Running without VPN" badge, right under the lede -----------
+ * The tap target comes from the padding, not a fixed height (12 + 20 + 12
+ * is already past the 44px minimum), matching wizard.css's own
+ * `.warning-banner` amber pair for the same "something needs your
+ * attention" colour. */
+
+.no-vpn-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  background: var(--warning-light);
+  border: 1px solid var(--warning);
+  border-radius: var(--radius-full);
+  padding: var(--space-3) var(--space-4);
+  margin-bottom: var(--space-6);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-bold);
+  text-decoration: none;
+}
+
+.no-vpn-badge:hover {
+  border-color: var(--spotlight);
+}
+
+.no-vpn-badge:focus-visible {
+  outline: 2px solid var(--spotlight);
+  outline-offset: 2px;
+}
+
+.no-vpn-badge__glyph {
+  color: var(--warning);
+}
+
+.no-vpn-badge__action {
+  color: var(--warning);
+  text-decoration: underline;
+  font-weight: var(--weight-semibold);
 }
 
 /* Removing a link only takes its card off the Hub - the button still

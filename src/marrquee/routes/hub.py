@@ -27,8 +27,9 @@ from starlette.datastructures import FormData
 
 from marrquee import words
 from marrquee.addresses import authority_from_headers, proxy_suspected
+from marrquee.catalog import get_app
 from marrquee.config import Settings
-from marrquee.deploy import DeployManager, DeploySnapshot
+from marrquee.deploy import AddStart, DeployManager, DeploySnapshot
 from marrquee.docker_client import DockerEngine
 from marrquee.health import LinkProbe, read_health, read_link_health
 from marrquee.hub import (
@@ -39,9 +40,13 @@ from marrquee.hub import (
     HubView,
     LoginFormState,
     SeedingFormState,
+    VpnFormState,
+    WithoutVpnState,
     hub_panel,
     hub_view,
     login_view,
+    running_without_vpn,
+    vpn_prefill,
 )
 from marrquee.links import (
     LINK_COUNT_MAX,
@@ -62,10 +67,16 @@ from marrquee.login import (
     password_matches,
     save_login,
 )
-from marrquee.questions import SEEDING_STEP, check_step, load_answers, save_step_answers
+from marrquee.questions import SEEDING_STEP, VPN_STEP, check_step, load_answers, save_step_answers
 from marrquee.state import load_state
-from marrquee.vpn import TunnelPlace
+from marrquee.vpn import VPN_APP_ID, TunnelPlace
 from marrquee.vpn_control import GluetunControl
+from marrquee.without_vpn import (
+    clear_without_vpn,
+    next_stage,
+    save_without_vpn,
+    without_vpn_confirmed,
+)
 
 router = APIRouter()
 
@@ -154,6 +165,7 @@ async def read_hub_view(request: Request) -> HubView:
         busy=manager.is_busy(),
         login=login,
         vpn_place=vpn_place,
+        without_vpn=without_vpn_confirmed(settings.config_dir),
     )
 
 
@@ -176,6 +188,10 @@ async def get_hub(request: Request) -> Response:
         # query string asked for the seeding pane, not whether qBittorrent
         # is actually there to change anything about.
         panel = hub_panel(None, None, links)
+    if panel.mode == "vpn" and view.vpn_pane is None:
+        panel = hub_panel(None, None, links)
+    if panel.mode == "without-vpn" and not view.without_vpn_offer:
+        panel = hub_panel(None, None, links)
     return _hub_response(request, view, panel)
 
 
@@ -192,6 +208,8 @@ def _hub_response(
     login_form: LoginFormState | None = None,
     change_form: LoginFormState | None = None,
     seeding_form: SeedingFormState | None = None,
+    vpn_form: VpnFormState | None = None,
+    without_vpn_state: WithoutVpnState | None = None,
 ) -> Response:
     settings: Settings = request.app.state.settings
     templates: Jinja2Templates = request.app.state.templates
@@ -207,6 +225,13 @@ def _hub_response(
         # back to reading on the next wiring run.
         saved = load_answers(settings.config_dir).get("qbittorrent", {})
         seeding_form = SeedingFormState(answers=saved, problem=None, problem_field=None)
+    if vpn_form is None:
+        # Same "prefill from whatever's already saved" idea as the seeding
+        # pane above, kept to only the keys that are ever safe to show back.
+        saved_vpn = load_answers(settings.config_dir).get(VPN_APP_ID, {})
+        vpn_form = VpnFormState(answers=vpn_prefill(saved_vpn), problem=None, problem_field=None)
+    if without_vpn_state is None:
+        without_vpn_state = WithoutVpnState(stage=1, problem=None)
     context = {
         "view": view,
         "words": words,
@@ -219,6 +244,9 @@ def _hub_response(
         "change_step": CHANGE_STEP,
         "seeding_step": SEEDING_STEP,
         "seeding_form": seeding_form,
+        "vpn_step": VPN_STEP,
+        "vpn_form": vpn_form,
+        "without_vpn_state": without_vpn_state,
         "login_help_url": LOGIN_HELP_URL,
     }
     return templates.TemplateResponse(request, "hub.html", context, status_code=status_code)
@@ -510,6 +538,137 @@ async def post_hub_seeding(request: Request) -> Response:
     # on disk when the run was scheduled.
     save_step_answers(settings.config_dir, "qbittorrent", check.answers)
     return RedirectResponse("/", status_code=303)
+
+
+# --- The VPN: "Add your VPN", "Change VPN", and the break-glass escape ------
+
+
+async def _vpn_refusal(
+    request: Request, *, answers: Mapping[str, str], problem: str, problem_field: str | None
+) -> Response:
+    """Re-render the live Hub with the panel forced open on the vpn pane -
+    a refusal or a busy re-render always comes from that pane, whatever
+    `?panel=` the request itself carried, and nothing is ever saved on this
+    path. `answers` is filtered to the safe keys before it ever reaches a
+    template, the same as a plain open.
+    """
+    view = await read_hub_view(request)
+    vpn_form = VpnFormState(
+        answers=vpn_prefill(answers), problem=problem, problem_field=problem_field
+    )
+    panel = HubPanel(mode="vpn", edit=None, label="", url="", error=None)
+    return _hub_response(request, view, panel, vpn_form=vpn_form)
+
+
+@router.post("/hub/vpn", response_class=HTMLResponse)
+async def post_hub_vpn(request: Request) -> Response:
+    """ "Add your VPN", "Change VPN", and a failed one of either's own retry
+    (with a chance to fix the answers first) - all three post here, since
+    all three ask the same question (`VPN_STEP`) before starting the same
+    kind of run.
+
+    Unlike the install endpoint, the run is started BEFORE the new answers
+    are saved: a busy refusal must never overwrite a working login the
+    owner hasn't actually asked to replace yet.
+    """
+    form = await request.form()
+    settings: Settings = request.app.state.settings
+    manager: DeployManager = request.app.state.deploy
+
+    snapshot = manager.snapshot()
+    if load_state(settings.config_dir) is None or snapshot.phase != "finale":
+        return RedirectResponse("/", status_code=303)
+
+    adding = snapshot.adding
+    present_ids = {progress.app_id for progress in snapshot.apps}
+    posted = {field.name: _form_value(form, field.name) for field in VPN_STEP.fields}
+
+    branch: Literal["retry", "change", "add"]
+    if adding is not None and adding.app_id == VPN_APP_ID and adding.state == "error":
+        branch = "retry"
+    elif VPN_APP_ID in present_ids:
+        branch = "change"
+    elif running_without_vpn(present_ids, adding):
+        branch = "add"
+    else:
+        return RedirectResponse("/", status_code=303)
+
+    if manager.is_busy() or (adding is not None and branch != "retry"):
+        return await _vpn_refusal(
+            request, answers=posted, problem=words.HUB_VPN_BUSY, problem_field=None
+        )
+
+    saved = load_answers(settings.config_dir).get(VPN_APP_ID, {})
+    check = check_step(VPN_STEP, posted, saved)
+    if not check.ok:
+        return await _vpn_refusal(
+            request, answers=check.answers, problem=check.problem or "", problem_field=check.field
+        )
+
+    result: AddStart
+    if branch == "retry":
+        result = manager.retry_add()
+    elif branch == "change":
+        result = manager.change_vpn()
+    else:
+        result = manager.add_app(VPN_APP_ID)
+
+    if result != "started":
+        # A deferred import: `routes/api.py` itself imports `read_hub_view`
+        # from this module, so importing its helper back at module load
+        # time would be a real cycle - by the time this function actually
+        # runs, both modules are already fully loaded.
+        from marrquee.routes.api import _add_start_refusal_message
+
+        return await _vpn_refusal(
+            request,
+            answers=check.answers,
+            problem=_add_start_refusal_message(result, get_app(VPN_APP_ID), manager),
+            problem_field=None,
+        )
+
+    # Saved right after the run starts, before this handler's next `await` -
+    # the same ordering `post_hub_seeding` uses, for the same reason: the
+    # run only reads `answers.json` once it actually begins.
+    save_step_answers(settings.config_dir, VPN_APP_ID, check.answers)
+    return RedirectResponse("/", status_code=303)
+
+
+@router.post("/hub/without-vpn", response_class=HTMLResponse)
+async def post_hub_without_vpn(request: Request) -> Response:
+    """Walk the break-glass three steps from the Hub's own qBittorrent row -
+    the third, typed step is the only one that writes anything at all.
+    """
+    form = await request.form()
+    settings: Settings = request.app.state.settings
+
+    view = await read_hub_view(request)
+    if not view.without_vpn_offer:
+        return RedirectResponse("/", status_code=303)
+
+    outcome = next_stage(_form_value(form, "stage"), _form_value(form, "typed"))
+    if not outcome.confirmed:
+        without_vpn_state = WithoutVpnState(stage=outcome.stage, problem=outcome.problem)
+        panel = HubPanel(mode="without-vpn", edit=None, label="", url="", error=None)
+        return _hub_response(request, view, panel, without_vpn_state=without_vpn_state)
+
+    save_without_vpn(settings.config_dir, now=datetime.now(UTC))
+    return RedirectResponse("/?panel=install#hub-panel", status_code=303)
+
+
+@router.post("/hub/without-vpn/undo")
+async def post_hub_without_vpn_undo(request: Request) -> Response:
+    """Undo a saved break-glass confirmation, while qBittorrent still isn't
+    installed and no add is in flight - the Hub's own "+" row offers this,
+    never once qBittorrent exists (there's nothing left to undo by then).
+    """
+    settings: Settings = request.app.state.settings
+    manager: DeployManager = request.app.state.deploy
+    snapshot = manager.snapshot()
+    installed_ids = {progress.app_id for progress in snapshot.apps}
+    if "qbittorrent" not in installed_ids and snapshot.adding is None:
+        clear_without_vpn(settings.config_dir)
+    return RedirectResponse("/?panel=install#hub-panel", status_code=303)
 
 
 # --- Adding an app: Try again, Cancel and Connect again are form posts -------

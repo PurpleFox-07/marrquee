@@ -61,6 +61,7 @@ from marrquee.routes.wizard import router as wizard_router
 from marrquee.state import STATE_VERSION, InstallState, load_state, save_state, write_json_atomic
 from marrquee.vpn import VPN_PROVIDERS, TunnelPlace, provider_wiki_url
 from marrquee.vpn_control import FakeGluetunControl
+from marrquee.without_vpn import save_without_vpn, without_vpn_confirmed
 from marrquee.words import STATUS_CHIP_DONE, app_line_done
 
 _TEMPLATES_DIR = Path(__file__).resolve().parents[1] / "src" / "marrquee" / "templates"
@@ -135,6 +136,7 @@ def _adding(
     note: str | None = None,
     failure: Failure | None = None,
     compose_ran: bool = False,
+    moves: tuple[str, ...] = (),
 ) -> AppAdd:
     return AppAdd(
         app_id=app_id,
@@ -146,6 +148,7 @@ def _adding(
         wiring=(),
         compose_ran=compose_ran,
         started_at="2026-09-24T00:00:00+00:00",
+        moves=moves,
     )
 
 
@@ -295,6 +298,31 @@ def _seeding_pane_html(page_html: str) -> str:
     match = re.search(r'<div data-panel-pane="seeding">.*?</dialog>', page_html, re.DOTALL)
     assert match is not None, "no seeding pane found on the page"
     return match.group(0)
+
+
+def _pane_html(page_html: str, name: str) -> str:
+    """One named `data-panel-pane`'s own markup, sliced out of the whole
+    page up to whichever comes first - the next pane, or the dialog's own
+    close tag - so this works regardless of where the pane sits among its
+    siblings.
+    """
+    match = re.search(
+        rf'<div data-panel-pane="{name}">.*?(?=<div data-panel-pane="|</dialog>)',
+        page_html,
+        re.DOTALL,
+    )
+    assert match is not None, f"no {name} pane found on the page"
+    return match.group(0)
+
+
+def _assert_unique_ids(page_html: str) -> None:
+    """Every `id="..."` on a rendered page has to be unique - two elements
+    sharing one breaks every `label[for]`/`getElementById` hook that names
+    it, silently, for whichever one a browser happens to pick.
+    """
+    ids = re.findall(r'\bid="([^"]+)"', page_html)
+    dupes = sorted({id_ for id_ in ids if ids.count(id_) > 1})
+    assert not dupes, f"duplicate element ids: {dupes!r}"
 
 
 class _AnchorNestingCollector(HTMLParser):
@@ -1944,17 +1972,23 @@ def test_the_choose_login_banner_and_the_gluetun_install_row_render_together(
         config_dir=tmp_path / "config",
         reset_login="forgot-my-password-2026",
     )
-    # qBittorrent is deployed alongside Prowlarr here (a pure view test,
-    # never a real compose plan) so its own install row - which would
-    # otherwise ALSO carry Gluetun's VPN step as a companion - drops out
-    # of `installable` entirely, leaving exactly one gluetun row on the
-    # page for this test's own id-uniqueness assertion to be about.
-    deployed = ("prowlarr", "qbittorrent")
+    deployed = ("prowlarr",)
     save_state(settings.config_dir, _install_state(deployed))
     _write_snapshot(settings, _finale_snapshot(deployed))
     save_login(settings.config_dir, "owner", "old-password-1", honor_reset=None)
+    # qBittorrent's own row would ALSO carry Gluetun's VPN step as a
+    # companion - excluded here (`offered=False`) so exactly one gluetun
+    # row is on the page for this test's own id-uniqueness assertion to be
+    # about, and so `running_without_vpn` (which would open the Hub's OWN
+    # separate VPN pane, carrying the very same field ids a second time)
+    # never becomes true just because this test needed Gluetun's row.
     offered_catalog = tuple(
-        dataclasses.replace(app, offered=True) if app.id == "gluetun" else app for app in CATALOG
+        dataclasses.replace(app, offered=True)
+        if app.id == "gluetun"
+        else dataclasses.replace(app, offered=False)
+        if app.id == "qbittorrent"
+        else app
+        for app in CATALOG
     )
     monkeypatch.setattr(hub_module, "CATALOG", offered_catalog)
     engine = FakeDockerEngine(
@@ -1972,8 +2006,7 @@ def test_the_choose_login_banner_and_the_gluetun_install_row_render_together(
     assert 'data-role="question-guide"' in page
     assert "data-guide-url=" in page
 
-    ids = re.findall(r'\bid="([^"]+)"', page)
-    assert len(ids) == len(set(ids)), f"expected every element id to be unique, got {ids!r}"
+    _assert_unique_ids(page)
 
 
 def test_the_vpn_step_renders_a_select_with_every_provider() -> None:
@@ -2080,7 +2113,7 @@ def test_login_step_still_renders_byte_identically_through_the_shared_partial() 
         '    id="q-marrquee-password_again"\n'
         '    name="password_again"\n'
         "    \n    \n    \n"
-        "  >\n  \n  \n  \n"
+        "  >\n  \n  \n  \n  \n"
         "</fieldset>"
     )
 
@@ -2190,6 +2223,25 @@ def test_a_non_qbittorrent_hub_never_offers_the_seeding_panel(tmp_path: Path) ->
     assert _dialog(page.text).get("data-panel-mode") == "closed"
 
 
+def test_the_seeding_panes_own_fields_never_duplicate_the_install_rows(tmp_path: Path) -> None:
+    """qBittorrent's own "+" row carries the same `SEEDING_STEP` (app_id
+    "qbittorrent") the seeding pane's form does - while qBittorrent isn't
+    installed yet, the pane's copy of those fields must not render at all,
+    or every `id="q-qbittorrent-seed*"` on the page would exist twice.
+    """
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    _write_snapshot(settings, _finale_snapshot(("sonarr",)))
+    save_login(settings.config_dir, "owner", "s3cret-password-1", honor_reset=None)
+    client = _client(settings)
+
+    page = client.get("/?panel=install").text
+
+    assert 'data-install-form="qbittorrent"' in page
+    assert 'data-question-step="qbittorrent:seeding"' in page
+    _assert_unique_ids(page)
+
+
 def test_change_seeding_saves_the_new_answer_and_reconnects(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     save_state(settings.config_dir, _install_state(("gluetun", "qbittorrent")))
@@ -2262,6 +2314,344 @@ def test_own_with_blank_numbers_refuses_on_seed_ratio_and_saves_nothing(tmp_path
     pane = _seeding_pane_html(response.text)
     assert words.SEEDING_PROBLEM_OWN_EMPTY in pane
     assert "qbittorrent" not in load_answers(settings.config_dir)
+
+
+# --- The badge, Change VPN and the three-step escape hatch ------------------
+
+
+def _vpn_answers(
+    provider: str = "mullvad", *, user: str = "ci-user", password: str = "ci-pass"
+) -> dict[str, str]:
+    return {
+        "provider": provider,
+        "vpn_type": "openvpn",
+        "openvpn_user": user,
+        "openvpn_password": password,
+        "wireguard_private_key": "",
+        "wireguard_addresses": "",
+        "wireguard_preshared_key": "",
+        "server_countries": "",
+    }
+
+
+def test_every_vpn_change_hook_exists_in_the_rendered_hub(tmp_path: Path) -> None:
+    """FIRST TEST - every hook the badge, the Change VPN link, both new
+    panel panes and the escape link promise genuinely exists once each is
+    reachable.
+    """
+    # Running without a VPN: the badge, and the "add" VPN pane's own form.
+    running = _settings(tmp_path / "running")
+    save_state(running.config_dir, _install_state(("qbittorrent",)))
+    _write_snapshot(running, _finale_snapshot(("qbittorrent",)))
+    running_page = _client(running).get("/").text
+
+    badge = re.search(r'<a[^>]*class="no-vpn-badge"[^>]*>', running_page)
+    assert badge is not None
+    assert 'href="/?panel=vpn#hub-panel"' in badge.group(0)
+    assert 'data-panel-open="vpn"' in badge.group(0)
+    running_vpn_pane = _pane_html(running_page, "vpn")
+    assert 'action="/hub/vpn"' in running_vpn_pane
+    _assert_unique_ids(running_page)
+
+    # Gluetun installed: its own "Change VPN" link, and the "change" pane.
+    changeable = _settings(tmp_path / "changeable")
+    save_state(changeable.config_dir, _install_state(("gluetun", "qbittorrent")))
+    _write_snapshot(changeable, _finale_snapshot(("gluetun", "qbittorrent")))
+    engine = FakeDockerEngine(
+        DockerStatus(connected=True, version="27.3.1"), containers=_qbittorrent_containers()
+    )
+    changeable_page = _client(changeable, engine).get("/").text
+
+    assert (
+        re.search(
+            r'<a class="hub-tile-link" href="/\?panel=vpn#hub-panel" data-panel-open="vpn">',
+            changeable_page,
+        )
+        is not None
+    )
+    changeable_vpn_pane = _pane_html(changeable_page, "vpn")
+    assert 'action="/hub/vpn"' in changeable_vpn_pane
+    _assert_unique_ids(changeable_page)
+
+    # Not installed yet: the without-vpn escape link on qBittorrent's own
+    # VPN companion step, and the undo form once confirmed.
+    fresh = _settings(tmp_path / "fresh")
+    save_state(fresh.config_dir, _install_state(()))
+    _write_snapshot(fresh, _finale_snapshot(()))
+    save_login(fresh.config_dir, "owner", "s3cret-password-1", honor_reset=None)
+    fresh_page = _client(fresh).get("/?panel=install").text
+
+    assert 'data-role="without-vpn-link"' in fresh_page
+    assert 'data-panel-choice="without-vpn"' in fresh_page
+    without_vpn_pane = _pane_html(fresh_page, "without-vpn")
+    assert 'action="/hub/without-vpn"' in without_vpn_pane
+    assert 'name="stage"' in without_vpn_pane
+    _assert_unique_ids(fresh_page)
+
+    confirmed = _settings(tmp_path / "confirmed")
+    save_state(confirmed.config_dir, _install_state(()))
+    _write_snapshot(confirmed, _finale_snapshot(()))
+    save_login(confirmed.config_dir, "owner", "s3cret-password-1", honor_reset=None)
+    save_without_vpn(confirmed.config_dir, now=datetime(2026, 9, 26, tzinfo=UTC))
+    confirmed_page = _client(confirmed).get("/?panel=install").text
+
+    assert 'action="/hub/without-vpn/undo"' in confirmed_page
+    _assert_unique_ids(confirmed_page)
+
+
+def test_the_status_endpoint_carries_running_without_vpn_and_the_widened_actions(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("qbittorrent",)))
+    _write_snapshot(settings, _finale_snapshot(("qbittorrent",)))
+    client = _client(settings)
+
+    status = client.get("/api/hub/status").json()
+
+    assert status["running_without_vpn"] is True
+    assert status["apps"][0]["actions"] == "none"
+    assert status["apps"][0]["can_change_vpn"] is False
+
+
+def test_the_escape_link_is_absent_from_the_change_vpn_pane(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("gluetun", "qbittorrent")))
+    _write_snapshot(settings, _finale_snapshot(("gluetun", "qbittorrent")))
+    client = _client(settings)
+
+    pane = _pane_html(client.get("/?panel=vpn").text, "vpn")
+
+    assert "without-vpn-link" not in pane
+    assert words.QUESTION_NO_VPN_LINK not in pane
+
+
+def test_the_vpn_form_never_echoes_the_username_or_a_password(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("gluetun", "qbittorrent")))
+    _write_snapshot(settings, _finale_snapshot(("gluetun", "qbittorrent")))
+    save_step_answers(settings.config_dir, "gluetun", _vpn_answers(user="do-not-leak-me"))
+    client = _client(settings)
+
+    pane = _pane_html(client.get("/?panel=vpn").text, "vpn")
+
+    assert "do-not-leak-me" not in pane
+    assert "ci-pass" not in pane
+    assert 'value="ci-user"' not in pane
+
+
+def test_post_hub_vpn_starts_change_vpn_then_saves(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("gluetun", "qbittorrent")))
+    _write_snapshot(settings, _finale_snapshot(("gluetun", "qbittorrent")))
+    engine = FakeDockerEngine(
+        DockerStatus(connected=True, version="27.3.1"), containers=_qbittorrent_containers()
+    )
+    manager = DeployManager(settings, engine, vpn=FakeGluetunControl())
+    app = create_app(settings=settings, engine=engine, manager=manager)
+    client = TestClient(app)
+
+    response = client.post(
+        "/hub/vpn", data=_vpn_answers(provider="protonvpn"), follow_redirects=False
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/"
+    adding = manager.snapshot().adding
+    assert adding is not None
+    assert adding.app_id == "gluetun"
+    assert adding.purpose == "change_vpn"
+    assert load_answers(settings.config_dir)["gluetun"]["provider"] == "protonvpn"
+
+
+def test_post_hub_vpn_busy_saves_nothing(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("qbittorrent",)))
+    _write_snapshot(settings, _finale_snapshot(("qbittorrent",)))
+    save_login(settings.config_dir, "owner", "s3cret-password-1", honor_reset=None)
+    engine = FakeDockerEngine(
+        DockerStatus(connected=True, version="27.3.1"), images={get_app("radarr").image}
+    )
+    manager = DeployManager(
+        settings, engine, probe=FakeReadinessProbe(default=False), sleep=_never_returns
+    )
+    app = create_app(settings=settings, engine=engine, manager=manager)
+
+    with TestClient(app) as client:
+        started = client.post("/api/hub/apps/radarr/install", json={"answers": {}})
+        assert started.status_code == 202
+
+        response = client.post("/hub/vpn", data=_vpn_answers())
+
+        assert response.status_code == 200
+        assert _dialog(response.text).get("data-panel-mode") == "vpn"
+        assert words.HUB_VPN_BUSY in _pane_html(response.text, "vpn")
+        assert "gluetun" not in load_answers(settings.config_dir)
+
+
+def test_post_hub_vpn_refusal_keeps_the_pane_open_and_saves_nothing(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("gluetun", "qbittorrent")))
+    _write_snapshot(settings, _finale_snapshot(("gluetun", "qbittorrent")))
+    client = _client(settings)
+
+    response = client.post("/hub/vpn", data={**_vpn_answers(), "provider": ""})
+
+    assert response.status_code == 200
+    assert _dialog(response.text).get("data-panel-mode") == "vpn"
+    assert "gluetun" not in load_answers(settings.config_dir)
+
+
+def test_post_hub_vpn_in_no_vpn_mode_adds_gluetun(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("qbittorrent",)))
+    _write_snapshot(settings, _finale_snapshot(("qbittorrent",)))
+    save_login(settings.config_dir, "owner", "s3cret-password-1", honor_reset=None)
+    engine = FakeDockerEngine(
+        DockerStatus(connected=True, version="27.3.1"), containers=_qbittorrent_containers()
+    )
+    manager = DeployManager(settings, engine, vpn=FakeGluetunControl())
+    app = create_app(settings=settings, engine=engine, manager=manager)
+    client = TestClient(app)
+
+    response = client.post("/hub/vpn", data=_vpn_answers(), follow_redirects=False)
+
+    assert response.status_code == 303
+    adding = manager.snapshot().adding
+    assert adding is not None
+    assert adding.app_id == "gluetun"
+    assert adding.purpose == "add"
+    assert adding.moves == ("qbittorrent",)
+
+
+def test_post_hub_vpn_in_error_it_retries(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(()))
+    failure = Failure(code="vpn_refused", headline="x", what_to_do="y", technical="z")
+    _write_snapshot(
+        settings,
+        _finale_with_add(
+            (),
+            adding=_adding(
+                app_id="gluetun",
+                purpose="add",
+                state="error",
+                line=app_line_done("VPN"),
+                failure=failure,
+                moves=("qbittorrent",),
+            ),
+        ),
+    )
+    engine = FakeDockerEngine(DockerStatus(connected=True, version="27.3.1"))
+    manager = DeployManager(settings, engine, vpn=FakeGluetunControl())
+    app = create_app(settings=settings, engine=engine, manager=manager)
+    client = TestClient(app)
+
+    response = client.post("/hub/vpn", data=_vpn_answers(), follow_redirects=False)
+
+    assert response.status_code == 303
+    adding = manager.snapshot().adding
+    assert adding is not None
+    # A genuinely new run replaced the stale one - its own `started_at`
+    # (always "now") is never the persisted snapshot's placeholder value.
+    assert adding.started_at != "2026-09-24T00:00:00+00:00"
+
+
+def test_three_posts_confirm_a_wrong_sentence_saves_nothing(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(()))
+    _write_snapshot(settings, _finale_snapshot(()))
+    save_login(settings.config_dir, "owner", "s3cret-password-1", honor_reset=None)
+    client = _client(settings)
+
+    stage1 = client.post("/hub/without-vpn", data={"stage": "1", "typed": ""})
+    assert stage1.status_code == 200
+    assert _pane_html(stage1.text, "without-vpn").count('data-stage="2"') == 1
+    assert not (settings.config_dir / "without_vpn.json").exists()
+
+    stage2 = client.post("/hub/without-vpn", data={"stage": "2", "typed": ""})
+    assert stage2.status_code == 200
+    assert _pane_html(stage2.text, "without-vpn").count('data-stage="3"') == 1
+    assert not (settings.config_dir / "without_vpn.json").exists()
+
+    wrong = client.post("/hub/without-vpn", data={"stage": "3", "typed": "wrong"})
+    assert wrong.status_code == 200
+    pane = _pane_html(wrong.text, "without-vpn")
+    # HTML-escaped (the sentence's own apostrophe becomes `&#39;`) - checked
+    # by a substring with no punctuation of its own.
+    assert "exactly as shown" in pane
+    assert not without_vpn_confirmed(settings.config_dir)
+
+    right = client.post(
+        "/hub/without-vpn",
+        data={"stage": "3", "typed": words.WITHOUT_VPN_PHRASE},
+        follow_redirects=False,
+    )
+    assert right.status_code == 303
+    assert right.headers["location"] == "/?panel=install#hub-panel"
+    assert without_vpn_confirmed(settings.config_dir)
+
+
+def test_without_vpn_post_is_refused_once_qbittorrent_is_installed(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("qbittorrent",)))
+    _write_snapshot(settings, _finale_snapshot(("qbittorrent",)))
+    client = _client(settings)
+
+    response = client.post(
+        "/hub/without-vpn",
+        data={"stage": "3", "typed": words.WITHOUT_VPN_PHRASE},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/"
+    assert not without_vpn_confirmed(settings.config_dir)
+
+
+def test_undo_clears_the_confirmation(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(()))
+    _write_snapshot(settings, _finale_snapshot(()))
+    save_without_vpn(settings.config_dir, now=datetime(2026, 9, 26, tzinfo=UTC))
+    client = _client(settings)
+
+    response = client.post("/hub/without-vpn/undo", follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/?panel=install#hub-panel"
+    assert not without_vpn_confirmed(settings.config_dir)
+
+
+def test_undo_is_refused_once_qbittorrent_is_installed(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("qbittorrent",)))
+    _write_snapshot(settings, _finale_snapshot(("qbittorrent",)))
+    save_without_vpn(settings.config_dir, now=datetime(2026, 9, 26, tzinfo=UTC))
+    client = _client(settings)
+
+    client.post("/hub/without-vpn/undo")
+
+    assert without_vpn_confirmed(settings.config_dir)
+
+
+def test_the_qbittorrent_row_without_the_vpn_shows_the_note_the_undo_and_only_seeding(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(()))
+    _write_snapshot(settings, _finale_snapshot(()))
+    save_login(settings.config_dir, "owner", "s3cret-password-1", honor_reset=None)
+    save_without_vpn(settings.config_dir, now=datetime(2026, 9, 26, tzinfo=UTC))
+    client = _client(settings)
+
+    page = client.get("/?panel=install").text
+
+    assert words.WITHOUT_VPN_ROW_NOTE in page
+    assert words.QBITTORRENT_DESCRIPTION_NO_VPN in page
+    assert 'action="/hub/without-vpn/undo"' in page
+    assert 'data-question-step="gluetun:vpn"' not in page
+    assert 'data-question-step="qbittorrent:seeding"' in page
 
 
 def test_the_seeding_pane_preselects_the_saved_preset(tmp_path: Path) -> None:

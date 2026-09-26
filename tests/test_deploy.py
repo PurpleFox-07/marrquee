@@ -39,6 +39,7 @@ from marrquee.docker_client import (
     ContainerHealth,
     ContainerRemoveResult,
     ContainerSnapshot,
+    ContainerStopResult,
     DockerStatus,
     FakeDockerEngine,
     NetworkConnectResult,
@@ -140,6 +141,7 @@ class _StatefulEngine:
         self_container_id: str | None = "marrquee",
         network_exists: bool = False,
         remove_results: dict[str, bool] | None = None,
+        stop_results: dict[str, bool] | None = None,
         logs: dict[str, str] | None = None,
         health_frames: dict[str, list[ContainerHealth | None]] | None = None,
     ) -> None:
@@ -151,6 +153,7 @@ class _StatefulEngine:
         self._containers: dict[str, ContainerSnapshot] = {}
         self._network_exists = network_exists
         self._remove_results = remove_results or {}
+        self._stop_results = stop_results or {}
         self._logs = logs or {}
         # A VPN whose Docker health changes tick by tick is state this fake
         # must model too (docker-fakes-model-state) - each name scripted
@@ -255,6 +258,14 @@ class _StatefulEngine:
         # guarantee, modelled here the same way a real daemon would behave.
         self._containers.pop(name, None)
         return ContainerRemoveResult(ok=True, detail=None)
+
+    async def stop_container(self, name: str, *, timeout_seconds: int = 30) -> ContainerStopResult:
+        self.calls.append(("stop_container", (name,)))
+        if not self._stop_results.get(name, True):
+            return ContainerStopResult(ok=False, detail=f"scripted failure stopping {name!r}")
+        if name in self._containers:
+            self._containers[name] = dataclasses.replace(self._containers[name], state="exited")
+        return ContainerStopResult(ok=True, detail=None)
 
 
 def _happy_engine(app_ids: tuple[str, ...]) -> _StatefulEngine:

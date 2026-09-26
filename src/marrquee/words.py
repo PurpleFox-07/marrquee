@@ -1517,6 +1517,105 @@ _QBIT_WORDS: tuple[str, ...] = (
 # end qBittorrent section
 # =============================================================================
 
+# =============================================================================
+# VPN changes - the break-glass "run without a VPN" phrase and its three
+# steps, the permanent Hub badge and "Add your VPN", and "Change VPN"
+# =============================================================================
+
+WITHOUT_VPN_PHRASE = "I understand my real address will be visible"
+QUESTION_NO_VPN_LINK = "Can't use a VPN right now?"
+WITHOUT_VPN_STEP1_TITLE = "Run qBittorrent without a VPN?"
+WITHOUT_VPN_STEP1_BODY = (
+    "Without a VPN, everyone you download from and share with can see your home's "
+    "internet address, and your internet company can see what you download. Marrquee "
+    "strongly recommends a VPN."
+)
+WITHOUT_VPN_STEP1_GO = "Continue without a VPN"
+WITHOUT_VPN_STEP2_TITLE = "Are you sure?"
+WITHOUT_VPN_STEP2_BODY = (
+    "Some internet companies send warnings, slow down or cut off connections that "
+    "share files without a VPN. You can add a VPN later from your Hub, and Marrquee "
+    "will move qBittorrent behind it."
+)
+WITHOUT_VPN_STEP2_GO = "I'm sure"
+WITHOUT_VPN_STEP3_TITLE = "Type this to confirm"
+WITHOUT_VPN_STEP3_BODY = "Type the sentence below exactly, then press Run without a VPN."
+WITHOUT_VPN_TYPED_LABEL = "The sentence"
+WITHOUT_VPN_STEP3_GO = "Run without a VPN"
+WITHOUT_VPN_USE_VPN = "Use a VPN instead"
+WITHOUT_VPN_PROBLEM_MISMATCH = (
+    "That doesn't match. Type the sentence exactly as shown - or choose Use a VPN instead."
+)
+WITHOUT_VPN_ROW_NOTE = "You chose to run qBittorrent without a VPN."
+WITHOUT_VPN_UNDO = "Use a VPN after all"
+QBITTORRENT_DESCRIPTION_NO_VPN = (
+    "Downloads what Sonarr and Radarr find. Running without a VPN - add one from your Hub."
+)
+DOWNLOADER_NO_VPN_COMPOSE_COMMENT = (
+    "Running WITHOUT a VPN, as you confirmed on your Hub. Add your VPN there to move it behind one."
+)
+HUB_NO_VPN_BADGE = "Running without VPN"
+HUB_NO_VPN_BADGE_ACTION = "Add your VPN"
+HUB_CHANGE_VPN = "Change VPN"
+HUB_VPN_ADD_TITLE = "Add your VPN"
+HUB_VPN_ADD_LEDE = (
+    "Marrquee connects to your VPN, proves it works, then moves qBittorrent behind it. "
+    "Downloads pause for a minute or two while it moves."
+)
+HUB_VPN_ADD_SUBMIT = "Connect this VPN"
+HUB_VPN_CHANGE_TITLE = "Change VPN"
+HUB_VPN_CHANGE_LEDE = (
+    "These settings replace your current VPN. Type your VPN username again; leave a "
+    "password box empty to keep the one you saved. Downloads pause until the new VPN is "
+    "proven."
+)
+HUB_VPN_CHANGE_SUBMIT = "Save and reconnect"
+HUB_VPN_BUSY = "Marrquee is busy with another change. Try again in a minute - nothing was changed."
+HUB_CHIP_VPN_CHANGING = "Changing…"
+HUB_CHIP_VPN_CHANGE_FAILED = "Didn't connect"
+HUB_KEEP_WITHOUT_VPN = "Keep running without VPN"
+HUB_LINE_RESTARTING_WITHOUT_VPN = "Starting qBittorrent again without a VPN…"
+
+
+_VPN_CHANGE_WORDS: tuple[str, ...] = (
+    "WITHOUT_VPN_PHRASE",
+    "QUESTION_NO_VPN_LINK",
+    "WITHOUT_VPN_STEP1_TITLE",
+    "WITHOUT_VPN_STEP1_BODY",
+    "WITHOUT_VPN_STEP1_GO",
+    "WITHOUT_VPN_STEP2_TITLE",
+    "WITHOUT_VPN_STEP2_BODY",
+    "WITHOUT_VPN_STEP2_GO",
+    "WITHOUT_VPN_STEP3_TITLE",
+    "WITHOUT_VPN_STEP3_BODY",
+    "WITHOUT_VPN_TYPED_LABEL",
+    "WITHOUT_VPN_STEP3_GO",
+    "WITHOUT_VPN_USE_VPN",
+    "WITHOUT_VPN_PROBLEM_MISMATCH",
+    "WITHOUT_VPN_ROW_NOTE",
+    "WITHOUT_VPN_UNDO",
+    "QBITTORRENT_DESCRIPTION_NO_VPN",
+    "DOWNLOADER_NO_VPN_COMPOSE_COMMENT",
+    "HUB_NO_VPN_BADGE",
+    "HUB_NO_VPN_BADGE_ACTION",
+    "HUB_CHANGE_VPN",
+    "HUB_VPN_ADD_TITLE",
+    "HUB_VPN_ADD_LEDE",
+    "HUB_VPN_ADD_SUBMIT",
+    "HUB_VPN_CHANGE_TITLE",
+    "HUB_VPN_CHANGE_LEDE",
+    "HUB_VPN_CHANGE_SUBMIT",
+    "HUB_VPN_BUSY",
+    "HUB_CHIP_VPN_CHANGING",
+    "HUB_CHIP_VPN_CHANGE_FAILED",
+    "HUB_KEEP_WITHOUT_VPN",
+    "HUB_LINE_RESTARTING_WITHOUT_VPN",
+)
+
+# =============================================================================
+# end VPN changes section
+# =============================================================================
+
 # The full review surface: every public name above, in one tuple. A later
 # feature area adds its own fenced section above this line, then extends
 # this tuple with its own `_..._WORDS` name - never editing an earlier
@@ -1532,4 +1631,5 @@ WORDS_INVENTORY: tuple[str, ...] = (
     *_LOGIN_WORDS,
     *_VPN_WORDS,
     *_QBIT_WORDS,
+    *_VPN_CHANGE_WORDS,
 )

@@ -1307,8 +1307,14 @@ jobs:
               qbittorrent = get_app("qbittorrent")
               sonarr = get_app("sonarr")
 
+              present = ("gluetun", "qbittorrent")
               category = await ensure_qbit_category(
-                  qbit, qbittorrent, qbit_key, media_folder="tv", save_path="/data/torrents/tv"
+                  qbit,
+                  qbittorrent,
+                  qbit_key,
+                  media_folder="tv",
+                  save_path="/data/torrents/tv",
+                  present=present,
               )
               if category.state != "done":
                   raise SystemExit(f"ensure_qbit_category did not finish: {category}")
@@ -1321,6 +1327,7 @@ jobs:
                   qbit_key,
                   category_field="tvCategory",
                   category="tv",
+                  present=present,
               )
               if client_result.state != "done":
                   raise SystemExit(f"ensure_download_client did not finish: {client_result}")
@@ -1462,6 +1469,341 @@ jobs:
           remaining=$(docker exec marrquee-stack-smoke sh -c "ls -A '${secrets_dir}'")
           if [ -n "$remaining" ]; then
             echo "::error::the VPN secrets folder still had files after cancel"
+            exit 1
+          fi
+
+      # Radarr was stopped for the earlier "Down" proof and never started
+      # again. Every wiring run below (adding qBittorrent, then moving it,
+      # then restoring it) waits on EVERY installed app to answer before it
+      # calls itself done - Radarr included - so a stopped Radarr would
+      # cost each of those runs the engine's own 180-second ready timeout
+      # for nothing. Restarting it here, once, keeps the rest of this job
+      # fast instead of just eventually correct.
+      - name: Start Radarr again and wait for the Hub to say Up
+        run: |
+          docker start radarr
+          for _ in $(seq 1 30); do
+            status=$(curl -fsS http://127.0.0.1:7788/api/hub/status)
+            state=$(echo "$status" | jq -r '.apps[] | select(.app_id == "radarr") | .state')
+            echo "radarr state: $state"
+            if [ "$state" = "up" ]; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::Radarr never read Up again within 60 seconds of docker start"
+          exit 1
+
+      # --- No-VPN mode: break the glass, add qBittorrent on its own network,
+      # try to move it behind a VPN that can never really connect, then keep
+      # it running without one. An earlier step in this same job already
+      # wrote a real qBittorrent.conf with a key that only ever lived in
+      # memory - write_qbit_conf never overwrites an existing file, so a
+      # real add here would inherit a key nothing else ever saved. Wiping
+      # the folder first is safe because that earlier step never touched
+      # install.json.
+      - name: Choose to run qBittorrent without a VPN (no-vpn move)
+        run: |
+          set -euo pipefail
+          docker exec marrquee-stack-smoke rm -rf "/host${RUNNER_TEMP}/marrquee-smoke/media/marrquee/apps/qbittorrent"
+
+          wrong_code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:7788/hub/without-vpn \
+            --data-urlencode "stage=3" --data-urlencode "typed=wrong")
+          if [ "$wrong_code" != "200" ]; then
+            echo "::error::a wrong sentence at break-glass stage 3 returned ${wrong_code}, expected 200"
+            exit 1
+          fi
+          if docker exec marrquee-stack-smoke test -e /config/without_vpn.json; then
+            echo "::error::a wrong sentence at break-glass stage 3 saved the confirmation file anyway"
+            exit 1
+          fi
+
+          for stage in 1 2; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:7788/hub/without-vpn \
+              --data-urlencode "stage=${stage}")
+            if [ "$code" != "200" ]; then
+              echo "::error::break-glass stage ${stage} returned ${code}, expected 200"
+              exit 1
+            fi
+          done
+
+          phrase=$(docker exec marrquee-stack-smoke python3 -c \
+            "from marrquee.words import WITHOUT_VPN_PHRASE; print(WITHOUT_VPN_PHRASE)")
+          confirm_code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:7788/hub/without-vpn \
+            --data-urlencode "stage=3" --data-urlencode "typed=${phrase}")
+          if [ "$confirm_code" != "303" ]; then
+            echo "::error::the typed break-glass sentence returned ${confirm_code}, expected 303"
+            exit 1
+          fi
+          if ! docker exec marrquee-stack-smoke test -e /config/without_vpn.json; then
+            echo "::error::the typed break-glass confirmation never wrote without_vpn.json"
+            exit 1
+          fi
+
+      - name: Add qBittorrent without a VPN
+        run: |
+          response=$(curl -s -w '\n%{http_code}' -X POST \
+            http://127.0.0.1:7788/api/hub/apps/qbittorrent/install \
+            -H "Content-Type: application/json" \
+            -d '{"answers":{"seeding":"good_neighbor"}}')
+          code=$(echo "$response" | tail -n1)
+          body=$(echo "$response" | sed '$d')
+          echo "hub install response (${code}): ${body}"
+          if [ "$code" != "202" ]; then
+            echo "::error::POST /api/hub/apps/qbittorrent/install returned ${code}, expected 202: ${body}"
+            exit 1
+          fi
+
+      - name: Poll GET /api/hub/status until qBittorrent finishes adding without a VPN (5 minute budget)
+        run: |
+          for _ in $(seq 1 150); do
+            status=$(curl -fsS http://127.0.0.1:7788/api/hub/status)
+            qbit=$(echo "$status" | jq -c '.apps[] | select(.app_id == "qbittorrent")')
+            state=$(echo "$qbit" | jq -r '.state')
+            add_state=$(echo "$qbit" | jq -r '.add_state')
+            busy=$(echo "$status" | jq -r '.busy')
+            line=$(echo "$qbit" | jq -r '.line')
+            echo "qbittorrent state: $state / add_state: $add_state / busy: $busy"
+            if [ "$add_state" = "error" ]; then
+              MESSAGE="adding qBittorrent without a VPN failed: ${line}" \
+                python3 -c "import os; text = os.environ['MESSAGE'].replace('%', '%25').replace(chr(13), '%0D').replace(chr(10), '%0A').replace('::', ': :'); print('::error::' + text)"
+              exit 1
+            fi
+            if [ "$state" = "up" ] && [ "$add_state" = "null" ] && [ "$busy" = "false" ]; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::qBittorrent never finished adding without a VPN within 5 minutes"
+          exit 1
+
+      # The one proof reading source can't settle for a no-VPN install: a
+      # real container on the `marrquee` network answering on the runner's
+      # own published 8080, and Sonarr's own connection test moving its
+      # existing qBittorrent client (still pointed at "gluetun" from an
+      # earlier step) onto the new host by name, since matching on the
+      # implementation alone would never notice the host changed.
+      - name: Assert qBittorrent runs without a VPN and Sonarr's client points at it
+        run: |
+          running_without_vpn=$(curl -fsS http://127.0.0.1:7788/api/hub/status | jq -r '.running_without_vpn')
+          if [ "$running_without_vpn" != "true" ]; then
+            echo "::error::running_without_vpn was not true once qBittorrent finished adding without a VPN"
+            exit 1
+          fi
+
+          network_mode=$(docker inspect -f '{{.HostConfig.NetworkMode}}' qbittorrent)
+          echo "qbittorrent network mode: $network_mode"
+          if [[ "$network_mode" == container:* ]]; then
+            echo "::error::qBittorrent joined a companion's network instead of running on its own"
+            exit 1
+          fi
+
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/)
+          if [ "$code" != "200" ]; then
+            echo "::error::qBittorrent's own published port 8080 did not answer (got ${code})"
+            exit 1
+          fi
+
+          compose_file="$RUNNER_TEMP/marrquee-smoke/media/marrquee/compose.yaml"
+          sonarr_key=$(grep -E '^\s*SONARR__AUTH__APIKEY:' "$compose_file" | sed -E 's/.*: *"([^"]+)".*/\1/')
+          if [ -z "$sonarr_key" ]; then
+            echo "::error::could not read Sonarr's API key out of the compose file"
+            exit 1
+          fi
+          response=$(curl -fsS -H "X-Api-Key: ${sonarr_key}" http://127.0.0.1:8989/api/v3/downloadclient)
+          if ! echo "$response" \
+            | jq -e '[.[] | select(.implementation == "QBittorrent")][0].fields[] | select(.name == "host") | .value == "qbittorrent"' \
+            > /dev/null
+          then
+            echo "::error::Sonarr's qBittorrent client host never moved to qbittorrent"
+            exit 1
+          fi
+
+      # qBittorrent has to be gone before Gluetun can publish the same 8080
+      # it was just holding, on a real daemon rather than just by reading
+      # the compose builder's source. The fake login can never actually
+      # connect - that failure is proven a few steps down - but the port
+      # hand-over itself happens the moment the run starts, long before the
+      # tunnel ever gets a chance to fail.
+      - name: Add your VPN again hands qBittorrent's port to the tunnel (no-vpn hand-over)
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:7788/hub/vpn \
+            --data-urlencode "provider=protonvpn" \
+            --data-urlencode "vpn_type=openvpn" \
+            --data-urlencode "openvpn_user=marrquee-ci-not-a-user" \
+            --data-urlencode "openvpn_password=${MARRQUEE_CI_VPN_PASSWORD}")
+          if [ "$code" != "303" ]; then
+            echo "::error::POST /hub/vpn returned ${code}, expected 303"
+            exit 1
+          fi
+
+          started=false
+          for _ in $(seq 1 10); do
+            add_state=$(curl -fsS http://127.0.0.1:7788/api/hub/status \
+              | jq -r '.apps[] | select(.app_id == "gluetun") | .add_state')
+            if [ "$add_state" != "null" ] && [ -n "$add_state" ]; then
+              started=true
+              break
+            fi
+            sleep 2
+          done
+          if [ "$started" != "true" ]; then
+            echo "::error::Add your VPN did not start"
+            exit 1
+          fi
+
+          qbittorrent_gone=false
+          gluetun_has_port=false
+          for _ in $(seq 1 30); do
+            if ! docker inspect qbittorrent > /dev/null 2>&1; then
+              qbittorrent_gone=true
+            fi
+            port_bindings=$(docker inspect -f '{{json .HostConfig.PortBindings}}' gluetun 2>/dev/null || echo "")
+            if echo "$port_bindings" | grep -q '"8080/tcp"'; then
+              gluetun_has_port=true
+            fi
+            if [ "$qbittorrent_gone" = "true" ] && [ "$gluetun_has_port" = "true" ]; then
+              break
+            fi
+            sleep 2
+          done
+          if [ "$qbittorrent_gone" != "true" ]; then
+            echo "::error::qBittorrent was still running when the VPN started"
+            exit 1
+          fi
+          if [ "$gluetun_has_port" != "true" ]; then
+            echo "::error::The VPN did not get qBittorrent's port"
+            exit 1
+          fi
+
+      # A fake login can never connect - it surfaces as either vpn_refused
+      # or vpn_not_connected, never as up. This waits again here because
+      # this run started from qBittorrent already installed and running
+      # without a VPN, not merely absent, so it exercises a different path
+      # through the same refusal.
+      - name: Poll GET /api/hub/status until the no-vpn hand-over's VPN add reports its plain failure (4 minute budget)
+        run: |
+          add_state=""
+          line=""
+          for _ in $(seq 1 120); do
+            status=$(curl -fsS http://127.0.0.1:7788/api/hub/status)
+            gluetun=$(echo "$status" | jq -c '.apps[] | select(.app_id == "gluetun")')
+            state=$(echo "$gluetun" | jq -r '.state')
+            add_state=$(echo "$gluetun" | jq -r '.add_state')
+            line=$(echo "$gluetun" | jq -r '.line')
+            echo "gluetun state: $state / add_state: $add_state"
+            if [ "$state" = "up" ]; then
+              echo "::error::A fake VPN login was reported as connected"
+              exit 1
+            fi
+            if [ "$add_state" = "error" ]; then
+              break
+            fi
+            sleep 2
+          done
+          if [ "$add_state" != "error" ]; then
+            echo "::error::Gluetun's no-VPN add never reached add_state=error within 4 minutes"
+            exit 1
+          fi
+          echo "NO_VPN_GLUETUN_LINE=$line" >> "$GITHUB_ENV"
+
+      # The tile's `line` is `headline + " " + what_to_do` - split the two
+      # candidate sentences the same way, inside the container, exactly
+      # like the earlier VPN-failure check, so this compares against
+      # exactly what the running code would say rather than a copy pasted
+      # into the workflow.
+      - name: Assert the no-vpn hand-over's VPN failure is one of the two plain sentences and qBittorrent stays paused
+        run: |
+          cat > "$RUNNER_TEMP/no_vpn_expected_lines.py" <<'PY'
+          from marrquee.deploy import DeployManager, _split_failure_text
+          from marrquee.vpn import find_provider
+          from marrquee.words import failure_vpn_not_connected, failure_vpn_refused
+
+          company = find_provider("protonvpn")
+          assert company is not None
+          minutes = round(DeployManager.TUNNEL_NEVER_UP_AFTER_SECONDS / 60)
+
+          headline, what_to_do = _split_failure_text(failure_vpn_refused(company.label))
+          print(f"{headline} {what_to_do}")
+
+          headline, what_to_do = _split_failure_text(failure_vpn_not_connected(minutes))
+          print(f"{headline} {what_to_do}")
+          PY
+
+          docker cp "$RUNNER_TEMP/no_vpn_expected_lines.py" marrquee-stack-smoke:/tmp/no_vpn_expected_lines.py
+          expected=$(docker exec marrquee-stack-smoke python /tmp/no_vpn_expected_lines.py)
+          echo "expected sentences:"
+          echo "$expected"
+          if ! echo "$expected" | grep -qxF "$NO_VPN_GLUETUN_LINE"; then
+            echo "::error::the no-vpn hand-over's failed VPN tile line matched neither the vpn_refused nor the vpn_not_connected sentence"
+            exit 1
+          fi
+          echo "::notice::the no-vpn hand-over's fake VPN login failed as expected: $NO_VPN_GLUETUN_LINE"
+
+          paused=$(curl -fsS http://127.0.0.1:7788/api/hub/status \
+            | jq -r '.apps[] | select(.app_id == "qbittorrent") | .paused')
+          if [ "$paused" != "true" ]; then
+            echo "::error::qBittorrent's tile was not paused while the no-vpn hand-over's VPN add was failing"
+            exit 1
+          fi
+
+      # The owner's real way out of a VPN that will never connect: qBittorrent
+      # comes back on its own network, the confirmation is kept (the owner
+      # never has to type the phrase again), and the VPN's secrets are gone
+      # for good.
+      - name: Keep running without VPN brings qBittorrent back (no-vpn restore)
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:7788/hub/apps/gluetun/cancel)
+          if [ "$code" != "303" ]; then
+            echo "::error::POST /hub/apps/gluetun/cancel returned ${code}, expected 303 (no-vpn restore)"
+            exit 1
+          fi
+
+          restored=false
+          for _ in $(seq 1 90); do
+            status=$(curl -fsS http://127.0.0.1:7788/api/hub/status)
+            qbit=$(echo "$status" | jq -c '.apps[] | select(.app_id == "qbittorrent")')
+            state=$(echo "$qbit" | jq -r '.state')
+            add_state=$(echo "$qbit" | jq -r '.add_state')
+            busy=$(echo "$status" | jq -r '.busy')
+            echo "qbittorrent state: $state / add_state: $add_state / busy: $busy"
+            if [ "$state" = "up" ] && [ "$add_state" = "null" ] && [ "$busy" = "false" ]; then
+              restored=true
+              break
+            fi
+            sleep 2
+          done
+          if [ "$restored" != "true" ]; then
+            echo "::error::qBittorrent never came back without a VPN within 3 minutes of Keep running without VPN"
+            exit 1
+          fi
+
+          if docker inspect gluetun > /dev/null 2>&1; then
+            echo "::error::gluetun's container still existed after Keep running without VPN"
+            exit 1
+          fi
+
+          network_mode=$(docker inspect -f '{{.HostConfig.NetworkMode}}' qbittorrent)
+          if [[ "$network_mode" == container:* ]]; then
+            echo "::error::qBittorrent was still riding a companion's network after Keep running without VPN"
+            exit 1
+          fi
+
+          running_without_vpn=$(curl -fsS http://127.0.0.1:7788/api/hub/status | jq -r '.running_without_vpn')
+          if [ "$running_without_vpn" != "true" ]; then
+            echo "::error::running_without_vpn was not true after Keep running without VPN restored qBittorrent"
+            exit 1
+          fi
+
+          secrets_dir="/host${RUNNER_TEMP}/marrquee-smoke/media/marrquee/vpn"
+          remaining=$(docker exec marrquee-stack-smoke sh -c "ls -A '${secrets_dir}'")
+          if [ -n "$remaining" ]; then
+            echo "::error::the VPN secrets folder still had files after Keep running without VPN"
+            exit 1
+          fi
+
+          if ! docker exec marrquee-stack-smoke test -e /config/without_vpn.json; then
+            echo "::error::the without-VPN confirmation was lost by Keep running without VPN"
             exit 1
           fi
 

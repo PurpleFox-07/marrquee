@@ -1326,6 +1326,8 @@ def test_stack_smoke_sonarr_connects_to_qbittorrent_with_the_key_while_the_tunne
 
     assert "ensure_qbit_category" in run
     assert "ensure_download_client" in run
+    assert 'present = ("gluetun", "qbittorrent")' in run
+    assert "present=present" in run
     assert "/api/v3/downloadclient" in run
     assert "QBittorrent" in run
     assert "removeCompletedDownloads" in run
@@ -1468,3 +1470,235 @@ def test_stack_smoke_new_qbittorrent_step_names_avoid_forbidden_needles() -> Non
         name = str(_step_named(job, *needles)["name"]).lower()
         for phrase in forbidden:
             assert phrase not in name, f"step {name!r} contains the forbidden phrase {phrase!r}"
+
+
+# --- Real Docker proves no-VPN mode, the safe move, and the way back. These
+# steps run after the VPN cancel above, against a stack that already has
+# qBittorrent and Gluetun both absent, Gluetun's port free, and Sonarr
+# already pointed at a "gluetun" download-client entry left by an earlier
+# step in this job. ---------------------------------------------------------
+
+
+def test_stack_smoke_restarts_radarr_before_the_no_vpn_move() -> None:
+    """Every wiring run the no-VPN steps trigger waits on every installed
+    app, Radarr included - restarting it here (once) instead of letting
+    each later run eat its own ready timeout for a Radarr that never came
+    back.
+    """
+    job = _stack_smoke_job()
+    step = _step_named(job, "start radarr again")
+    run = step["run"]
+
+    assert "docker start radarr" in run
+    assert "seq 1 " in run
+    assert "while true" not in run
+    assert "::error::" in run
+
+    names = [str(s.get("name", "")) for s in _steps(job)]
+    radarr_index = names.index(step["name"])
+    stop_index = names.index(_step_named(job, "stop radarr")["name"])
+    choose_index = names.index(_step_named(job, "choose", "no-vpn")["name"])
+    assert stop_index < radarr_index < choose_index
+
+
+def test_stack_smoke_no_vpn_wrong_sentence_is_tried_first_and_saves_nothing() -> None:
+    step = _step_named(_stack_smoke_job(), "choose", "no-vpn")
+    run = step["run"]
+
+    wrong_pos = run.index("typed=wrong")
+    file_check_pos = run.index("without_vpn.json")
+    stage_one_pos = run.index("stage=${stage}")
+    assert wrong_pos < file_check_pos < stage_one_pos
+
+    assert "test -e /config/without_vpn.json" in run
+    assert "WITHOUT_VPN_PHRASE" in run
+    assert '"303"' in run
+    assert "::error::" in run
+
+
+def test_stack_smoke_no_vpn_move_wipes_qbittorrents_config_folder_first() -> None:
+    step = _step_named(_stack_smoke_job(), "choose", "no-vpn")
+    run = step["run"]
+
+    assert "rm -rf" in run
+    assert "/marrquee/apps/qbittorrent" in run
+    rm_pos = run.index("rm -rf")
+    wrong_pos = run.index("typed=wrong")
+    assert rm_pos < wrong_pos
+
+
+def test_stack_smoke_no_vpn_add_moves_sonarrs_client_host_to_qbittorrent() -> None:
+    """An earlier step already left Sonarr's downloadclient entry pointed
+    at "gluetun" - the real no-VPN add has to notice the host changed (by
+    name, since the implementation alone never changes) and PUT it back to
+    "qbittorrent".
+    """
+    step = _step_named(_stack_smoke_job(), "add qbittorrent without a vpn")
+    assert '"202"' in step["run"]
+    assert "::error::" in step["run"]
+
+    poll_step = _step_named(_stack_smoke_job(), "poll", "qbittorrent finishes adding without a vpn")
+    assert "add_state" in poll_step["run"]
+    assert "::error::" in poll_step["run"]
+
+    assert_step = _step_named(_stack_smoke_job(), "sonarr's client points at it")
+    run = assert_step["run"]
+    assert "running_without_vpn" in run
+    assert "container:" in run
+    assert "127.0.0.1:8080" in run
+    assert 'value == "qbittorrent"' in run
+    assert "::error::" in run
+
+
+def test_stack_smoke_no_vpn_hand_over_reuses_the_masked_vpn_password() -> None:
+    """No new credential is generated for this second VPN attempt - the
+    same masked throwaway login from earlier in the job is reused, so a
+    leak here would already have tripped `::add-mask::` long before this
+    step ever ran.
+    """
+    step = _step_named(_stack_smoke_job(), "hands", "qbittorrent's port")
+    run = step["run"]
+
+    assert "${MARRQUEE_CI_VPN_PASSWORD}" in run
+    assert "openssl rand" not in run
+    assert "::add-mask::" not in run
+    for line in run.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("echo") or "::error::" in stripped or "::notice::" in stripped:
+            assert "MARRQUEE_CI_VPN_PASSWORD" not in stripped, (
+                f"the VPN password appears in an echoed line: {line!r}"
+            )
+
+
+def test_stack_smoke_no_vpn_hand_over_step_checks_qbittorrent_is_gone_and_gluetun_holds_8080() -> (
+    None
+):
+    step = _step_named(_stack_smoke_job(), "hands", "qbittorrent's port")
+    run = step["run"]
+
+    assert '"303"' in run
+    assert "Add your VPN did not start" in run
+    assert "docker inspect qbittorrent" in run
+    assert "qBittorrent was still running when the VPN started" in run
+    assert "HostConfig.PortBindings" in run
+    assert '"8080/tcp"' in run
+    assert "The VPN did not get qBittorrent's port" in run
+
+
+def test_stack_smoke_no_vpn_hand_over_failure_is_one_of_the_two_plain_sentences() -> None:
+    step = _step_named(_stack_smoke_job(), "no-vpn hand-over", "plain sentences")
+    run = step["run"]
+
+    assert "_split_failure_text" in run
+    assert "failure_vpn_refused" in run
+    assert "failure_vpn_not_connected" in run
+    assert "NO_VPN_GLUETUN_LINE" in run
+    assert 'select(.app_id == "qbittorrent") | .paused' in run
+    assert '"true"' in run
+    assert "::error::" in run
+
+
+def test_stack_smoke_no_vpn_restore_brings_qbittorrent_back_on_its_own_network() -> None:
+    step = _step_named(_stack_smoke_job(), "no-vpn restore")
+    run = step["run"]
+
+    assert "/hub/apps/gluetun/cancel" in run
+    assert '"303"' in run
+    assert "docker inspect gluetun" in run
+    assert "container:" in run
+    assert "running_without_vpn" in run
+    assert "ls -A" in run
+    assert "test -e /config/without_vpn.json" in run
+    assert "::error::" in run
+
+
+def test_stack_smoke_no_vpn_steps_run_after_cancel_in_order_choose_add_hand_over_keep() -> None:
+    job = _stack_smoke_job()
+    names = [str(step.get("name", "")) for step in _steps(job)]
+
+    cancel_assert_index = names.index(
+        _step_named(job, "cancel removed gluetun's container")["name"]
+    )
+    radarr_index = names.index(_step_named(job, "start radarr again")["name"])
+    choose_index = names.index(_step_named(job, "choose", "no-vpn")["name"])
+    add_index = names.index(_step_named(job, "add qbittorrent without a vpn")["name"])
+    add_poll_index = names.index(
+        _step_named(job, "poll", "qbittorrent finishes adding without a vpn")["name"]
+    )
+    add_assert_index = names.index(_step_named(job, "sonarr's client points at it")["name"])
+    hand_over_index = names.index(_step_named(job, "hands", "qbittorrent's port")["name"])
+    hand_over_poll_index = names.index(_step_named(job, "poll", "no-vpn hand-over")["name"])
+    hand_over_assert_index = names.index(
+        _step_named(job, "no-vpn hand-over", "plain sentences")["name"]
+    )
+    keep_index = names.index(_step_named(job, "no-vpn restore")["name"])
+    dump_index = names.index(_step_named(job, "dump diagnostics")["name"])
+
+    assert (
+        cancel_assert_index
+        < radarr_index
+        < choose_index
+        < add_index
+        < add_poll_index
+        < add_assert_index
+        < hand_over_index
+        < hand_over_poll_index
+        < hand_over_assert_index
+        < keep_index
+        < dump_index
+    )
+
+
+def test_stack_smoke_every_no_vpn_step_emits_error_on_failure() -> None:
+    job = _stack_smoke_job()
+    needle_sets = [
+        ("start radarr again",),
+        ("choose", "no-vpn"),
+        ("add qbittorrent without a vpn",),
+        ("poll", "qbittorrent finishes adding without a vpn"),
+        ("sonarr's client points at it",),
+        ("hands", "qbittorrent's port"),
+        ("poll", "no-vpn hand-over"),
+        ("no-vpn hand-over", "plain sentences"),
+        ("no-vpn restore",),
+    ]
+    for needles in needle_sets:
+        step = _step_named(job, *needles)
+        assert "::error::" in step["run"], f"step {step['name']!r} never emits ::error::"
+
+
+def test_stack_smoke_no_vpn_step_names_avoid_forbidden_needles() -> None:
+    """`_step_named` returns the FIRST match - a new no-VPN step whose name
+    contains one of these generic phrases (already used by an earlier step
+    in this same job) would silently resolve to that earlier step instead
+    of its own.
+    """
+    job = _stack_smoke_job()
+    forbidden = ("developer test", "remove qbittorrent", "add the vpn", "cancel the vpn add")
+    needle_sets = [
+        ("start radarr again",),
+        ("choose", "no-vpn"),
+        ("add qbittorrent without a vpn",),
+        ("poll", "qbittorrent finishes adding without a vpn"),
+        ("sonarr's client points at it",),
+        ("hands", "qbittorrent's port"),
+        ("poll", "no-vpn hand-over"),
+        ("no-vpn hand-over", "plain sentences"),
+        ("no-vpn restore",),
+    ]
+    for needles in needle_sets:
+        name = str(_step_named(job, *needles)["name"]).lower()
+        for phrase in forbidden:
+            assert phrase not in name, f"step {name!r} contains the forbidden phrase {phrase!r}"
+
+
+def test_stack_smoke_cleanup_list_already_covers_qbittorrent_and_gluetun() -> None:
+    """The no-VPN steps leave qBittorrent installed and Gluetun absent - the
+    final cleanup still has to remove qBittorrent unconditionally (it does;
+    Gluetun's absence is already proven by the restore step) so a failed
+    run still tears down every container this job made.
+    """
+    step = _step_named(_stack_smoke_job(), "clean up")
+    run = step["run"]
+    assert "qbittorrent" in run
+    assert "gluetun" in run

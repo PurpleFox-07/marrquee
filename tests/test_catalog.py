@@ -19,6 +19,7 @@ from marrquee.catalog import (
     app_host,
     apps_in_order,
     companions_for,
+    description_for,
     get_app,
     riders_of,
     unavailable_reason,
@@ -26,6 +27,7 @@ from marrquee.catalog import (
 from marrquee.words import (
     PROWLARR_DESCRIPTION,
     QBITTORRENT_DESCRIPTION,
+    QBITTORRENT_DESCRIPTION_NO_VPN,
     RADARR_DESCRIPTION,
     SONARR_DESCRIPTION,
 )
@@ -254,17 +256,43 @@ def test_qbittorrent_sits_after_gluetun_and_rides_its_network() -> None:
     assert qbittorrent.description == QBITTORRENT_DESCRIPTION
 
 
-def test_app_host_is_network_via_when_set_else_the_apps_own_id() -> None:
-    assert app_host(get_app("qbittorrent")) == "gluetun"
-    assert app_host(get_app("sonarr")) == "sonarr"
-    assert app_host(get_app("gluetun")) == "gluetun"
+def test_app_host_follows_the_installed_ids() -> None:
+    qbittorrent = get_app("qbittorrent")
+
+    assert app_host(qbittorrent, ("gluetun", "qbittorrent")) == "gluetun"
+    assert app_host(qbittorrent, ("sonarr", "qbittorrent")) == "qbittorrent"
+    assert app_host(get_app("sonarr"), ()) == "sonarr"
+    assert app_host(get_app("sonarr"), ("gluetun",)) == "sonarr"
+    assert app_host(get_app("gluetun"), ("gluetun",)) == "gluetun"
 
 
 def test_companions_for_adds_gluetun_only_when_it_is_missing() -> None:
-    assert companions_for("qbittorrent", ()) == ("gluetun",)
-    assert companions_for("qbittorrent", ("sonarr",)) == ("gluetun",)
-    assert companions_for("qbittorrent", ("gluetun", "sonarr")) == ()
-    assert companions_for("sonarr", ()) == ()
+    assert companions_for("qbittorrent", (), without_vpn=False) == ("gluetun",)
+    assert companions_for("qbittorrent", ("sonarr",), without_vpn=False) == ("gluetun",)
+    assert companions_for("qbittorrent", ("gluetun", "sonarr"), without_vpn=False) == ()
+    assert companions_for("sonarr", (), without_vpn=False) == ()
+
+
+def test_companions_for_drops_the_vpn_only_when_confirmed() -> None:
+    assert companions_for("qbittorrent", (), without_vpn=True) == ()
+    assert companions_for("qbittorrent", ("sonarr",), without_vpn=True) == ()
+    # Gluetun already installed: nothing to drop either way.
+    assert companions_for("qbittorrent", ("gluetun", "sonarr"), without_vpn=True) == ()
+    # An app with no VPN companion at all is unaffected by the flag.
+    assert companions_for("sonarr", (), without_vpn=True) == ()
+
+
+def test_description_for_says_no_vpn_only_when_gluetun_is_missing() -> None:
+    qbittorrent = get_app("qbittorrent")
+
+    assert description_for(qbittorrent, ("sonarr", "qbittorrent")) == QBITTORRENT_DESCRIPTION_NO_VPN
+    assert description_for(qbittorrent, ("gluetun", "qbittorrent")) == QBITTORRENT_DESCRIPTION
+    assert description_for(get_app("sonarr"), ()) == SONARR_DESCRIPTION
+
+
+def test_description_without_vpn_defaults_to_empty() -> None:
+    assert get_app("sonarr").description_without_vpn == ""
+    assert get_app("qbittorrent").description_without_vpn == QBITTORRENT_DESCRIPTION_NO_VPN
 
 
 def test_riders_of_returns_present_apps_that_ride_the_given_network_in_catalog_order() -> None:

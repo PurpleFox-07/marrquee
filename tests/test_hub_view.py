@@ -431,6 +431,7 @@ def _adding(
     line: str = "Starting Radarr",
     note: str | None = None,
     failure: Failure | None = None,
+    moves: tuple[str, ...] = (),
 ) -> AppAdd:
     return AppAdd(
         app_id=app_id,
@@ -442,6 +443,7 @@ def _adding(
         wiring=(),
         compose_ran=False,
         started_at="2026-09-24T00:00:00+00:00",
+        moves=moves,
     )
 
 
@@ -548,6 +550,17 @@ def test_qbittorrents_install_row_holds_the_vpn_step_then_seeding() -> None:
     by_id = {row.app.id: row for row in view.install_rows}
     assert [step.app_id for step in by_id["qbittorrent"].steps] == ["gluetun", "qbittorrent"]
     assert [step.step_id for step in by_id["qbittorrent"].steps] == ["vpn", "seeding"]
+
+
+def test_without_vpn_confirmed_qbittorrents_install_row_skips_the_vpn_step() -> None:
+    """A saved break-glass confirmation drops Gluetun from qBittorrent's
+    install row the same way an already-installed Gluetun does - the row
+    never asks a question about an app that will never be brought along.
+    """
+    view = hub_view([], [], authority=_AUTHORITY, proxied=False, now=_NOW, without_vpn=True)
+
+    by_id = {row.app.id: row for row in view.install_rows}
+    assert [step.step_id for step in by_id["qbittorrent"].steps] == ["seeding"]
 
 
 def test_an_already_installed_gluetun_never_repeats_its_own_step() -> None:
@@ -1206,3 +1219,255 @@ def test_a_downloader_being_added_never_offers_change_seeding() -> None:
     tile = next(tile for tile in view.tiles if tile.app_id == "qbittorrent")
     assert tile.can_change_seeding is False
     assert tile.paused is False
+
+
+# --- The badge, moves, Change VPN and the escape hatch ----------------------
+
+
+def test_badge_shows_only_while_qbittorrent_runs_without_a_vpn() -> None:
+    no_vpn = hub_view(
+        ["sonarr", "qbittorrent"],
+        [_health("sonarr"), _health("qbittorrent")],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+    )
+    with_vpn = hub_view(
+        ["gluetun", "qbittorrent"],
+        [_health("gluetun", state="up", health="healthy"), _health("qbittorrent")],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+    )
+    confirmation_only = hub_view(
+        [], [], authority=_AUTHORITY, proxied=False, now=_NOW, without_vpn=True
+    )
+    mid_move = hub_view(
+        ["sonarr", "qbittorrent"],
+        [_health("sonarr"), _health("qbittorrent")],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        adding=_adding(app_id="gluetun", purpose="add", moves=("qbittorrent",)),
+    )
+
+    assert no_vpn.running_without_vpn is True
+    assert with_vpn.running_without_vpn is False
+    assert confirmation_only.running_without_vpn is False
+    assert mid_move.running_without_vpn is False
+
+
+def test_movers_are_paused_during_a_move_and_a_change_whatever_docker_says() -> None:
+    adding_move = hub_view(
+        ["gluetun", "qbittorrent"],
+        [_health("gluetun", state="up", health="healthy"), _health("qbittorrent", state="up")],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        adding=_adding(app_id="gluetun", purpose="add", moves=("qbittorrent",)),
+    )
+    changing = hub_view(
+        ["gluetun", "qbittorrent"],
+        [_health("gluetun", state="up", health="healthy"), _health("qbittorrent", state="up")],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        adding=_adding(app_id="gluetun", purpose="change_vpn", moves=("qbittorrent",)),
+    )
+
+    for view in (adding_move, changing):
+        tile = next(tile for tile in view.tiles if tile.app_id == "qbittorrent")
+        assert tile.paused is True
+        assert tile.state == "down"
+        assert tile.chip == words.HUB_CHIP_PAUSED
+        assert tile.line == words.HUB_LINE_PAUSED_FOR_VPN
+        assert tile.url is None
+
+
+def test_change_vpn_tile_changing_then_didnt_connect_with_try_again_only() -> None:
+    changing = hub_view(
+        ["gluetun"],
+        [_health("gluetun", state="up", health="healthy")],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        adding=_adding(
+            app_id="gluetun",
+            purpose="change_vpn",
+            state="starting",
+            line="Connecting VPN...",
+            moves=("qbittorrent",),
+        ),
+    )
+    failed = hub_view(
+        ["gluetun"],
+        [_health("gluetun", state="up", health="healthy")],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        adding=_adding(
+            app_id="gluetun",
+            purpose="change_vpn",
+            state="error",
+            line=words.app_line_error("VPN"),
+            failure=_failure("Couldn't reconnect.", "Try again."),
+            moves=("qbittorrent",),
+        ),
+    )
+
+    changing_tile = changing.tiles[0]
+    assert changing_tile.state == "starting"
+    assert changing_tile.chip == words.HUB_CHIP_VPN_CHANGING
+    assert changing_tile.line == "Connecting VPN..."
+    assert changing_tile.add_state == "starting"
+
+    failed_tile = failed.tiles[0]
+    assert failed_tile.state == "down"
+    assert failed_tile.chip == words.HUB_CHIP_VPN_CHANGE_FAILED
+    assert failed_tile.line == "Couldn't reconnect. Try again."
+    assert failed_tile.actions == "try_again"
+    # No gluetun run "in progress" is a lie while this one is actively
+    # failed - Try again is the only way back in, not a second form.
+    assert failed_tile.can_change_vpn is False
+
+
+def test_restore_tile_says_starting_again_without_a_vpn() -> None:
+    starting = hub_view(
+        ["sonarr", "qbittorrent"],
+        [_health("sonarr"), _health("qbittorrent", state="up")],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        adding=_adding(
+            app_id="qbittorrent",
+            purpose="restore",
+            state="starting",
+            line="Starting qBittorrent",
+            moves=("qbittorrent",),
+        ),
+    )
+    failed = hub_view(
+        ["sonarr", "qbittorrent"],
+        [_health("sonarr"), _health("qbittorrent", state="up")],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        adding=_adding(
+            app_id="qbittorrent",
+            purpose="restore",
+            state="error",
+            line=words.app_line_error("qBittorrent"),
+            failure=_failure("qBittorrent couldn't be restored.", "Try again."),
+            moves=("qbittorrent",),
+        ),
+    )
+
+    starting_tile = next(tile for tile in starting.tiles if tile.app_id == "qbittorrent")
+    assert starting_tile.state == "starting"
+    assert starting_tile.chip == words.HUB_CHIP_STARTING
+    assert starting_tile.line == words.HUB_LINE_RESTARTING_WITHOUT_VPN
+    assert starting_tile.url is None
+
+    failed_tile = next(tile for tile in failed.tiles if tile.app_id == "qbittorrent")
+    assert failed_tile.state == "down"
+    assert failed_tile.chip == words.HUB_CHIP_ADD_FAILED
+    assert failed_tile.line == "qBittorrent couldn't be restored. Try again."
+    assert failed_tile.actions == "try_again"
+
+
+def test_a_failed_add_your_vpn_offers_keep_running_without_vpn() -> None:
+    view = hub_view(
+        [],
+        [],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        adding=_adding(
+            app_id="gluetun",
+            purpose="add",
+            state="error",
+            line=words.app_line_error("VPN"),
+            failure=_failure("Your VPN refused the connection.", "Check your login."),
+            moves=("qbittorrent",),
+        ),
+    )
+
+    tile = view.tiles[0]
+    assert tile.actions == "retry_or_restore"
+    assert tile.can_change_vpn is True
+
+
+def test_a_plain_failed_add_never_offers_restore_or_change_vpn() -> None:
+    view = hub_view(
+        [],
+        [],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        adding=_adding(app_id="radarr", state="error", failure=_failure()),
+    )
+
+    tile = view.tiles[0]
+    assert tile.actions == "retry"
+    assert tile.can_change_vpn is False
+
+
+def test_vpn_pane_mode_is_add_change_or_closed() -> None:
+    add_mode = hub_view(
+        ["sonarr", "qbittorrent"],
+        [_health("sonarr"), _health("qbittorrent")],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+    )
+    change_mode = hub_view(
+        ["gluetun", "qbittorrent"],
+        [_health("gluetun", state="up", health="healthy"), _health("qbittorrent")],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+    )
+    closed = hub_view(
+        ["sonarr"], [_health("sonarr")], authority=_AUTHORITY, proxied=False, now=_NOW
+    )
+    add_from_a_failed_first_try = hub_view(
+        [],
+        [],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        adding=_adding(app_id="gluetun", purpose="add", state="error", moves=("qbittorrent",)),
+    )
+
+    assert add_mode.vpn_pane == "add"
+    assert change_mode.vpn_pane == "change"
+    assert closed.vpn_pane is None
+    assert add_from_a_failed_first_try.vpn_pane == "add"
+
+
+def test_without_vpn_pane_is_closed_once_qbittorrent_or_the_vpn_exists_or_confirmed() -> None:
+    offered = hub_view([], [], authority=_AUTHORITY, proxied=False, now=_NOW)
+    qbittorrent_installed = hub_view(
+        ["qbittorrent"], [_health("qbittorrent")], authority=_AUTHORITY, proxied=False, now=_NOW
+    )
+    vpn_installed = hub_view(
+        ["gluetun"], [_health("gluetun")], authority=_AUTHORITY, proxied=False, now=_NOW
+    )
+    confirmed = hub_view([], [], authority=_AUTHORITY, proxied=False, now=_NOW, without_vpn=True)
+    mid_add = hub_view(
+        [], [], authority=_AUTHORITY, proxied=False, now=_NOW, adding=_adding(app_id="radarr")
+    )
+
+    assert offered.without_vpn_offer is True
+    assert qbittorrent_installed.without_vpn_offer is False
+    assert vpn_installed.without_vpn_offer is False
+    assert confirmed.without_vpn_offer is False
+    assert mid_add.without_vpn_offer is False
+
+
+def test_install_row_carries_without_vpn_only_for_the_downloader() -> None:
+    view = hub_view([], [], authority=_AUTHORITY, proxied=False, now=_NOW, without_vpn=True)
+
+    by_id = {row.app.id: row for row in view.install_rows}
+    assert by_id["qbittorrent"].without_vpn is True
+    assert by_id["sonarr"].without_vpn is False

@@ -185,6 +185,12 @@ class QbitSettingsTask:
     `involved` names only qBittorrent - the app was already proved ready by
     its own bring-up (the key call answering `app/version`), so there is
     nothing else for the engine to wait on before `apply` runs.
+
+    The forwarded port is only ever asked for while Gluetun is actually
+    part of this install: `with_app_removed` keeps a departed app's own
+    key in `api_keys` (Story 5), so a stale `api_keys["gluetun"]` must
+    never be read once gluetun has left `app_ids` - that would call a
+    Gluetun that no longer exists.
     """
 
     key: str
@@ -205,12 +211,14 @@ class QbitSettingsTask:
             **seeding_preferences(ctx.answers.get(app_id)),
         }
         gluetun_key = ctx.state.api_keys.get("gluetun")
-        if gluetun_key is not None:
+        if "gluetun" in ctx.state.app_ids and gluetun_key is not None:
             port = await ctx.vpn.forwarded_port(gluetun_key)
             if isinstance(port, int):
                 prefs["listen_port"] = port
 
-        return await ensure_qbit_preferences(ctx.qbit, app, api_key, prefs)
+        return await ensure_qbit_preferences(
+            ctx.qbit, app, api_key, prefs, present=ctx.state.app_ids
+        )
 
 
 @dataclass(frozen=True)
@@ -246,6 +254,7 @@ class DownloadClientTask:
             ctx.state.api_keys[downloader_id],
             media_folder=self.media_folder,
             save_path=save_path,
+            present=ctx.state.app_ids,
         )
         if category_outcome.state == "error":
             return category_outcome
@@ -258,6 +267,7 @@ class DownloadClientTask:
             ctx.state.api_keys[downloader_id],
             category_field=self.category_field,
             category=self.media_folder,
+            present=ctx.state.app_ids,
         )
         if client_outcome.state == "error" or not category_outcome.changed:
             return client_outcome
@@ -544,7 +554,7 @@ class WiringEngine:
             return True
 
         api_key = ctx.state.api_keys.get(app_id, "")
-        base_url = app_base_url(app)
+        base_url = app_base_url(app, ctx.state.app_ids)
         path = f"{app.api_base}/{_SYSTEM_STATUS_PATH}"
 
         start = self._clock()

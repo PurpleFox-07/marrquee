@@ -427,6 +427,67 @@ def test_no_qbittorrent_key_or_auth_env_anywhere_in_the_rendered_file() -> None:
     assert qbit_env["WEBUI_PORT"] == "8080"
 
 
+# --- qBittorrent without a VPN: the one deliberate exception ----------------
+
+
+def test_qbittorrent_without_gluetun_renders_on_marrquee_with_its_own_port() -> None:
+    """The one deliberate exception to the refusal below: a confirmed
+    break-glass install runs qBittorrent as a normal app on the `marrquee`
+    network instead of riding a VPN it doesn't have.
+    """
+    state = _fixture_state(("sonarr", "qbittorrent"))
+
+    doc = yaml.safe_load(compose.render_compose(compose.build_stack_plan(state, without_vpn=True)))
+    services = _services(doc)
+
+    assert services["qbittorrent"]["networks"] == ["marrquee"]
+    assert services["qbittorrent"]["ports"] == ["8080:8080"]
+    assert "network_mode" not in services["qbittorrent"]
+    assert "gluetun" not in services
+
+
+def test_qbittorrent_without_gluetun_is_refused_unless_without_vpn() -> None:
+    state = _fixture_state(("sonarr", "qbittorrent"))
+
+    with pytest.raises(ValueError, match="qbittorrent needs gluetun"):
+        compose.build_stack_plan(state)  # without_vpn defaults to False
+
+
+def test_with_gluetun_present_without_vpn_changes_nothing() -> None:
+    """The flag only ever matters for the one app whose companion is
+    genuinely missing - with Gluetun actually installed, True and False
+    must render byte-identical output.
+    """
+    state = _fixture_state(("prowlarr", "sonarr", "gluetun", "qbittorrent"))
+    answers = _gluetun_answers()
+
+    with_flag = compose.render_compose(compose.build_stack_plan(state, answers, without_vpn=True))
+    without_flag = compose.render_compose(
+        compose.build_stack_plan(state, answers, without_vpn=False)
+    )
+
+    assert with_flag == without_flag
+
+
+def test_no_vpn_compose_comment_says_it_runs_without_a_vpn() -> None:
+    state = _fixture_state(("sonarr", "qbittorrent"))
+
+    text = compose.render_compose(compose.build_stack_plan(state, without_vpn=True))
+
+    assert words.DOWNLOADER_NO_VPN_COMPOSE_COMMENT in _comment_text(text)
+    assert words.DOWNLOADER_COMPOSE_COMMENT not in _comment_text(text)
+
+
+def test_no_vpn_qbittorrent_incoming_bittorrent_port_is_not_published() -> None:
+    state = _fixture_state(("sonarr", "qbittorrent"))
+
+    text = compose.render_compose(compose.build_stack_plan(state, without_vpn=True))
+    doc = yaml.safe_load(text)
+
+    assert doc["services"]["qbittorrent"]["ports"] == ["8080:8080"]
+    assert "6881" not in text
+
+
 def test_forwarding_provider_adds_both_port_commands_non_forwarding_adds_none() -> None:
     """A non-forwarding provider still writes the key and the port-sync
     script - an owner switching to a forwarding provider later must not
