@@ -21,6 +21,7 @@ from marrquee.docker_client import DockerEngine, SocketDockerEngine
 from marrquee.hardlinks import HardlinkMonitor
 from marrquee.health import HttpLinkProbe, LinkProbe
 from marrquee.login_apply import HttpLoginApplier, LoginApplier
+from marrquee.recyclarr import RecyclarrControl, RecyclarrMonitor
 from marrquee.routes.alive import router as alive_router
 from marrquee.routes.api import router as api_router
 from marrquee.routes.deploy import router as deploy_router
@@ -52,6 +53,7 @@ def create_app(
     vpn_control: GluetunControl | None = None,
     qbit_client: QbitClient | None = None,
     hardlinks: HardlinkMonitor | None = None,
+    recyclarr: RecyclarrControl | None = None,
 ) -> FastAPI:
     """Build the Marrquee app.
 
@@ -84,6 +86,9 @@ def create_app(
     the Hub and Diagnostics to read - the same single instance either way,
     so a test that passes its own `manager=` still needs to pass
     `hardlinks=` too if that manager should ask for the same checks.
+    `recyclarr=None` builds one real `RecyclarrMonitor(settings, engine)` the
+    same way, handed to a freshly-built `DeployManager` as `recyclarr=` AND
+    kept on `app.state.recyclarr` for the Hub to read.
     """
     if settings is None:
         settings = Settings.from_env()
@@ -95,6 +100,8 @@ def create_app(
         qbit_client = HttpQbitClient()
     if hardlinks is None:
         hardlinks = HardlinkMonitor(settings)
+    if recyclarr is None:
+        recyclarr = RecyclarrMonitor(settings, engine)
     if manager is None:
         manager = DeployManager(
             settings,
@@ -111,6 +118,7 @@ def create_app(
             vpn=vpn_control,
             qbit=qbit_client,
             hardlinks=hardlinks,
+            recyclarr=recyclarr,
         )
     if link_probe is None:
         link_probe = HttpLinkProbe()
@@ -129,6 +137,7 @@ def create_app(
     app.state.vpn_control = vpn_control
     app.state.qbit_client = qbit_client
     app.state.hardlinks = hardlinks
+    app.state.recyclarr = recyclarr
     app.state.templates = Jinja2Templates(directory=_TEMPLATES_DIR)
 
     app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")

@@ -166,9 +166,12 @@ def test_one_checked_checkbox_per_catalog_app_in_catalog_order_with_description(
     assert [box["value"] for box in checkboxes] == [app.id for app in _OFFERED]
     checked_by_id = {box["value"]: "checked" in box for box in checkboxes}
     assert checked_by_id == {app.id: app.default_ticked for app in _OFFERED}
+    # Jinja2 escapes an apostrophe (Recyclarr's description has one) as an
+    # entity - unescape before comparing against the plain-text constant.
+    rendered = html.unescape(response.text)
     for app in _OFFERED:
         assert app.name in response.text
-        assert app.description in response.text
+        assert app.description in rendered
 
 
 def test_gluetun_never_gets_a_checkbox_of_its_own(tmp_path: Path) -> None:
@@ -193,6 +196,7 @@ def test_a_saved_install_ticks_exactly_the_saved_apps(tmp_path: Path) -> None:
         "sonarr": False,
         "radarr": True,
         "qbittorrent": False,
+        "recyclarr": False,
     }
 
 
@@ -208,6 +212,7 @@ def test_an_unknown_id_in_the_query_string_is_dropped_not_a_500(tmp_path: Path) 
         "sonarr": False,
         "radarr": True,
         "qbittorrent": False,
+        "recyclarr": False,
     }
 
 

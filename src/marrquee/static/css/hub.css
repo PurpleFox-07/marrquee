@@ -124,6 +124,30 @@
   background: var(--warning);
 }
 
+/* Recyclarr's own honesty states - late (a day overdue) and failed (a bad
+ * sync, or one that couldn't even start) both read amber, at the same
+ * specificity as the plain "up" ring/dot above and placed right after the
+ * pause rule so this reads as one state ladder, top to bottom, rather than
+ * a rule bolted on wherever there was room. */
+.hub-poster[data-sync-state="failed"],
+.hub-poster[data-sync-state="late"] {
+  border-color: var(--warning);
+  box-shadow: 0 0 0 var(--space-1) color-mix(in srgb, var(--warning) 14%, transparent);
+}
+
+.hub-poster[data-sync-state="failed"] .hub-dot,
+.hub-poster[data-sync-state="late"] .hub-dot {
+  background: var(--warning);
+}
+
+/* Sync now stays in the markup through every up state (so the grid's own
+ * shape never flips), but a sync already running has nothing left for it
+ * to start - hidden here, not removed, so a no-JavaScript page still gets
+ * the right answer from its own last server render. */
+.hub-poster[data-sync-state="syncing"] ~ .hub-tile-actions [data-role="sync-now"] {
+  display: none;
+}
+
 .hub-poster [data-role="line"] {
   margin: var(--space-2) 0 0;
   font-size: var(--text-xs);

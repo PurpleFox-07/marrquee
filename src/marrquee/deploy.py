@@ -33,10 +33,12 @@ from typing import ClassVar, Literal, Protocol, cast
 import httpx
 
 from marrquee.catalog import (
+    RECYCLARR_APP_ID,
     CatalogApp,
     apps_in_order,
     companions_for,
     get_app,
+    require_port,
     riders_of,
     unavailable_reason,
 )
@@ -56,6 +58,12 @@ from marrquee.login import SavedLogin, load_login, pending_app_ids, record_appli
 from marrquee.login_apply import LoginApplier, NoLoginApplier
 from marrquee.qbittorrent import write_qbit_conf
 from marrquee.questions import load_answers
+from marrquee.recyclarr import (
+    RecyclarrTrigger,
+    remove_recyclarr_config,
+    sync_wanted_after,
+    write_recyclarr_config,
+)
 from marrquee.state import InstallState, load_state, save_state, write_json_atomic
 from marrquee.storage import (
     FreshnessCheck,
@@ -188,7 +196,7 @@ class AppProgress:
     chip: str
     line: str
     note: str | None
-    port: int
+    port: int | None
 
 
 @dataclass(frozen=True)
@@ -372,6 +380,7 @@ class DeployManager:
         vpn: GluetunControl = NoGluetunControl(),
         qbit: QbitClient = HttpQbitClient(),
         hardlinks: HardlinkTrigger | None = None,
+        recyclarr: RecyclarrTrigger | None = None,
     ) -> None:
         self._settings = settings
         self._engine = engine
@@ -383,6 +392,7 @@ class DeployManager:
         self._vpn = vpn
         self._qbit = qbit
         self._hardlinks = hardlinks
+        self._recyclarr = recyclarr
         self._task: asyncio.Task[None] | None = None
         # The login run's own in-memory progress line - never persisted and
         # never resumed after a restart (the pending names plus Try again
@@ -727,6 +737,8 @@ class DeployManager:
                     logger.error("cancel: could not rewrite compose.yaml: %s", error)
                 if any(removed_app.kind == "vpn" for removed_app in brought):
                     clear_vpn_secrets(self._settings, root)
+                if any(removed_app.kind == "sync" for removed_app in brought):
+                    remove_recyclarr_config(self._settings, root)
 
         if current.moves:
             first_mover = get_app(current.moves[0])
@@ -1171,6 +1183,12 @@ class DeployManager:
             # poll or Diagnostics visit sees its result.
             self._hardlinks.request_check()
 
+        if self._recyclarr is not None and sync_wanted_after(install.app_ids, None):
+            # Fired, never awaited, the same fire-and-forget shape as the
+            # drive check just above - a slow sync must never pin this
+            # deploy as still running.
+            self._recyclarr.request_sync()
+
     async def _find_name_clash(
         self, install: InstallState, root: PurePosixPath, catalog_apps: tuple[CatalogApp, ...]
     ) -> Failure | None:
@@ -1251,6 +1269,11 @@ class DeployManager:
 
         if app.kind == "downloader":
             conf_failure = self._write_qbit_conf_file(app, api_key, root, install)
+            if conf_failure is not None:
+                return conf_failure
+
+        if app.kind == "sync":
+            conf_failure = self._write_recyclarr_conf(install, root)
             if conf_failure is not None:
                 return conf_failure
 
@@ -1338,13 +1361,19 @@ class DeployManager:
         `present` is the install's own app ids, so this reaches qBittorrent
         at whichever host it actually answers on - `gluetun` behind the
         VPN, `qbittorrent` on its own network.
+
+        A `kind == "sync"` app has no web page to probe at all - Docker
+        reporting the container `running` (already checked by the caller's
+        own loop) is the whole of "ready" for it.
         """
+        if app.kind == "sync":
+            return True
         if app.kind == "downloader":
             response = await self._qbit.request(
                 "GET", app_base_url(app, present), f"{app.api_base}/app/version", api_key
             )
             return response.ok
-        return await self._probe.check(app.id, app.port, app.api_base, api_key)
+        return await self._probe.check(app.id, require_port(app), app.api_base, api_key)
 
     def _write_qbit_conf_file(
         self, app: CatalogApp, api_key: str, root: PurePosixPath, install: InstallState
@@ -1365,6 +1394,27 @@ class DeployManager:
                 headline=headline,
                 what_to_do=what_to_do,
                 technical=str(error),
+            )
+        return None
+
+    def _write_recyclarr_conf(self, install: InstallState, root: PurePosixPath) -> Failure | None:
+        """Rewrite Recyclarr's own config from the install and saved
+        quality answers, right before Docker is ever asked to start it -
+        the file must already hold this install's exact choices the very
+        first time Recyclarr's own cron ever runs, the same idea
+        `_write_qbit_conf_file` follows for qBittorrent's own settings.
+        """
+        answers = load_answers(self._settings.config_dir)
+        try:
+            write_recyclarr_config(self._settings, install, answers)
+        except (OSError, ValueError, PathEscapesRoot) as error:
+            app = get_app(RECYCLARR_APP_ID)
+            headline, what_to_do = _split_failure_text(failure_compose_failed(app.name))
+            return Failure(
+                code="compose_failed",
+                headline=headline,
+                what_to_do=what_to_do,
+                technical=self._redact(str(error), install),
             )
         return None
 
@@ -1720,6 +1770,12 @@ class DeployManager:
             # `_run_wiring_for_add` directly and never reach here, so
             # moving an existing pair around never asks for a needless check.
             self._hardlinks.request_check()
+
+        if self._recyclarr is not None and sync_wanted_after(grown.app_ids, app.id):
+            # Same reasoning as the drive check just above: reconnect,
+            # Change VPN and restore never reach this line, so none of them
+            # ever asks for a needless sync.
+            self._recyclarr.request_sync()
 
     def _add_reporter(self) -> Callable[[AppState, str, str | None], Awaitable[None]]:
         """The add path's own `report` callback for `_bring_up_app`.
@@ -2457,12 +2513,12 @@ def _compose_failure(
             what_to_do=what_to_do,
             technical=result.output,
         )
-    if _looks_like_port_conflict(result.output):
-        # Gluetun's own port is never published (`_vpn_service_plan` gives
-        # it no `ports:` of its own) - a real conflict on 8000 could only
-        # ever be its rider's own published port, so the failure names
-        # THAT app and port, never Gluetun's.
-        named_app = riders[0] if riders else app
+    # Gluetun's own port is never published (`_vpn_service_plan` gives it
+    # no `ports:` of its own) - a real conflict on 8000 could only ever be
+    # its rider's own published port, so the failure names THAT app and
+    # port, never Gluetun's.
+    named_app = riders[0] if riders else app
+    if named_app.port is not None and _looks_like_port_conflict(result.output):
         headline, what_to_do = _split_failure_text(
             failure_port_in_use(named_app.name, named_app.port)
         )
@@ -2595,7 +2651,7 @@ def _app_progress_from_payload(payload: object) -> AppProgress:
         chip=_require_str(payload.get("chip")),
         line=_require_str(payload.get("line")),
         note=_require_optional_str(payload.get("note")),
-        port=_require_int(payload.get("port")),
+        port=None if payload.get("port") is None else _require_int(payload.get("port")),
     )
 
 

@@ -88,6 +88,30 @@ def _shell_case_arms(case_block: str) -> dict[str, str]:
     return arms
 
 
+def _assert_post_loop_verdict(run: str, guard: str, error_substring: str) -> None:
+    """A poll loop's own final verdict: the exact `if [ ... ]; then` guard
+    line, immediately followed by its own `::error::` line and a bare
+    `exit 1` - not merely present somewhere in the step. `if false; then`
+    (or `if true; then`) swapped in for the real comparison would still
+    leave every substring this step's other assertions check for sitting
+    right there in the step's text, just never reached (or always
+    reached) - only pinning the guard's own exact text, and what sits on
+    the two lines immediately after it, catches that.
+    """
+    lines = run.splitlines()
+    matches = [index for index, line in enumerate(lines) if line.strip() == guard]
+    assert matches, f"guard {guard!r} not found verbatim in the step"
+    guard_index = matches[0]
+    error_line = lines[guard_index + 1].strip()
+    exit_line = lines[guard_index + 2].strip()
+    assert "::error::" in error_line and error_substring in error_line, (
+        f"{guard!r} is not immediately followed by its own ::error:: line (got {error_line!r})"
+    )
+    assert exit_line == "exit 1", (
+        f"{guard!r} is not immediately followed by exit 1 (got {exit_line!r})"
+    )
+
+
 def _last_nonblank_line(text: str) -> str:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     return lines[-1] if lines else ""
@@ -602,6 +626,7 @@ def test_stack_smoke_dumps_diagnostics_and_logs_only_on_failure() -> None:
     assert step.get("if") == "failure()"
     assert "/api/deploy/diagnostics" in step["run"]
     assert "docker logs marrquee-stack-smoke" in step["run"]
+    assert "docker logs recyclarr" in step["run"]
 
 
 def test_stack_smoke_also_puts_diagnostics_in_a_public_annotation_truncated_and_escaped() -> None:
@@ -938,7 +963,15 @@ def test_stack_smoke_always_cleans_up_containers_network_and_temp_files() -> Non
 
     assert step.get("if") == "always()"
     run = step["run"]
-    for name in ("prowlarr", "sonarr", "radarr", "gluetun", "qbittorrent", "marrquee-stack-smoke"):
+    for name in (
+        "prowlarr",
+        "sonarr",
+        "radarr",
+        "gluetun",
+        "qbittorrent",
+        "recyclarr",
+        "marrquee-stack-smoke",
+    ):
         assert name in run
     assert "docker network rm marrquee" in run
     # `sudo`, not a plain `rm -rf`: some of what's under the temp folder can
@@ -1660,6 +1693,8 @@ def test_stack_smoke_no_vpn_steps_run_after_cancel_in_order_choose_add_hand_over
     )
     keep_index = names.index(_step_named(job, "no-vpn restore")["name"])
     drive_index = names.index(_step_named(job, "drive check agrees")["name"])
+    syncs_index = names.index(_step_named(job, "recyclarr syncs quality")["name"])
+    amber_index = names.index(_step_named(job, "sync turns amber")["name"])
     dump_index = names.index(_step_named(job, "dump diagnostics")["name"])
 
     assert (
@@ -1674,6 +1709,8 @@ def test_stack_smoke_no_vpn_steps_run_after_cancel_in_order_choose_add_hand_over
         < hand_over_assert_index
         < keep_index
         < drive_index
+        < syncs_index
+        < amber_index
         < dump_index
     )
 
@@ -1691,6 +1728,8 @@ def test_stack_smoke_every_no_vpn_step_emits_error_on_failure() -> None:
         ("no-vpn hand-over", "plain sentences"),
         ("no-vpn restore",),
         ("drive check agrees",),
+        ("recyclarr syncs quality",),
+        ("sync turns amber",),
     ]
     for needles in needle_sets:
         step = _step_named(job, *needles)
@@ -1836,3 +1875,235 @@ def test_stack_smoke_cleanup_list_already_covers_qbittorrent_and_gluetun() -> No
     run = step["run"]
     assert "qbittorrent" in run
     assert "gluetun" in run
+    assert "recyclarr" in run
+
+
+# --- stack-smoke: Recyclarr on a real daemon - the guide-backed profiles
+# really land in Sonarr and Radarr, it runs as the drive owner with no key
+# of its own, and a sync that cannot reach a stopped Radarr turns the
+# poster amber with the exact reason `recyclarr_line_app_down` gives. -----
+
+
+def test_stack_smoke_recyclarr_sync_step_installs_through_the_hub_endpoint_and_polls_states() -> (
+    None
+):
+    step = _step_named(_stack_smoke_job(), "recyclarr syncs quality")
+    run = step["run"]
+
+    assert "docker start radarr" in run
+    assert "/api/hub/apps/recyclarr/install" in run
+    assert '"answers":{"tv_quality":"1080p","movie_quality":"4k"}' in run
+    assert '"202"' in run
+    assert "add_state" in run
+    assert "sync_state" in run
+    assert 'select(.app_id == "recyclarr")' in run
+    assert "seq 1 " in run
+    assert "while true" not in run
+    assert "Recyclarr's first sync failed:" in run
+    assert "Recyclarr never finished adding and syncing within 10 minutes" in run
+    assert run.count("::error::") >= 5
+
+    # The decisive comparisons, pinned by their exact text - a poll loop
+    # whose break condition or final gate was hollowed out to something
+    # always-true would still contain every substring above.
+    assert 'if [ "$add_state" = "null" ] && [ "$sync_state" = "ok" ]; then' in run
+    assert 'if [ "$add_state" != "null" ] || [ "$sync_state" != "ok" ]; then' in run
+
+
+def test_stack_smoke_recyclarr_sync_step_retry_loops_never_abort_under_set_e() -> None:
+    """Every polling loop's own `curl` is guarded so one transient failure
+    retries instead of aborting the whole step under `set -euo pipefail`.
+    """
+    step = _step_named(_stack_smoke_job(), "recyclarr syncs quality")
+    run = step["run"]
+
+    assert "set -euo pipefail" in run
+    assert run.count('status=$(curl -fsS http://127.0.0.1:7788/api/hub/status) || status=""') >= 2
+
+
+def test_stack_smoke_recyclarr_sync_step_checks_the_log_marrquee_reads() -> None:
+    step = _step_named(_stack_smoke_job(), "recyclarr syncs quality")
+    run = step["run"]
+
+    assert "/host${RUNNER_TEMP}/marrquee-smoke/media/marrquee/apps/recyclarr/logs/cli" in run
+    assert r"^recyclarr_.*\.debug\.log$" in run
+    assert "Recyclarr wrote no log where Marrquee reads it" in run
+
+
+def test_stack_smoke_recyclarr_sync_step_reads_live_quality_profiles_with_httpx() -> None:
+    """The one condition reading source can't settle: Recyclarr's own
+    v8.7.2 config sync really creates the guide-backed profiles in a live
+    Sonarr and Radarr, read back with the same keys Marrquee generated.
+    """
+    step = _step_named(_stack_smoke_job(), "recyclarr syncs quality")
+    run = step["run"]
+
+    assert "import httpx" in run
+    assert "/config/install.json" in run
+    assert "http://sonarr:8989/api/v3/qualityprofile" in run
+    assert "http://radarr:7878/api/v3/qualityprofile" in run
+    assert '"X-Api-Key": api_keys["sonarr"]' in run
+    assert '"X-Api-Key": api_keys["radarr"]' in run
+    assert '"WEB-1080p" not in sonarr_names' in run
+    assert '"UHD Bluray + WEB" not in radarr_names' in run
+    assert "Recyclarr's guide-backed profiles never landed:" in run
+
+
+def test_stack_smoke_recyclarr_sync_step_checks_it_runs_as_the_drive_owner() -> None:
+    """WHICH USER runs this: Recyclarr's own image ignores PUID/PGID, so
+    `user:` landing it on the drive owner - not the image's own default -
+    is a live-daemon proof, not something reading `compose.py` can settle.
+    """
+    step = _step_named(_stack_smoke_job(), "recyclarr syncs quality")
+    run = step["run"]
+
+    assert "install['puid']" in run
+    assert "install['pgid']" in run
+    assert "docker inspect -f '{{.Config.User}}' recyclarr" in run
+    assert '"${puid}:${pgid}"' in run
+    assert "command -v stat" in run
+    assert "stat -c '%a %u'" in run
+    assert '"600 ${puid}"' in run
+    assert "recyclarr.yml" in run
+
+
+def test_stack_smoke_recyclarr_sync_step_key_leak_check_is_structurally_sound() -> None:
+    """A plain substring match on `::error::` or `exit 1` anywhere in this
+    step would still pass if the `case` arm that actually gates a leaked
+    key were hollowed out to a no-op, or a no-op arm grew a stray `exit 1`
+    of its own - each arm is checked on its own, by its own label, the
+    same discipline the drive check's leftover-file check already uses.
+    """
+    step = _step_named(_stack_smoke_job(), "recyclarr syncs quality")
+    run = step["run"]
+
+    assert "command -v grep" in run
+    assert "the positive control failed" in run
+    assert "sed -n '/^  sonarr:/,/^$/p'" in run
+    assert "sed -n '/^  recyclarr:/,/^$/p'" in run
+    assert 'grep -qF "$sonarr_key"' in run
+    assert 'for key in "$sonarr_key" "$radarr_key"' in run
+
+    case_block = _text_between(run, 'case "$leaked" in', "esac")
+    arms = _shell_case_arms(case_block)
+
+    assert set(arms) == {"0", "1", "*"}
+
+    # exit code 1 = grep found nothing = no key leaked: nothing to report.
+    assert arms["1"] == ""
+
+    # exit code 0 = grep found the key = it leaked into compose.yaml: a
+    # real failure, not silence.
+    assert "::error::" in arms["0"]
+    assert "exit 1" in arms["0"]
+
+    # anything else = the check itself couldn't run: also a real failure.
+    assert "::error::" in arms["*"]
+    assert "exit 1" in arms["*"]
+
+
+def test_stack_smoke_amber_step_stops_radarr_and_polls_for_the_app_down_reason() -> None:
+    step = _step_named(_stack_smoke_job(), "sync turns amber")
+    run = step["run"]
+
+    assert "docker stop radarr" in run
+    assert "/hub/apps/recyclarr/sync" in run
+    assert '"303"' in run
+    assert 'select(.app_id == "recyclarr")' in run
+    assert '"failed"' in run
+    assert "A failed sync was not reported (state" in run
+    assert "seq 1 " in run
+    assert "while true" not in run
+    assert run.count("::error::") >= 4
+
+
+def test_stack_smoke_amber_step_compares_the_reason_with_html_unescape_never_html_escape() -> None:
+    """Apostrophes: Recyclarr's words contain one ("it's"), and the
+    comparison must never accidentally re-encode a real apostrophe as its
+    own opposite.
+    """
+    step = _step_named(_stack_smoke_job(), "sync turns amber")
+    run = step["run"]
+
+    assert "from marrquee.words import recyclarr_line_app_down" in run
+    assert 'recyclarr_line_app_down("Radarr")' in run
+    assert "html.unescape" in run
+    assert "html.escape" not in run
+    assert "the failed sync's reason did not match" in run
+
+    # The decisive comparison itself, pinned by its exact text - a `true`
+    # or an unconditional `SystemExit(0)` swapped in for the equality check
+    # would still contain every substring above.
+    assert "raise SystemExit(0 if actual == expected else 1)" in run
+
+
+def test_stack_smoke_amber_step_restores_radarr_and_syncs_back_to_ok() -> None:
+    """The amber step's own positive control is step 1's "ok" - this only
+    proves the restore path, not a second independent control.
+    """
+    step = _step_named(_stack_smoke_job(), "sync turns amber")
+    run = step["run"]
+
+    assert run.count("docker start radarr") == 1
+    assert run.count('"303"') == 2
+    assert '"ok"' in run
+    assert "Recyclarr never recovered to sync_state=ok" in run
+
+
+def test_stack_smoke_recyclarr_and_amber_steps_pin_every_post_loop_verdict() -> None:
+    """Every poll loop in both steps ends its own life-or-death branch:
+    the exact guard, its own `::error::` line, and a bare `exit 1` right
+    after it - not a `true`/`false` placeholder that would leave every
+    other assertion in this file's other tests still sitting untouched in
+    the step's text.
+    """
+    job = _stack_smoke_job()
+    sync_run = _step_named(job, "recyclarr syncs quality")["run"]
+    amber_run = _step_named(job, "sync turns amber")["run"]
+
+    _assert_post_loop_verdict(
+        sync_run,
+        'if [ "$radarr_state" != "up" ]; then',
+        "Radarr was not Up ahead of the Recyclarr sync proof",
+    )
+    _assert_post_loop_verdict(
+        sync_run,
+        'if [ "$add_state" != "null" ] || [ "$sync_state" != "ok" ]; then',
+        "Recyclarr never finished adding and syncing within 10 minutes",
+    )
+    _assert_post_loop_verdict(
+        amber_run,
+        'if [ "$sync_state" != "failed" ]; then',
+        "A failed sync was not reported",
+    )
+    _assert_post_loop_verdict(
+        amber_run,
+        'if [ "$radarr_state" != "up" ]; then',
+        "Radarr never came back Up after being restarted",
+    )
+    _assert_post_loop_verdict(
+        amber_run,
+        'if [ "$sync_state" != "ok" ]; then',
+        "Recyclarr never recovered to sync_state=ok",
+    )
+
+
+def test_stack_smoke_recyclarr_step_names_avoid_forbidden_needles() -> None:
+    """`_step_named` returns the FIRST match - a step named with a generic
+    phrase already used by an earlier step in this same job (or the
+    "developer test" phrase this chunk was told never to use) would
+    silently resolve to that earlier step instead of its own.
+    """
+    job = _stack_smoke_job()
+    forbidden = (
+        "developer test",
+        "stop radarr",
+        "start radarr again",
+        "cancel",
+        "clean up",
+        "dump diagnostics",
+    )
+    for needles in [("recyclarr syncs quality",), ("sync turns amber",)]:
+        name = str(_step_named(job, *needles)["name"]).lower()
+        for phrase in forbidden:
+            assert phrase not in name, f"step {name!r} contains the forbidden phrase {phrase!r}"

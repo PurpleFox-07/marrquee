@@ -22,7 +22,7 @@ from fastapi.testclient import TestClient
 from test_deploy import _run_to_terminal, _StatefulEngine
 
 import marrquee.questions as questions_module
-from marrquee.catalog import get_app
+from marrquee.catalog import get_app, require_port
 from marrquee.config import Settings
 from marrquee.deploy import (
     AppProgress,
@@ -40,6 +40,7 @@ from marrquee.hardlinks import HardlinkMonitor, HardlinkResult, save_hardlink_re
 from marrquee.login import load_login, save_login
 from marrquee.main import create_app
 from marrquee.questions import QuestionCheck, QuestionField, QuestionStep, load_answers
+from marrquee.recyclarr import RecyclarrControl, SyncRecord, SyncStatus
 from marrquee.routes.api import _event_stream
 from marrquee.state import InstallState, load_state, save_state, write_json_atomic
 from marrquee.storage import write_marker
@@ -59,6 +60,7 @@ from marrquee.words import (
     REFUSAL_NOTHING_CHOSEN,
     STORAGE_CHECK_OK_MESSAGE,
     hub_install_busy,
+    recyclarr_line_app_down,
 )
 
 # --- Shared fixtures and small builders --------------------------------------
@@ -128,6 +130,7 @@ def _client(
     engine: FakeDockerEngine | None = None,
     vpn_control: FakeGluetunControl | None = None,
     hardlinks: HardlinkMonitor | None = None,
+    recyclarr: RecyclarrControl | None = None,
 ) -> TestClient:
     app = create_app(
         settings=settings,
@@ -135,8 +138,26 @@ def _client(
         manager=manager,
         vpn_control=vpn_control,
         hardlinks=hardlinks,
+        recyclarr=recyclarr,
     )
     return TestClient(app)
+
+
+class _RecordingRecyclarr:
+    """Stands in for `RecyclarrMonitor` on a route test: a fixed status to
+    hand back, and a count of how many times a sync was ever requested.
+    """
+
+    def __init__(self, status: SyncStatus) -> None:
+        self._status = status
+        self.sync_calls = 0
+
+    def request_sync(self) -> object:
+        self.sync_calls += 1
+        return None
+
+    async def status(self) -> SyncStatus:
+        return self._status
 
 
 def _idle_manager(settings: Settings) -> DeployManager:
@@ -160,9 +181,16 @@ def test_catalog_route_lists_apps_in_deploy_order_with_port_only(tmp_path: Path)
 
     assert response.status_code == 200
     apps = response.json()["apps"]
-    assert [app["id"] for app in apps] == ["prowlarr", "sonarr", "radarr", "qbittorrent"]
+    assert [app["id"] for app in apps] == [
+        "prowlarr",
+        "sonarr",
+        "radarr",
+        "qbittorrent",
+        "recyclarr",
+    ]
     assert apps[0].keys() == {"id", "name", "description", "port"}
     assert apps[0]["port"] == 9696
+    assert apps[-1]["port"] is None
 
 
 # --- The resting state: honest before any deploy has run ---------------------
@@ -487,6 +515,92 @@ def test_hub_status_vpn_tunnel_is_none_with_no_vpn_installed(tmp_path: Path) -> 
     assert response.json()["vpn_tunnel"] is None
 
 
+def test_hub_status_carries_sync_state_and_the_app_down_reason(tmp_path: Path) -> None:
+    """Recyclarr's own `sync_state` and `actions` reach the JSON poll the
+    same way `hub_view` computes them - the app-down reason named because
+    Radarr's own health, not Recyclarr's log wording, says it's down.
+    """
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+    save_state(settings.config_dir, _install_state(("sonarr", "radarr", "recyclarr"), root))
+    write_json_atomic(
+        settings.config_dir / "deploy.json",
+        dataclasses.asdict(
+            DeploySnapshot(
+                run_id="run-1",
+                phase="finale",
+                apps=(
+                    AppProgress(
+                        app_id="sonarr",
+                        name="Sonarr",
+                        state="done",
+                        chip="chip",
+                        line="Ready",
+                        note=None,
+                        port=8989,
+                    ),
+                    AppProgress(
+                        app_id="radarr",
+                        name="Radarr",
+                        state="done",
+                        chip="chip",
+                        line="Ready",
+                        note=None,
+                        port=7878,
+                    ),
+                    AppProgress(
+                        app_id="recyclarr",
+                        name="Recyclarr",
+                        state="done",
+                        chip="chip",
+                        line="Ready",
+                        note=None,
+                        port=None,
+                    ),
+                ),
+                headline="Now showing",
+                detail=None,
+                failure=None,
+                started_at="2026-09-19T00:00:00+00:00",
+                finished_at="2026-09-19T00:05:00+00:00",
+                wiring=(),
+            )
+        ),
+    )
+    engine = FakeDockerEngine(
+        DockerStatus(connected=True),
+        containers={
+            "sonarr": _running_container("sonarr"),
+            "radarr": ContainerSnapshot(
+                name="radarr",
+                exists=True,
+                state="exited",
+                exit_code=1,
+                image=get_app("radarr").image,
+                detail=None,
+            ),
+            "recyclarr": _running_container("recyclarr"),
+        },
+    )
+    recyclarr = _RecordingRecyclarr(
+        SyncStatus(
+            syncing=False,
+            last=SyncRecord(finished_at=datetime.now(UTC), ok=False),
+            start_failed=False,
+            run_failed=False,
+        )
+    )
+    client = _client(settings, _idle_manager(settings), engine=engine, recyclarr=recyclarr)
+
+    response = client.get("/api/hub/status")
+
+    assert response.status_code == 200
+    by_id = {app["app_id"]: app for app in response.json()["apps"]}
+    assert by_id["recyclarr"]["sync_state"] == "failed"
+    assert by_id["recyclarr"]["actions"] == "sync"
+    assert by_id["recyclarr"]["line"] == recyclarr_line_app_down("Radarr")
+
+
 def test_hub_status_carries_the_drive_note(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     save_hardlink_result(
@@ -660,7 +774,9 @@ async def test_hub_install_endpoint_starts_an_add_and_refuses_a_second(tmp_path:
         images={get_app(app_id).image for app_id in ("prowlarr", "sonarr", "radarr")},
     )
     radarr = get_app("radarr")
-    probe = FakeReadinessProbe(responses={(radarr.id, radarr.port): [False] * 1000}, default=True)
+    probe = FakeReadinessProbe(
+        responses={(radarr.id, require_port(radarr)): [False] * 1000}, default=True
+    )
     manager = DeployManager(settings, engine, probe=probe)
     manager.start()
     await _run_to_terminal(manager)
@@ -801,6 +917,108 @@ async def test_hub_install_qbittorrent_refuses_the_vpn_step_and_names_gluetun(
     assert body["step_id"] == "vpn"
     assert body["step_app_id"] == "gluetun"
     assert load_answers(settings.config_dir) == {}
+
+
+async def test_hub_install_recyclarr_saves_tv_quality_under_sonarr(tmp_path: Path) -> None:
+    """Recyclarr's own quality question is owned by Sonarr
+    (`step.app_id == "sonarr"`), so the endpoint's existing
+    `save_step_answers(..., step.app_id, ...)` lands the answer under
+    `sonarr`, never under `recyclarr` - the app whose add actually
+    triggered the question.
+    """
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+    save_state(settings.config_dir, _install_state(("prowlarr", "sonarr"), root))
+    save_login(settings.config_dir, "owner", "s3cret-password-1", honor_reset=None)
+    engine = _StatefulEngine(
+        ("prowlarr", "sonarr"),
+        images={get_app(app_id).image for app_id in ("prowlarr", "sonarr", "recyclarr")},
+    )
+    manager = DeployManager(settings, engine, probe=FakeReadinessProbe(default=True))
+    manager.start()
+    await _run_to_terminal(manager)
+    assert manager.snapshot().phase == "finale"
+
+    app = create_app(settings=settings, engine=engine, manager=manager)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/hub/apps/recyclarr/install", json={"answers": {"tv_quality": "4k"}}
+        )
+
+    assert response.status_code == 202
+    saved = load_answers(settings.config_dir)
+    assert saved["sonarr"]["tv_quality"] == "4k"
+    assert "recyclarr" not in saved
+
+
+def test_hub_install_sonarr_with_recyclarr_installed_asks_tv_quality(tmp_path: Path) -> None:
+    """Adding Sonarr after Recyclarr already exists asks the same question
+    in the other direction, and still saves it under Sonarr.
+
+    The finale snapshot is written directly (as
+    `test_hub_status_carries_kind_per_tile_and_the_vpn_tunnel_signal` does)
+    rather than run through a real bring-up - Recyclarr's own compose
+    branch and readiness rule don't exist until a later chunk, and this
+    test has no opinion about either.
+    """
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+    save_state(settings.config_dir, _install_state(("prowlarr", "recyclarr"), root))
+    save_login(settings.config_dir, "owner", "s3cret-password-1", honor_reset=None)
+    finished = DeploySnapshot(
+        run_id="run-1",
+        phase="finale",
+        apps=(
+            AppProgress(
+                app_id="prowlarr",
+                name="Prowlarr",
+                state="done",
+                chip="chip",
+                line="Ready",
+                note=None,
+                port=9696,
+            ),
+            AppProgress(
+                app_id="recyclarr",
+                name="Recyclarr",
+                state="done",
+                chip="chip",
+                line="Ready",
+                note=None,
+                port=None,
+            ),
+        ),
+        headline="Now showing",
+        detail=None,
+        failure=None,
+        started_at="2026-09-19T00:00:00+00:00",
+        finished_at="2026-09-19T00:05:00+00:00",
+        wiring=(),
+    )
+    write_json_atomic(settings.config_dir / "deploy.json", dataclasses.asdict(finished))
+
+    engine = _StatefulEngine(
+        ("prowlarr", "recyclarr"),
+        images={get_app(app_id).image for app_id in ("prowlarr", "sonarr", "recyclarr")},
+    )
+    manager = DeployManager(settings, engine, probe=FakeReadinessProbe(default=True))
+    assert manager.snapshot().phase == "finale"
+
+    app = create_app(settings=settings, engine=engine, manager=manager)
+    with TestClient(app) as client:
+        refused = client.post("/api/hub/apps/sonarr/install", json={"answers": {}})
+        assert refused.status_code == 400
+        body = refused.json()
+        assert body["step_id"] == "quality"
+        assert body["step_app_id"] == "sonarr"
+
+        accepted = client.post(
+            "/api/hub/apps/sonarr/install", json={"answers": {"tv_quality": "1080p"}}
+        )
+        assert accepted.status_code == 202
+
+    saved = load_answers(settings.config_dir)
+    assert saved["sonarr"]["tv_quality"] == "1080p"
 
 
 # --- The storage check --------------------------------------------------------

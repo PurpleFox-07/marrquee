@@ -20,6 +20,7 @@ class RecordingDockerStub:
 
     def __init__(self) -> None:
         self.request_lines: list[str] = []
+        self.request_bodies: list[bytes] = []
         self._server: asyncio.AbstractServer | None = None
         self._responses: list[tuple[str, bytes]] = [
             ("HTTP/1.1 200 OK", b'{"Version": "27.3.1", "ApiVersion": "1.47"}')
@@ -49,12 +50,19 @@ class RecordingDockerStub:
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         request_line = await reader.readline()
         self.request_lines.append(request_line.decode().strip())
-        # Drain the rest of the request headers so the client's write completes
-        # cleanly, without trying to parse or act on them.
+        # Drain the rest of the request headers, keeping only Content-Length -
+        # that's what lets a POST body (an exec's create/start payload) be
+        # read off the wire and recorded below, rather than merely ignored.
+        content_length = 0
         while True:
             line = await reader.readline()
             if line in (b"\r\n", b""):
                 break
+            name, _, value = line.decode().partition(":")
+            if name.strip().lower() == "content-length":
+                content_length = int(value.strip())
+        body = await reader.readexactly(content_length) if content_length else b""
+        self.request_bodies.append(body)
         index = min(len(self.request_lines) - 1, len(self._responses) - 1)
         status_line, body = self._responses[index]
         response = (

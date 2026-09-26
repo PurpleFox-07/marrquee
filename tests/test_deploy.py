@@ -23,7 +23,7 @@ from pathlib import Path, PurePosixPath
 
 import httpx
 
-from marrquee.catalog import get_app
+from marrquee.catalog import get_app, require_port
 from marrquee.config import Settings
 from marrquee.deploy import (
     AppProgress,
@@ -41,6 +41,8 @@ from marrquee.docker_client import (
     ContainerSnapshot,
     ContainerStopResult,
     DockerStatus,
+    ExecStartResult,
+    ExecState,
     FakeDockerEngine,
     NetworkConnectResult,
     _service_config_signature,
@@ -144,6 +146,7 @@ class _StatefulEngine:
         stop_results: dict[str, bool] | None = None,
         logs: dict[str, str] | None = None,
         health_frames: dict[str, list[ContainerHealth | None]] | None = None,
+        exec_exit_codes: dict[str, int] | None = None,
     ) -> None:
         self._images = (
             images if images is not None else {get_app(app_id).image for app_id in app_ids}
@@ -173,6 +176,9 @@ class _StatefulEngine:
         # what a test can tell that apart by.
         self._service_signatures: dict[str, str] = {}
         self._recreate_sequence = 0
+        self._exec_exit_codes = exec_exit_codes or {}
+        self._exec_containers: dict[str, str] = {}
+        self._exec_sequence = 0
 
     async def status(self) -> DockerStatus:
         self.calls.append(("status", ()))
@@ -266,6 +272,28 @@ class _StatefulEngine:
         if name in self._containers:
             self._containers[name] = dataclasses.replace(self._containers[name], state="exited")
         return ContainerStopResult(ok=True, detail=None)
+
+    async def exec_start(self, container: str, cmd: Sequence[str]) -> ExecStartResult:
+        self.calls.append(("exec_start", (container, tuple(cmd))))
+        snapshot = self._containers.get(container)
+        if snapshot is None or snapshot.state != "running":
+            return ExecStartResult(ok=False, exec_id=None, detail="container is not running")
+        self._exec_sequence += 1
+        exec_id = f"exec-{self._exec_sequence}"
+        self._exec_containers[exec_id] = container
+        return ExecStartResult(ok=True, exec_id=exec_id, detail=None)
+
+    async def exec_inspect(self, exec_id: str) -> ExecState:
+        self.calls.append(("exec_inspect", (exec_id,)))
+        container = self._exec_containers.get(exec_id)
+        if container is None:
+            return ExecState(known=False, running=False, exit_code=None, detail=None)
+        return ExecState(
+            known=True,
+            running=False,
+            exit_code=self._exec_exit_codes.get(container, 0),
+            detail=None,
+        )
 
 
 def _happy_engine(app_ids: tuple[str, ...]) -> _StatefulEngine:
@@ -669,7 +697,7 @@ async def test_apps_that_already_finished_stay_done_when_a_later_app_fails(
     # Prowlarr answers ready first time; Sonarr (started next, catalog order)
     # never answers at all.
     probe = FakeReadinessProbe(
-        responses={("prowlarr", get_app("prowlarr").port): [True]}, default=False
+        responses={("prowlarr", require_port(get_app("prowlarr"))): [True]}, default=False
     )
     clock = _FakeClock()
     manager = DeployManager(settings, engine, probe=probe, clock=clock.time, sleep=clock.sleep)
@@ -1323,6 +1351,45 @@ async def test_resume_if_interrupted_reenters_a_persisted_running_deploy(tmp_pat
     history = await _run_to_terminal(manager)
 
     assert history[-1].phase == "finale"
+
+
+def test_a_persisted_progress_with_a_null_port_loads(tmp_path: Path) -> None:
+    """A `kind="sync"` app (Recyclarr) persists with `port: null` - the
+    reload must use that entry honestly instead of silently discarding the
+    whole persisted snapshot back to "ready".
+    """
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+    install = _install_state(("recyclarr",), root)
+    save_state(settings.config_dir, install)
+
+    stale = DeploySnapshot(
+        run_id="stale-run-with-a-portless-app",
+        phase="running",
+        apps=(
+            AppProgress(
+                app_id="recyclarr",
+                name="Recyclarr",
+                state="starting",
+                chip="Starting…",
+                line="Starting Recyclarr",
+                note=None,
+                port=None,
+            ),
+        ),
+        headline="Starting your apps, one at a time.",
+        detail=None,
+        failure=None,
+        started_at="2026-09-19T00:00:00+00:00",
+        finished_at=None,
+        wiring=(),
+    )
+    write_json_atomic(settings.config_dir / "deploy.json", dataclasses.asdict(stale))
+
+    manager = DeployManager(settings, FakeDockerEngine(DockerStatus(connected=True)))
+
+    assert manager.snapshot().phase == "running"
+    assert manager.snapshot().apps[0].port is None
 
 
 def test_resume_if_interrupted_does_nothing_when_nothing_was_ever_started(tmp_path: Path) -> None:

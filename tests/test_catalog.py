@@ -14,6 +14,7 @@ import pytest
 
 from marrquee.catalog import (
     CATALOG,
+    RECYCLARR_APP_ID,
     AppRule,
     CatalogApp,
     app_host,
@@ -21,6 +22,7 @@ from marrquee.catalog import (
     companions_for,
     description_for,
     get_app,
+    require_port,
     riders_of,
     unavailable_reason,
 )
@@ -29,6 +31,8 @@ from marrquee.words import (
     QBITTORRENT_DESCRIPTION,
     QBITTORRENT_DESCRIPTION_NO_VPN,
     RADARR_DESCRIPTION,
+    RECYCLARR_DESCRIPTION,
+    RECYCLARR_NEEDS_ARR,
     SONARR_DESCRIPTION,
 )
 
@@ -36,7 +40,7 @@ from marrquee.words import (
 def test_catalog_holds_the_three_arr_apps_gluetun_and_qbittorrent_in_deploy_order() -> None:
     ids = [app.id for app in CATALOG]
 
-    assert ids == ["prowlarr", "sonarr", "radarr", "gluetun", "qbittorrent"]
+    assert ids == ["prowlarr", "sonarr", "radarr", "gluetun", "qbittorrent", "recyclarr"]
     orders = [app.order for app in CATALOG]
     assert orders == sorted(orders)
 
@@ -81,6 +85,7 @@ def test_the_three_arr_apps_take_the_login_gluetun_takes_none_qbittorrent_its_ow
         "radarr": "arr",
         "gluetun": "none",
         "qbittorrent": "qbittorrent",
+        "recyclarr": "none",
     }
 
 
@@ -170,6 +175,7 @@ def test_every_catalog_description_is_the_mockups_own_wording() -> None:
     assert descriptions_by_id["prowlarr"] == PROWLARR_DESCRIPTION
     assert descriptions_by_id["sonarr"] == SONARR_DESCRIPTION
     assert descriptions_by_id["radarr"] == RADARR_DESCRIPTION
+    assert descriptions_by_id["recyclarr"] == RECYCLARR_DESCRIPTION
     assert PROWLARR_DESCRIPTION == "Your search sources, managed in one place."
     assert SONARR_DESCRIPTION == "Finds and organizes your TV shows."
     assert RADARR_DESCRIPTION == "Finds and organizes your movies."
@@ -299,3 +305,55 @@ def test_riders_of_returns_present_apps_that_ride_the_given_network_in_catalog_o
     assert riders_of("gluetun", ("qbittorrent", "sonarr", "gluetun")) == (get_app("qbittorrent"),)
     assert riders_of("gluetun", ("sonarr", "radarr")) == ()
     assert riders_of("qbittorrent", ("qbittorrent", "sonarr")) == ()
+
+
+# --- Recyclarr: a "sync" app with no port -----------------------------------
+
+
+def test_recyclarr_is_offered_unticked_and_has_no_port() -> None:
+    recyclarr = get_app(RECYCLARR_APP_ID)
+
+    assert recyclarr.id == "recyclarr"
+    assert recyclarr.name == "Recyclarr"
+    assert recyclarr.description == RECYCLARR_DESCRIPTION
+    assert recyclarr.image == "ghcr.io/recyclarr/recyclarr:8.7.2"
+    assert recyclarr.port is None
+    assert recyclarr.env_prefix == "RECYCLARR"
+    assert recyclarr.api_base == ""
+    assert recyclarr.media_folders == ()
+    assert recyclarr.needs_data_mount is False
+    assert recyclarr.glyph == "RC"
+    assert recyclarr.order == 5
+    assert recyclarr.default_ticked is False
+    assert recyclarr.web_page is False
+    assert recyclarr.login_kind == "none"
+    assert recyclarr.kind == "sync"
+    assert recyclarr.offered is True
+    assert recyclarr.api_key_style == "hex32"
+    assert recyclarr.network_via is None
+    assert recyclarr.description_without_vpn == ""
+    assert recyclarr.rules == (
+        AppRule(kind="needs_any", app_ids=("sonarr", "radarr"), reason=RECYCLARR_NEEDS_ARR),
+    )
+
+
+def test_recyclarr_sits_last_right_after_qbittorrent() -> None:
+    ids = [app.id for app in CATALOG]
+
+    assert ids[-1] == "recyclarr"
+    assert ids.index("recyclarr") == ids.index("qbittorrent") + 1
+
+
+def test_unavailable_reason_for_recyclarr_without_sonarr_or_radarr_is_recyclarr_needs_arr() -> None:
+    recyclarr = get_app("recyclarr")
+
+    assert unavailable_reason(recyclarr, ()) == RECYCLARR_NEEDS_ARR
+    assert unavailable_reason(recyclarr, ("sonarr",)) is None
+    assert unavailable_reason(recyclarr, ("radarr",)) is None
+
+
+def test_require_port_raises_for_recyclarr_and_returns_8989_for_sonarr() -> None:
+    assert require_port(get_app("sonarr")) == 8989
+
+    with pytest.raises(ValueError, match="recyclarr has no port"):
+        require_port(get_app("recyclarr"))

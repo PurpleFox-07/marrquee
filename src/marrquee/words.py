@@ -1754,6 +1754,101 @@ _DRIVE_WORDS: tuple[str, ...] = (
 # end Your drive section
 # =============================================================================
 
+# =============================================================================
+# Recyclarr - keeping Sonarr and Radarr's quality settings matched to the
+# TRaSH guides, in the owner's own words
+# =============================================================================
+
+RECYCLARR_DESCRIPTION = (
+    "Keeps Sonarr and Radarr's quality settings matching the TRaSH guides - "
+    "the settings experienced users rely on - and checks for updates every day."
+)
+RECYCLARR_NEEDS_ARR = "needs Sonarr or Radarr"
+
+QUALITY_TV_STEP_TITLE = "Quality for TV shows"
+QUALITY_MOVIE_STEP_TITLE = "Quality for movies"
+QUALITY_TV_STEP_LEDE = (
+    "Recyclarr adds a quality profile to Sonarr that follows the TRaSH guides, "
+    "and keeps it up to date every day. Shows you already have are left alone - "
+    "choose the new profile when you add a show. If you change Sonarr's "
+    "quality settings by hand, Recyclarr puts them back on its next sync."
+)
+QUALITY_MOVIE_STEP_LEDE = (
+    "Recyclarr adds a quality profile to Radarr that follows the TRaSH guides, "
+    "and keeps it up to date every day. Movies you already have are left alone - "
+    "choose the new profile when you add a movie. If you change Radarr's "
+    "quality settings by hand, Recyclarr puts them back on its next sync."
+)
+QUALITY_LABEL = "Quality"
+QUALITY_1080P = "1080p (Full HD)"
+QUALITY_4K = "4K (Ultra HD)"
+QUALITY_TV_1080P_HINT = "Looks great on most TVs. About 1-4 GB per episode."
+QUALITY_TV_4K_HINT = "For a 4K TV and plenty of space. About 5-20 GB per episode."
+QUALITY_MOVIE_1080P_HINT = "Looks great on most TVs. About 5-15 GB per movie."
+QUALITY_MOVIE_4K_HINT = "For a 4K TV and plenty of space. About 20-60 GB per movie."
+RECYCLARR_CONFIG_HEADER_COMMENT = (
+    "Written by Marrquee for Recyclarr. Marrquee rewrites this file every time "
+    "it starts a sync, so edits made here don't last."
+)
+RECYCLARR_COMPOSE_COMMENT = (
+    "Recyclarr has no web page. It reads recyclarr.yml in this app's folder, "
+    "which Marrquee writes, and syncs once a day by itself."
+)
+
+RECYCLARR_LINE_SYNCING = "Syncing quality settings…"
+RECYCLARR_LINE_NEVER = "Not synced yet - press Sync now."
+RECYCLARR_LINE_COULDNT_START = "Marrquee couldn't start a sync. Press Sync now to try again."
+RECYCLARR_CHIP_NEEDS_LOOK = "Needs a look"
+HUB_SYNC_NOW = "Sync now"
+
+
+def recyclarr_line_last_synced(when: str) -> str:
+    return f"Last synced {when}"
+
+
+def recyclarr_line_late(when: str) -> str:
+    return f"Last synced {when} - it should sync every day. Press Sync now."
+
+
+def recyclarr_line_failed(when: str) -> str:
+    return f"The last sync, {when}, didn't work. Press Sync now to try again."
+
+
+def recyclarr_line_app_down(name: str) -> str:
+    return f"Couldn't update {name} because it's down. Start {name} again, then press Sync now."
+
+
+_RECYCLARR_WORDS: tuple[str, ...] = (
+    "RECYCLARR_DESCRIPTION",
+    "RECYCLARR_NEEDS_ARR",
+    "QUALITY_TV_STEP_TITLE",
+    "QUALITY_MOVIE_STEP_TITLE",
+    "QUALITY_TV_STEP_LEDE",
+    "QUALITY_MOVIE_STEP_LEDE",
+    "QUALITY_LABEL",
+    "QUALITY_1080P",
+    "QUALITY_4K",
+    "QUALITY_TV_1080P_HINT",
+    "QUALITY_TV_4K_HINT",
+    "QUALITY_MOVIE_1080P_HINT",
+    "QUALITY_MOVIE_4K_HINT",
+    "RECYCLARR_CONFIG_HEADER_COMMENT",
+    "RECYCLARR_COMPOSE_COMMENT",
+    "RECYCLARR_LINE_SYNCING",
+    "RECYCLARR_LINE_NEVER",
+    "RECYCLARR_LINE_COULDNT_START",
+    "RECYCLARR_CHIP_NEEDS_LOOK",
+    "HUB_SYNC_NOW",
+    "recyclarr_line_last_synced",
+    "recyclarr_line_late",
+    "recyclarr_line_failed",
+    "recyclarr_line_app_down",
+)
+
+# =============================================================================
+# end Recyclarr section
+# =============================================================================
+
 # The full review surface: every public name above, in one tuple. A later
 # feature area adds its own fenced section above this line, then extends
 # this tuple with its own `_..._WORDS` name - never editing an earlier
@@ -1771,4 +1866,5 @@ WORDS_INVENTORY: tuple[str, ...] = (
     *_QBIT_WORDS,
     *_VPN_CHANGE_WORDS,
     *_DRIVE_WORDS,
+    *_RECYCLARR_WORDS,
 )

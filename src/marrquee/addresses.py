@@ -69,9 +69,10 @@ def host_only(authority: str) -> str | None:
     return host
 
 
-def app_url(authority: str | None, port: int) -> str | None:
+def app_url(authority: str | None, port: int | None) -> str | None:
     """`http://<host>:<port>/` built from the address the browser used, or
-    `None` when no trustworthy host can be worked out.
+    `None` when no trustworthy host can be worked out - or when `port` is
+    `None`, a `kind="sync"` app (Recyclarr) having no web page of its own.
 
     Always `http` - the arr apps only ever publish plain HTTP on their own
     ports, so inheriting `https` from a proxied Marrquee would produce a
@@ -79,7 +80,7 @@ def app_url(authority: str | None, port: int) -> str | None:
     fallback and no configured address, because a fabricated link is worse
     than the page's own "couldn't work out an address" wording.
     """
-    if authority is None:
+    if authority is None or port is None:
         return None
     host = host_only(authority)
     if host is None:

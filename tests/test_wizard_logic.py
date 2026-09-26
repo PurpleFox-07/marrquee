@@ -94,14 +94,21 @@ def test_wizard_steps_are_numbered_one_through_four_in_order() -> None:
 
 
 def test_wizard_steps_matches_the_four_fixed_pills_when_nothing_is_registered() -> None:
-    # Gluetun and qBittorrent are the two catalog apps with a registered
-    # question step, so "nothing is registered" holds only for subsets
-    # that leave both out.
+    # Gluetun and qBittorrent carry their own registered question step;
+    # Recyclarr carries none of its own, but its quality question is
+    # `asked_with="recyclarr"` on Sonarr/Radarr, so any subset with
+    # Recyclarr AND (Sonarr or Radarr) also has a registered step. "nothing
+    # is registered" holds only for subsets that leave every one of those
+    # three ids out.
     every_subset = (
         (),
         ("prowlarr",),
         ("prowlarr", "sonarr"),
-        tuple(app.id for app in catalog.CATALOG if app.id not in ("gluetun", "qbittorrent")),
+        tuple(
+            app.id
+            for app in catalog.CATALOG
+            if app.id not in ("gluetun", "qbittorrent", "recyclarr")
+        ),
     )
     for app_ids in every_subset:
         steps = wizard.wizard_steps(app_ids)

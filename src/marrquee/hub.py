@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Final, Literal
 
 from marrquee.addresses import app_url
@@ -32,6 +32,7 @@ from marrquee.catalog import (
     companions_for,
     description_for,
     get_app,
+    require_port,
     unavailable_reason,
 )
 from marrquee.deploy import AddState, AppAdd, WiringGap
@@ -41,6 +42,7 @@ from marrquee.health import AppHealth, HubState, LinkHealth, LinkState
 from marrquee.links import LinkCard, link_address, link_glyph
 from marrquee.login import LoginRecord, LoginStatus, login_status, pending_app_ids, reset_reminder
 from marrquee.questions import QuestionStep, question_steps_for
+from marrquee.recyclarr import SyncRecord, SyncState, SyncStatus
 from marrquee.vpn import VPN_APP_ID, TunnelPlace, tunnel_place_line
 from marrquee.words import (
     HUB_ALL_UP,
@@ -62,6 +64,10 @@ from marrquee.words import (
     HUB_LINK_LINE_DOWN,
     HUB_LINKS_ALL_UP,
     HUB_NOTHING_SET_UP,
+    RECYCLARR_CHIP_NEEDS_LOOK,
+    RECYCLARR_LINE_COULDNT_START,
+    RECYCLARR_LINE_NEVER,
+    RECYCLARR_LINE_SYNCING,
     VPN_LINE_CONNECTING,
     VPN_LINE_NOT_SURE,
     VPN_LINE_TUNNEL_DOWN,
@@ -82,6 +88,10 @@ from marrquee.words import (
     hub_open_app_aria,
     hub_some_up,
     hub_wiring_gap_note,
+    recyclarr_line_app_down,
+    recyclarr_line_failed,
+    recyclarr_line_last_synced,
+    recyclarr_line_late,
     relative_time,
 )
 
@@ -102,6 +112,21 @@ HUB_ADD_POLL_MS: Final = 2000
 # anchor (GitHub's own slug for "## Forgot your apps' password?") stays
 # correct without a second, hand-typed copy of it anywhere else.
 LOGIN_HELP_URL: Final = "https://github.com/PurpleFox-07/marrquee#forgot-your-apps-password"
+
+# How stale a good sync is allowed to look before the poster stops trusting
+# it - the owner's own 48-hour call, not Recyclarr's cron interval itself.
+# An injectable default rather than a bare literal in `hub_view`, so a test
+# can shrink it instead of forging multi-day timestamps.
+SYNC_LATE_AFTER: Final = timedelta(hours=48)
+
+# `HubTile.actions`, shared with `HubTileOut` (routes/api.py) so the two
+# never drift apart on which extra form a poster may show beside its link.
+TileAction = Literal["none", "retry", "reconnect", "try_again", "retry_or_restore", "sync"]
+
+# The only two apps a sync tile's "couldn't reach it" reason ever names -
+# Recyclarr configures nothing else, so no other app's health is worth
+# reading here.
+_RECYCLARR_PARTNER_APP_IDS: Final = ("sonarr", "radarr")
 
 _CHIP_BY_STATE: dict[HubState, str] = {
     "up": HUB_CHIP_UP,
@@ -152,6 +177,10 @@ class HubTile:
     Gluetun's own tile once it's installed and no VPN run is touching it,
     or a fresh "Add your VPN" that's already moved a rider and failed (the
     one place the owner can still edit the VPN answers before trying again).
+    `sync_state` is Recyclarr's own poster state (`None` for every other
+    app) - `actions="sync"` stays set through every one of its up states,
+    syncing included, so the grid's own shape never flips; the CSS alone
+    hides the button while a sync is running.
     """
 
     app_id: str
@@ -165,11 +194,12 @@ class HubTile:
     aria: str | None
     add_state: AddState | None = None
     note: str = ""
-    actions: Literal["none", "retry", "reconnect", "try_again", "retry_or_restore"] = "none"
+    actions: TileAction = "none"
     kind: AppKind = "arr"
     paused: bool = False
     can_change_seeding: bool = False
     can_change_vpn: bool = False
+    sync_state: SyncState | None = None
 
 
 @dataclass(frozen=True)
@@ -425,6 +455,8 @@ def hub_view(
     vpn_place: TunnelPlace | None = None,
     without_vpn: bool = False,
     drive: HardlinkResult | None = None,
+    recyclarr: SyncStatus | None = None,
+    sync_late_after: timedelta = SYNC_LATE_AFTER,
 ) -> HubView:
     healths_by_id = {health.app_id: health for health in healths}
     gaps_by_id = {gap.app_id: gap for gap in wiring_gaps}
@@ -448,6 +480,9 @@ def hub_view(
             now=now,
             vpn_place=vpn_place,
             present=deployed_ids,
+            healths_by_id=healths_by_id,
+            sync=recyclarr,
+            sync_late_after=sync_late_after,
         )
         return _apply_add_overlay(tile, app, adding, gaps_by_id.get(app.id)), tunnel
 
@@ -489,7 +524,8 @@ def hub_view(
             app=app,
             unavailable=unavailable_reason(app, deployed_ids),
             steps=question_steps_for(
-                (*companions_for(app.id, deployed_ids, without_vpn=without_vpn), app.id)
+                (*companions_for(app.id, deployed_ids, without_vpn=without_vpn), app.id),
+                present=deployed_ids,
             ),
             without_vpn=without_vpn and app.network_via is not None,
         )
@@ -840,9 +876,25 @@ def _tile(
     now: datetime,
     vpn_place: TunnelPlace | None = None,
     present: Iterable[str] = (),
+    healths_by_id: Mapping[str, AppHealth] | None = None,
+    sync: SyncStatus | None = None,
+    sync_late_after: timedelta = SYNC_LATE_AFTER,
 ) -> tuple[HubTile, TunnelState | None]:
     if app.kind == "vpn":
         return _vpn_tile(app, health, vpn_place, now, present)
+    if app.kind == "sync":
+        return (
+            _sync_tile(
+                app,
+                health,
+                sync,
+                now,
+                present,
+                healths_by_id=healths_by_id or {},
+                sync_late_after=sync_late_after,
+            ),
+            None,
+        )
 
     # No matching health reading (a deployed app Docker was never asked
     # about, or whose id it didn't recognise) is honestly "unknown", never
@@ -927,6 +979,120 @@ def _vpn_running_tile(
     return "unknown", VPN_LINE_NOT_SURE, "unknown"
 
 
+def _sync_tile(
+    app: CatalogApp,
+    health: AppHealth | None,
+    sync: SyncStatus | None,
+    now: datetime,
+    present: Iterable[str],
+    *,
+    healths_by_id: Mapping[str, AppHealth],
+    sync_late_after: timedelta,
+) -> HubTile:
+    """Recyclarr's own poster: never linked (it has no web page of its own),
+    and while its container is up, coloured by Marrquee's OWN sync attempts
+    and Recyclarr's own per-run logs - never by anything Recyclarr's log
+    itself says in English. A stopped container is an ordinary Down, the
+    same arr-style mapping and lines every other app gets.
+    """
+    state: HubState = health.state if health is not None else "unknown"
+    if state != "up":
+        return HubTile(
+            app_id=app.id,
+            glyph=app.glyph,
+            name=app.name,
+            description=description_for(app, present),
+            state=state,
+            chip=_CHIP_BY_STATE[state],
+            line=_line(app, state, None, health, now),
+            url=None,
+            aria=None,
+            kind=app.kind,
+        )
+
+    sync_state, line, chip = _sync_up_details(sync, now, present, healths_by_id, sync_late_after)
+    return HubTile(
+        app_id=app.id,
+        glyph=app.glyph,
+        name=app.name,
+        description=description_for(app, present),
+        state="up",
+        chip=chip,
+        line=line,
+        url=None,
+        aria=None,
+        kind=app.kind,
+        # Every up state offers Sync now, syncing included - the CSS alone
+        # hides the button while `sync_state == "syncing"`, so the grid's
+        # own shape (and `hub.js`'s reload signature) never has to flip.
+        actions="sync",
+        sync_state=sync_state,
+    )
+
+
+def _sync_up_details(
+    sync: SyncStatus | None,
+    now: datetime,
+    present: Iterable[str],
+    healths_by_id: Mapping[str, AppHealth],
+    sync_late_after: timedelta,
+) -> tuple[SyncState, str, str]:
+    if sync is not None and sync.syncing:
+        return "syncing", RECYCLARR_LINE_SYNCING, HUB_CHIP_UP
+
+    last = sync.last if sync is not None else None
+    start_failed = sync is not None and sync.start_failed
+    # `run_failed` is the broader signal (a bad exit code, a timeout, or a
+    # clean exit whose own newest log still shows an error) - it is true
+    # whenever `start_failed` is, so checking it alone still catches every
+    # "Marrquee itself couldn't finish this sync" case, plus the ones a
+    # real Recyclarr release's exit code doesn't prove on its own.
+    run_failed = sync is not None and sync.run_failed
+
+    if start_failed:
+        return "failed", RECYCLARR_LINE_COULDNT_START, RECYCLARR_CHIP_NEEDS_LOOK
+    if run_failed and (last is None or last.ok):
+        # Either nothing has ever landed in the log Marrquee reads, or the
+        # newest one there predates this failure and still says "fine" - in
+        # both cases the freshest truth is "the attempt itself failed", not
+        # whatever a stale or absent log would otherwise suggest.
+        return "failed", RECYCLARR_LINE_COULDNT_START, RECYCLARR_CHIP_NEEDS_LOOK
+
+    if last is None:
+        return "never", RECYCLARR_LINE_NEVER, HUB_CHIP_UP
+
+    age = _sync_age_seconds(last, now)
+    if last.ok:
+        if age < sync_late_after.total_seconds():
+            return "ok", recyclarr_line_last_synced(relative_time(age)), HUB_CHIP_UP
+        return "late", recyclarr_line_late(relative_time(age)), RECYCLARR_CHIP_NEEDS_LOOK
+
+    return (
+        "failed",
+        _recyclarr_failure_reason(last, age, present, healths_by_id),
+        RECYCLARR_CHIP_NEEDS_LOOK,
+    )
+
+
+def _sync_age_seconds(last: SyncRecord, now: datetime) -> float:
+    # A future `finished_at` (a NAS with a bad clock) reads as "just now"
+    # rather than a nonsensical negative age - the same honesty
+    # `_last_seen` already applies to a down app's own last-seen time.
+    return max(0.0, (now - last.finished_at).total_seconds())
+
+
+def _recyclarr_failure_reason(
+    last: SyncRecord, age: float, present: Iterable[str], healths_by_id: Mapping[str, AppHealth]
+) -> str:
+    ids = set(present)
+    partners = (app for app in apps_in_order(ids) if app.id in _RECYCLARR_PARTNER_APP_IDS)
+    for partner in partners:
+        partner_health = healths_by_id.get(partner.id)
+        if partner_health is not None and partner_health.state == "down":
+            return recyclarr_line_app_down(partner.name)
+    return recyclarr_line_failed(relative_time(age))
+
+
 def _line(
     app: CatalogApp, state: HubState, url: str | None, health: AppHealth | None, now: datetime
 ) -> str:
@@ -937,13 +1103,19 @@ def _line(
         # there being no link is normal for it, not a missing address.
         if not app.web_page:
             return ""
-        return "" if url is not None else hub_line_no_address(app.name, app.port)
+        # Every app with a web page also has a port - `require_port` turns
+        # a future contract violation into a loud bug instead of a poster
+        # silently naming a port that doesn't exist.
+        return "" if url is not None else hub_line_no_address(app.name, require_port(app))
     if state == "starting":
         return hub_line_starting(app.name)
     if state == "unknown":
+        # A `kind="sync"` app (Recyclarr) has no port to fall back to - an
+        # unknown container state reads as plainly unknown for it, never
+        # as "no address" naming a port that doesn't exist.
         return (
             hub_line_unknown(app.name)
-            if url is not None
+            if url is not None or app.port is None
             else hub_line_no_address(app.name, app.port)
         )
 

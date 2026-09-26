@@ -51,6 +51,7 @@
     "note",
     "actions",
     "paused",
+    "sync_state",
   ];
   // No "url" here: a link card's `href` is set once, by the server, and
   // stays put - the light is only ever a hint, so a poll never touches it.
@@ -171,6 +172,11 @@
     } else {
       tile.removeAttribute("data-add-state");
     }
+    if (app.sync_state) {
+      tile.setAttribute("data-sync-state", app.sync_state);
+    } else {
+      tile.removeAttribute("data-sync-state");
+    }
     setTextWithin(tile, "chip", app.chip);
     setTextWithin(tile, "line", app.line);
     setTextWithin(tile, "note", app.note);
@@ -181,6 +187,22 @@
       tile.removeAttribute("href");
       tile.removeAttribute("aria-label");
     }
+    paintSyncButton(tile, app.sync_state);
+  }
+
+  // The Sync now button's own class - never its text - swaps with the
+  // state: primary once the owner needs to notice it (late/failed), ghost
+  // otherwise. Its own visibility (hidden while syncing) is CSS's job,
+  // driven by `data-sync-state` above, so a poll with JavaScript off still
+  // gets the right answer from the page's own last server render.
+  function paintSyncButton(tile, syncState) {
+    var item = tile.closest("li");
+    var button = item && item.querySelector('[data-role="sync-now"]');
+    if (!button) {
+      return;
+    }
+    var primary = syncState === "late" || syncState === "failed";
+    button.className = primary ? "btn-primary" : "btn-ghost";
   }
 
   // A link card's light is a hint, never a lock (Marrquee checks it from

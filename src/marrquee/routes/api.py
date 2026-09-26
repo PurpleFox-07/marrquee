@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncGenerator
-from typing import Annotated, Literal, cast
+from typing import Annotated, cast
 
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import PlainTextResponse, StreamingResponse
@@ -45,7 +45,7 @@ from marrquee.deploy import (
     FailureCode,
 )
 from marrquee.health import HubState, LinkState
-from marrquee.hub import HubTile, LinkTile, LoginBanner, TunnelState
+from marrquee.hub import HubTile, LinkTile, LoginBanner, TileAction, TunnelState
 from marrquee.install import install_apps
 from marrquee.login import LOGIN_STEP, load_login, save_login
 from marrquee.questions import (
@@ -56,6 +56,7 @@ from marrquee.questions import (
     question_steps_for,
     save_step_answers,
 )
+from marrquee.recyclarr import SyncState
 from marrquee.routes.hub import read_hub_view
 from marrquee.state import load_state
 from marrquee.storage import StorageCheck, check_storage_root
@@ -136,7 +137,7 @@ class CatalogAppOut(BaseModel):
     id: str
     name: str
     description: str
-    port: int
+    port: int | None
 
 
 class CatalogResponse(BaseModel):
@@ -169,7 +170,7 @@ class AppProgressOut(BaseModel):
     chip: str
     line: str
     note: str | None
-    port: int
+    port: int | None
 
 
 class WiringStepOut(BaseModel):
@@ -219,11 +220,12 @@ class HubTileOut(BaseModel):
     aria: str | None
     add_state: AddState | None
     note: str
-    actions: Literal["none", "retry", "reconnect", "try_again", "retry_or_restore"]
+    actions: TileAction
     kind: AppKind
     paused: bool
     can_change_seeding: bool
     can_change_vpn: bool
+    sync_state: SyncState | None
 
 
 class LinkTileOut(BaseModel):
@@ -334,6 +336,7 @@ def _hub_tile_out(tile: HubTile) -> HubTileOut:
         paused=tile.paused,
         can_change_seeding=tile.can_change_seeding,
         can_change_vpn=tile.can_change_vpn,
+        sync_state=tile.sync_state,
     )
 
 
@@ -587,7 +590,8 @@ async def post_hub_install(
                 app_id, installed_ids, without_vpn=without_vpn_confirmed(settings.config_dir)
             ),
             app_id,
-        )
+        ),
+        present=installed_ids,
     )
     saved = load_answers(settings.config_dir)
     checks: list[tuple[QuestionStep, QuestionCheck]] = []

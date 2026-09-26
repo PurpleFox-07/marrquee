@@ -22,7 +22,14 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from marrquee import storage
-from marrquee.catalog import CatalogApp, apps_in_order, description_for, get_app, riders_of
+from marrquee.catalog import (
+    CatalogApp,
+    apps_in_order,
+    description_for,
+    get_app,
+    require_port,
+    riders_of,
+)
 from marrquee.config import Settings
 from marrquee.state import InstallState
 from marrquee.storage import ChownFn, to_host_view
@@ -32,6 +39,7 @@ from marrquee.words import (
     DATA_MOUNT_COMMENT,
     DOWNLOADER_COMPOSE_COMMENT,
     DOWNLOADER_NO_VPN_COMPOSE_COMMENT,
+    RECYCLARR_COMPOSE_COMMENT,
     VPN_SECRETS_MOUNT_COMMENT,
 )
 
@@ -73,7 +81,11 @@ class ServicePlan:
     (qBittorrent's branch, riding Gluetun's network namespace instead of
     getting one of its own), makes `_render_service` write a
     `network_mode:` line and skip that service's `networks:` block entirely
-    - compose refuses a service that names both.
+    - compose refuses a service that names both. `user`, when set
+    (Recyclarr's branch), makes `_render_service` write a `user:` line right
+    after `container_name:` - the one app that must run as the drive owner
+    instead of the image's own default user, because its image ignores
+    PUID/PGID entirely.
     """
 
     app_id: str
@@ -87,6 +99,7 @@ class ServicePlan:
     cap_add: tuple[str, ...] = ()
     devices: tuple[str, ...] = ()
     network_mode: str | None = None
+    user: str | None = None
 
 
 @dataclass(frozen=True)
@@ -174,6 +187,9 @@ def _service_plan(
     if app.kind == "downloader":
         return _downloader_service_plan(app, state, root)
 
+    if app.kind == "sync":
+        return _recyclarr_service_plan(app, state, root)
+
     try:
         api_key = state.api_keys[app.id]
     except KeyError:
@@ -207,7 +223,7 @@ def _service_plan(
         service=app.id,
         image=app.image,
         container_name=app.id,
-        ports=((app.port, app.port),),
+        ports=((require_port(app), require_port(app)),),
         environment=tuple(environment),
         volumes=tuple(volumes),
         comment=app.description,
@@ -258,7 +274,9 @@ def _vpn_service_plan(
     secrets_mount = f"{vpn_secrets_host_path(root)}{_VPN_SECRETS_MOUNT_SUFFIX}"
     # A rider (qBittorrent) shares this container's network namespace and
     # has no `ports:` block of its own - Gluetun publishes its port instead.
-    ports = tuple((rider.port, rider.port) for rider in riders_of(app.id, state.app_ids))
+    ports = tuple(
+        (require_port(rider), require_port(rider)) for rider in riders_of(app.id, state.app_ids)
+    )
 
     return ServicePlan(
         app_id=app.id,
@@ -290,13 +308,14 @@ def _downloader_service_plan(
     owner has actually confirmed running without one.
     """
     via_present = app.network_via is not None and app.network_via in state.app_ids
+    port = require_port(app)
 
     environment: tuple[tuple[str, str], ...] = (
         ("PUID", str(state.puid)),
         ("PGID", str(state.pgid)),
         ("TZ", state.timezone),
         ("UMASK", state.umask),
-        ("WEBUI_PORT", str(app.port)),
+        ("WEBUI_PORT", str(port)),
     )
 
     config_mount = f"{root / 'marrquee' / 'apps' / app.id}{_CONFIG_MOUNT_SUFFIX}"
@@ -327,10 +346,45 @@ def _downloader_service_plan(
         service=app.id,
         image=app.image,
         container_name=app.id,
-        ports=((app.port, app.port),),
+        ports=((port, port),),
         environment=environment,
         volumes=tuple(volumes),
         comment=f"{description} {DOWNLOADER_NO_VPN_COMPOSE_COMMENT}",
+    )
+
+
+def _recyclarr_service_plan(
+    app: CatalogApp, state: InstallState, root: PurePosixPath
+) -> ServicePlan:
+    """Recyclarr's own branch: no port, no API key in its environment (its
+    keys travel inside `recyclarr.yml`, rewritten fresh before every sync -
+    see `recyclarr.write_recyclarr_config`), and `user:` instead of
+    PUID/PGID - the image documents that it doesn't support those and runs
+    as whatever `user:` compose gives it.
+
+    Every value here is written out explicitly rather than left to the
+    image's own defaults, so a later image update can't silently change
+    what Marrquee promised the owner it configured.
+    """
+    config_mount = f"{root / 'marrquee' / 'apps' / app.id}{_CONFIG_MOUNT_SUFFIX}"
+    environment: tuple[tuple[str, str], ...] = (
+        ("TZ", state.timezone),
+        ("CRON_SCHEDULE", "@daily"),
+        ("RECYCLARR_CONFIG_DIR", "/config"),
+        ("RECYCLARR_DATA_DIR", "/config"),
+        ("RECYCLARR_CREATE_CONFIG", "false"),
+    )
+
+    return ServicePlan(
+        app_id=app.id,
+        service=app.id,
+        image=app.image,
+        container_name=app.id,
+        user=f"{state.puid}:{state.pgid}",
+        ports=(),
+        environment=environment,
+        volumes=(config_mount,),
+        comment=f"{app.description} {RECYCLARR_COMPOSE_COMMENT}",
     )
 
 
@@ -362,6 +416,8 @@ def _render_service(service: ServicePlan, network: str) -> list[str]:
     lines.extend(f"    {comment}" for comment in _comment_lines(service.comment))
     lines.append(f"    image: {_quoted(service.image)}")
     lines.append(f"    container_name: {service.container_name}")
+    if service.user is not None:
+        lines.append(f"    user: {_quoted(service.user)}")
     lines.append("    restart: unless-stopped")
     if service.network_mode is not None:
         # Compose refuses a service that names both `network_mode:` and

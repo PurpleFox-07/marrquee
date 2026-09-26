@@ -89,6 +89,27 @@ def test_get_unknown_step_redirects_to_apps(tmp_path: Path) -> None:
     assert response.headers["location"] == "/setup/apps"
 
 
+def test_get_a_hand_typed_asked_with_step_without_its_partner_redirects_to_apps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`find_step` matches on ids alone, so a step that is only ever
+    registered ALONGSIDE another app (Recyclarr's quality question, owned
+    by Sonarr) must still be refused when that other app was never
+    ticked - a hand-typed URL must not render a step nobody actually
+    registered for this run.
+    """
+    step = dataclasses.replace(_refusing_step(app_id="sonarr"), asked_with="recyclarr")
+    monkeypatch.setattr(questions_module, "QUESTION_STEPS", (step,))
+    client = _client(_settings(tmp_path))
+
+    response = client.get(
+        "/setup/questions/sonarr/fixture", params={"apps": "sonarr"}, follow_redirects=False
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/setup/apps"
+
+
 def test_get_a_step_for_an_app_not_ticked_redirects_to_apps(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

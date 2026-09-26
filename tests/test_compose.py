@@ -20,6 +20,7 @@ import yaml
 from marrquee import compose, vpn, words
 from marrquee.catalog import get_app
 from marrquee.config import Settings
+from marrquee.docker_client import _service_config_block
 from marrquee.qbittorrent import PORT_SYNC_SCRIPT_NAME, QBIT_KEY_SECRET_NAME
 from marrquee.state import STATE_VERSION, InstallState
 
@@ -30,6 +31,10 @@ _SONARR_KEY = "2" * 32
 _RADARR_KEY = "3" * 32
 _GLUETUN_KEY = "4" * 32
 _QBIT_KEY = "qbt_" + "5" * 28
+# Recyclarr's own branch never reads this - `_bring_up_app` still requires
+# every app to have one (see the story's Investigation), so the fixture
+# carries it purely to keep that unrelated invariant satisfied.
+_RECYCLARR_KEY = "6" * 32
 
 
 def _fixture_state(app_ids: tuple[str, ...] = ("prowlarr", "sonarr", "radarr")) -> InstallState:
@@ -39,6 +44,7 @@ def _fixture_state(app_ids: tuple[str, ...] = ("prowlarr", "sonarr", "radarr")) 
         "radarr": _RADARR_KEY,
         "gluetun": _GLUETUN_KEY,
         "qbittorrent": _QBIT_KEY,
+        "recyclarr": _RECYCLARR_KEY,
     }
     return InstallState(
         version=STATE_VERSION,
@@ -542,6 +548,75 @@ def test_a_state_without_gluetun_renders_byte_identical_to_before() -> None:
     text = compose.render_compose(compose.build_stack_plan(_fixture_state()))
 
     assert text == _GOLDEN_THREE_APP_COMPOSE
+
+
+# --- Recyclarr's own compose branch ------------------------------------------
+
+
+def _service_block(text: str, service: str) -> str:
+    """`service`'s own block of a rendered compose file - `docker_client`'s
+    own recreate-signature slicer already does exactly this cut, so this is
+    that same function, not a second copy of its line-scanning rules.
+    """
+    block = _service_config_block(text, service)
+    assert block is not None, f"{service!r} has no block in this rendered file"
+    return block
+
+
+def test_recyclarr_service_shape() -> None:
+    state = InstallState(
+        version=STATE_VERSION,
+        storage_root="/volume1/media",
+        app_ids=("prowlarr", "sonarr", "recyclarr"),
+        api_keys={
+            "prowlarr": _PROWLARR_KEY,
+            "sonarr": _SONARR_KEY,
+            "recyclarr": _RECYCLARR_KEY,
+        },
+        puid=1026,
+        pgid=100,
+        umask="002",
+        timezone="Etc/UTC",
+        created="2026-09-19T00:00:00+00:00",
+    )
+    doc = _rendered_doc(state)
+
+    recyclarr = _services(doc)["recyclarr"]
+    assert recyclarr["user"] == "1026:100"
+    assert "ports" not in recyclarr
+    assert recyclarr["networks"] == ["marrquee"]
+    environment = _environment(recyclarr)
+    assert list(environment.keys()) == [
+        "TZ",
+        "CRON_SCHEDULE",
+        "RECYCLARR_CONFIG_DIR",
+        "RECYCLARR_DATA_DIR",
+        "RECYCLARR_CREATE_CONFIG",
+    ]
+    assert environment == {
+        "TZ": "Etc/UTC",
+        "CRON_SCHEDULE": "@daily",
+        "RECYCLARR_CONFIG_DIR": "/config",
+        "RECYCLARR_DATA_DIR": "/config",
+        "RECYCLARR_CREATE_CONFIG": "false",
+    }
+    assert _volumes(recyclarr) == ["/volume1/media/marrquee/apps/recyclarr:/config"]
+
+    text = compose.render_compose(compose.build_stack_plan(state))
+    for key in state.api_keys.values():
+        assert key not in _service_block(text, "recyclarr")
+
+
+def test_arr_services_are_byte_for_byte_unchanged_by_the_recyclarr_branch() -> None:
+    """diverges-from-existing: Recyclarr's own compose branch must never
+    leak into the rendering of the arr services that sit beside it.
+    """
+    state = _fixture_state(("prowlarr", "sonarr", "radarr", "recyclarr"))
+
+    text = compose.render_compose(compose.build_stack_plan(state))
+
+    for name in ("prowlarr", "sonarr", "radarr"):
+        assert _service_block(text, name) == _service_block(_GOLDEN_THREE_APP_COMPOSE, name)
 
 
 # --- the single highest-consequence path bug in the story --------------------

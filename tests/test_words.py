@@ -398,6 +398,30 @@ _EXPECTED_INVENTORY = (
     "drive_technical",
     "HUB_DRIVE_NOTE_COPIES",
     "HUB_DRIVE_NOTE_UNCHECKED",
+    "RECYCLARR_DESCRIPTION",
+    "RECYCLARR_NEEDS_ARR",
+    "QUALITY_TV_STEP_TITLE",
+    "QUALITY_MOVIE_STEP_TITLE",
+    "QUALITY_TV_STEP_LEDE",
+    "QUALITY_MOVIE_STEP_LEDE",
+    "QUALITY_LABEL",
+    "QUALITY_1080P",
+    "QUALITY_4K",
+    "QUALITY_TV_1080P_HINT",
+    "QUALITY_TV_4K_HINT",
+    "QUALITY_MOVIE_1080P_HINT",
+    "QUALITY_MOVIE_4K_HINT",
+    "RECYCLARR_CONFIG_HEADER_COMMENT",
+    "RECYCLARR_COMPOSE_COMMENT",
+    "RECYCLARR_LINE_SYNCING",
+    "RECYCLARR_LINE_NEVER",
+    "RECYCLARR_LINE_COULDNT_START",
+    "RECYCLARR_CHIP_NEEDS_LOOK",
+    "HUB_SYNC_NOW",
+    "recyclarr_line_last_synced",
+    "recyclarr_line_late",
+    "recyclarr_line_failed",
+    "recyclarr_line_app_down",
 )
 
 _DEPLOY_ENGINE_WORD_COUNT = 40
@@ -412,6 +436,7 @@ _VPN_WORD_COUNT = 45
 _QBIT_WORD_COUNT = 29
 _VPN_CHANGE_WORD_COUNT = 32
 _DRIVE_WORD_COUNT = 27
+_RECYCLARR_WORD_COUNT = 24
 
 
 def test_words_inventory_is_pinned() -> None:
@@ -731,10 +756,10 @@ def test_the_vpn_change_section_precedes_the_drive_section() -> None:
     assert "LINK_TEST_FILE_TEXT" not in vpn_change_names
 
 
-def test_the_drive_section_is_last() -> None:
-    """The drive check (hard-link probe, saved result) is the newest
-    section. Later chunks in this story bump `_DRIVE_WORD_COUNT` as they
-    append more words to it.
+def test_the_drive_section_precedes_the_recyclarr_section() -> None:
+    """The drive check (hard-link probe, saved result) used to be the
+    newest section - Recyclarr now follows it, so this slice is closed the
+    same move every earlier story made.
     """
     drive_start = (
         _DEPLOY_ENGINE_WORD_COUNT
@@ -749,14 +774,43 @@ def test_the_drive_section_is_last() -> None:
         + _QBIT_WORD_COUNT
         + _VPN_CHANGE_WORD_COUNT
     )
+    drive_end = drive_start + _DRIVE_WORD_COUNT
 
-    drive_names = words.WORDS_INVENTORY[drive_start:]
+    drive_names = words.WORDS_INVENTORY[drive_start:drive_end]
 
-    assert drive_names == _EXPECTED_INVENTORY[drive_start:]
+    assert drive_names == _EXPECTED_INVENTORY[drive_start:drive_end]
     assert drive_names[0] == "LINK_TEST_FILE_TEXT"
-    assert len(words.WORDS_INVENTORY) == len(_EXPECTED_INVENTORY)
     assert len(drive_names) == _DRIVE_WORD_COUNT
     assert "WITHOUT_VPN_PHRASE" not in drive_names
+    assert "RECYCLARR_DESCRIPTION" not in drive_names
+
+
+def test_the_recyclarr_section_is_last() -> None:
+    """Recyclarr is the newest section. Later chunks in this story bump
+    `_RECYCLARR_WORD_COUNT` as they append more words to it.
+    """
+    recyclarr_start = (
+        _DEPLOY_ENGINE_WORD_COUNT
+        + _WIZARD_WORD_COUNT
+        + _WIRING_WORD_COUNT
+        + _DEPLOY_SCREEN_WORD_COUNT
+        + _HUB_WORD_COUNT
+        + _HUB_LINK_WORD_COUNT
+        + _HUB_INSTALL_WORD_COUNT
+        + _LOGIN_WORD_COUNT
+        + _VPN_WORD_COUNT
+        + _QBIT_WORD_COUNT
+        + _VPN_CHANGE_WORD_COUNT
+        + _DRIVE_WORD_COUNT
+    )
+
+    recyclarr_names = words.WORDS_INVENTORY[recyclarr_start:]
+
+    assert recyclarr_names == _EXPECTED_INVENTORY[recyclarr_start:]
+    assert recyclarr_names[0] == "RECYCLARR_DESCRIPTION"
+    assert len(words.WORDS_INVENTORY) == len(_EXPECTED_INVENTORY)
+    assert len(recyclarr_names) == _RECYCLARR_WORD_COUNT
+    assert "LINK_TEST_FILE_TEXT" not in recyclarr_names
 
 
 def test_drive_reason_and_todo_words_name_the_folder_and_match_content_direction() -> None:

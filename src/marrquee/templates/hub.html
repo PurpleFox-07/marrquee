@@ -114,6 +114,7 @@
           data-state="{{ tile.state }}"
           data-paused="{{ 'true' if tile.paused else 'false' }}"
           {% if tile.add_state %}data-add-state="{{ tile.add_state }}"{% endif %}
+          {% if tile.sync_state %}data-sync-state="{{ tile.sync_state }}"{% endif %}
           {% if tile.url %}href="{{ tile.url }}" aria-label="{{ tile.aria }}"{% endif %}
           target="_blank"
           rel="noopener noreferrer"
@@ -163,6 +164,16 @@
           </form>
           <form method="post" action="/hub/apps/{{ tile.app_id }}/cancel">
             <button type="submit" class="btn-ghost">{{ words.HUB_KEEP_WITHOUT_VPN }}</button>
+          </form>
+        </div>
+        {% elif tile.actions == "sync" %}
+        <div class="hub-tile-actions">
+          <form method="post" action="/hub/apps/{{ tile.app_id }}/sync">
+            <button
+              type="submit"
+              class="{{ 'btn-primary' if tile.sync_state in ('late', 'failed') else 'btn-ghost' }}"
+              data-role="sync-now"
+            >{{ words.HUB_SYNC_NOW }}</button>
           </form>
         </div>
         {% endif %}

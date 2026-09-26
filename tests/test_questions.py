@@ -12,8 +12,10 @@ import pytest
 from marrquee import questions, vpn, words
 from marrquee.login import LOGIN_STEP
 from marrquee.questions import (
+    MOVIE_QUALITY_STEP,
     QUESTION_STEPS,
     SEEDING_STEP,
+    TV_QUALITY_STEP,
     VPN_STEP,
     QuestionCheck,
     QuestionField,
@@ -45,7 +47,7 @@ def _text_step(app_id: str, step_id: str = "fixture") -> QuestionStep:
 
 
 def test_question_steps_holds_the_registered_vpn_and_seeding_steps() -> None:
-    assert QUESTION_STEPS == (VPN_STEP, SEEDING_STEP)
+    assert QUESTION_STEPS == (VPN_STEP, SEEDING_STEP, TV_QUALITY_STEP, MOVIE_QUALITY_STEP)
 
 
 def test_question_option_and_field_gain_their_new_optional_attributes() -> None:
@@ -209,6 +211,61 @@ def test_question_steps_for_only_returns_steps_for_the_given_apps(
     monkeypatch.setattr(questions, "QUESTION_STEPS", (radarr_step, sonarr_step))
 
     assert question_steps_for(("sonarr",)) == (sonarr_step,)
+
+
+def test_quality_steps_fields_are_owned_by_their_arr_app() -> None:
+    assert TV_QUALITY_STEP.app_id == "sonarr"
+    assert TV_QUALITY_STEP.asked_with == "recyclarr"
+    assert [field.name for field in TV_QUALITY_STEP.fields] == ["tv_quality"]
+    assert [option.value for option in TV_QUALITY_STEP.fields[0].options] == ["1080p", "4k"]
+    assert TV_QUALITY_STEP.fields[0].default == "1080p"
+
+    assert MOVIE_QUALITY_STEP.app_id == "radarr"
+    assert MOVIE_QUALITY_STEP.asked_with == "recyclarr"
+    assert [field.name for field in MOVIE_QUALITY_STEP.fields] == ["movie_quality"]
+
+
+def test_quality_step_check_accepts_whatever_check_step_already_let_through() -> None:
+    accepted = check_step(TV_QUALITY_STEP, {"tv_quality": "4k"}, {})
+    assert accepted.ok is True
+    assert accepted.answers == {"tv_quality": "4k"}
+
+    refused = check_step(TV_QUALITY_STEP, {"tv_quality": "8k"}, {})
+    assert refused.ok is False
+    assert refused.problem == QUESTION_PICK_ONE
+
+
+def test_recyclarr_add_asks_installed_arr_steps_only() -> None:
+    steps = question_steps_for(("recyclarr",), present=("prowlarr", "sonarr"))
+
+    assert steps == (TV_QUALITY_STEP,)
+
+
+def test_sonarr_add_with_recyclarr_present_asks_tv_quality() -> None:
+    steps = question_steps_for(("sonarr",), present=("prowlarr", "recyclarr"))
+
+    assert steps == (TV_QUALITY_STEP,)
+
+
+def test_sonarr_add_without_recyclarr_asks_nothing() -> None:
+    assert question_steps_for(("sonarr",)) == ()
+
+
+def test_wizard_with_sonarr_and_recyclarr_ticked_includes_the_tv_step() -> None:
+    """The wizard never passes `present=` - both ids arrive together in
+    `app_ids` instead, since everything ticked is "adding" from its point
+    of view.
+    """
+    steps = question_steps_for(("sonarr", "recyclarr"))
+
+    assert TV_QUALITY_STEP in steps
+    assert MOVIE_QUALITY_STEP not in steps
+
+
+def test_present_unset_keeps_every_pre_existing_step_list_unchanged() -> None:
+    assert question_steps_for(("gluetun", "qbittorrent")) == (VPN_STEP, SEEDING_STEP)
+    assert question_steps_for(("qbittorrent",)) == (SEEDING_STEP,)
+    assert question_steps_for(("gluetun",)) == (VPN_STEP,)
 
 
 def test_find_step_matches_both_ids(monkeypatch: pytest.MonkeyPatch) -> None:

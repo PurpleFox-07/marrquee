@@ -8,6 +8,7 @@ what was sent to it and replies with a fixed, controllable response.
 from __future__ import annotations
 
 import asyncio
+import json
 import socket
 import struct
 from pathlib import Path
@@ -23,6 +24,8 @@ from marrquee.docker_client import (
     DockerEngine,
     DockerFailure,
     DockerStatus,
+    ExecStartResult,
+    ExecState,
     FakeDockerEngine,
     NetworkConnectResult,
     SocketDockerEngine,
@@ -866,6 +869,133 @@ async def test_stop_container_reports_a_connection_error_as_not_ok(
 
     assert result.ok is False
     assert result.detail is not None
+
+
+# --- exec_start() / exec_inspect() ------------------------------------------
+
+
+async def test_exec_start_creates_then_starts_detached(docker_stub):
+    """FIRST TEST - the plan's weakest assumption: does Sync now's detached
+    exec actually issue the two-request shape the swagger promises, in
+    order, with the bodies it promises?
+    """
+    stub, socket_path = docker_stub
+    stub.respond_with_sequence(
+        [
+            ("HTTP/1.1 201 Created", b'{"Id": "abc"}'),
+            ("HTTP/1.1 200 OK", b""),
+        ]
+    )
+    engine = SocketDockerEngine(socket_path=socket_path)
+
+    result = await engine.exec_start("recyclarr", ("recyclarr", "sync"))
+
+    assert result == ExecStartResult(ok=True, exec_id="abc", detail=None)
+    assert stub.request_lines == [
+        "POST /containers/recyclarr/exec HTTP/1.1",
+        "POST /exec/abc/start HTTP/1.1",
+    ]
+    assert json.loads(stub.request_bodies[0]) == {
+        "AttachStdin": False,
+        "AttachStdout": False,
+        "AttachStderr": False,
+        "Tty": False,
+        "Cmd": ["recyclarr", "sync"],
+    }
+    assert json.loads(stub.request_bodies[1]) == {"Detach": True, "Tty": False}
+
+
+async def test_exec_start_on_a_stopped_container_reports_409_as_not_ok(docker_stub):
+    stub, socket_path = docker_stub
+    stub.respond_with_json(
+        {"message": "container 6d61 is not running"}, status_line="HTTP/1.1 409 Conflict"
+    )
+    engine = SocketDockerEngine(socket_path=socket_path)
+
+    result = await engine.exec_start("recyclarr", ("recyclarr", "sync"))
+
+    assert result.ok is False
+    assert result.exec_id is None
+    assert result.detail is not None
+    assert "409" in result.detail
+    assert "not running" in result.detail
+
+
+async def test_exec_start_reports_a_failed_start_as_not_ok_but_still_carries_the_exec_id(
+    docker_stub,
+):
+    """The create half can succeed (Docker minted an exec id) while the
+    start half fails (the container paused or died in between) - that must
+    still come back `ok=False`, or a sync that never actually started would
+    be indistinguishable from one that did.
+    """
+    stub, socket_path = docker_stub
+    stub.respond_with_sequence(
+        [
+            ("HTTP/1.1 201 Created", b'{"Id": "abc"}'),
+            ("HTTP/1.1 409 Conflict", b'{"message": "container abc is paused"}'),
+        ]
+    )
+    engine = SocketDockerEngine(socket_path=socket_path)
+
+    result = await engine.exec_start("recyclarr", ("recyclarr", "sync"))
+
+    assert result.ok is False
+    assert result.exec_id == "abc"
+    assert result.detail is not None
+    assert "409" in result.detail
+    assert "container abc is paused" in result.detail
+
+
+async def test_exec_inspect_parses_running_and_exit_code_and_404_is_unknown(docker_stub):
+    stub, socket_path = docker_stub
+    stub.respond_with_json({"Running": True, "ExitCode": None})
+    engine = SocketDockerEngine(socket_path=socket_path)
+
+    running = await engine.exec_inspect("abc")
+    assert running == ExecState(known=True, running=True, exit_code=None, detail=None)
+
+    stub.respond_with_json({"Running": False, "ExitCode": 1})
+    finished = await engine.exec_inspect("abc")
+    assert finished == ExecState(known=True, running=False, exit_code=1, detail=None)
+
+    stub.respond_with("HTTP/1.1 404 Not Found", b'{"message": "no such exec instance"}')
+    unknown = await engine.exec_inspect("does-not-exist")
+    assert unknown == ExecState(known=False, running=False, exit_code=None, detail=None)
+
+
+# --- FakeDockerEngine.exec_start() / exec_inspect() -------------------------
+
+
+async def test_the_fake_refuses_exec_on_a_stopped_container_then_reports_scripted_exit() -> None:
+    running_recyclarr = ContainerSnapshot(
+        name="recyclarr", exists=True, state="running", exit_code=None, image=None, detail=None
+    )
+    fake = FakeDockerEngine(
+        DockerStatus(connected=True),
+        containers={"recyclarr": running_recyclarr},
+        exec_exit_codes={"recyclarr": 1},
+        exec_running_polls=2,
+    )
+
+    refused = await fake.exec_start("prowlarr", ("recyclarr", "sync"))
+    assert refused == ExecStartResult(ok=False, exec_id=None, detail="container is not running")
+
+    started = await fake.exec_start("recyclarr", ("recyclarr", "sync"))
+    assert started.ok is True
+    assert started.exec_id is not None
+
+    first_poll = await fake.exec_inspect(started.exec_id)
+    second_poll = await fake.exec_inspect(started.exec_id)
+    third_poll = await fake.exec_inspect(started.exec_id)
+
+    assert first_poll == ExecState(known=True, running=True, exit_code=None, detail=None)
+    assert second_poll == ExecState(known=True, running=True, exit_code=None, detail=None)
+    assert third_poll == ExecState(known=True, running=False, exit_code=1, detail=None)
+
+    assert await fake.exec_inspect("no-such-exec") == ExecState(
+        known=False, running=False, exit_code=None, detail=None
+    )
 
 
 # --- FakeDockerEngine -----------------------------------------------------

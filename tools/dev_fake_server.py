@@ -57,7 +57,7 @@ from pathlib import Path
 import uvicorn
 from fastapi import FastAPI
 
-from marrquee.catalog import apps_in_order, get_app
+from marrquee.catalog import apps_in_order, get_app, require_port
 from marrquee.config import Settings
 from marrquee.deploy import AppProgress, DeployManager, DeploySnapshot, FakeReadinessProbe
 from marrquee.docker_client import (
@@ -227,13 +227,18 @@ def _probe_for_scene(scene: str) -> FakeReadinessProbe:
     if scene == "happy":
         # A handful of "not yet" answers earns the reassurance note
         # honestly, then Radarr comes up like everything else.
-        return FakeReadinessProbe(responses={(radarr.id, radarr.port): [False] * 8}, default=True)
+        return FakeReadinessProbe(
+            responses={(radarr.id, require_port(radarr)): [False] * 8}, default=True
+        )
     if scene == "failure":
         # Prowlarr and Sonarr answer ready first try; Radarr never does, so
         # the deploy times out on it, exactly like a real stuck app.
         prowlarr, sonarr = get_app("prowlarr"), get_app("sonarr")
         return FakeReadinessProbe(
-            responses={(prowlarr.id, prowlarr.port): [True], (sonarr.id, sonarr.port): [True]},
+            responses={
+                (prowlarr.id, require_port(prowlarr)): [True],
+                (sonarr.id, require_port(sonarr)): [True],
+            },
             default=False,
         )
     return FakeReadinessProbe(default=True)  # "wiring-problem": every app comes up cleanly

@@ -382,7 +382,7 @@ async def get_setup_question(app_id: str, step_id: str, request: Request) -> Res
 
     app_ids = parse_app_ids(request.query_params.get("apps", ""))
     step = find_step(app_id, step_id) if app_id in app_ids else None
-    if step is None:
+    if step is None or _step_index(app_ids, app_id, step_id) < 0:
         return RedirectResponse("/setup/apps", status_code=303)
 
     saved = load_answers(settings.config_dir).get(app_id, {})
@@ -402,7 +402,7 @@ async def post_setup_question(app_id: str, step_id: str, request: Request) -> Re
 
     app_ids = parse_app_ids(_form_value(form, "apps"))
     step = find_step(app_id, step_id) if app_id in app_ids else None
-    if step is None:
+    if step is None or _step_index(app_ids, app_id, step_id) < 0:
         return RedirectResponse("/setup/apps", status_code=303)
 
     saved = load_answers(settings.config_dir).get(app_id, {})

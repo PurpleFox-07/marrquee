@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Literal
 
-from marrquee.catalog import CatalogApp, app_host
+from marrquee.catalog import CatalogApp, app_host, require_port
 from marrquee.wiring.arr_client import ArrClient, ArrResponse
 from marrquee.wiring.qbit_client import QbitClient, QbitResponse, preferences_form
 from marrquee.words import (
@@ -83,7 +83,7 @@ def app_base_url(app: CatalogApp, present: Iterable[str]) -> str:
     of `present`) has no DNS name of its own; `app_host` is what routes it
     to the app whose network it actually joined.
     """
-    return f"http://{app_host(app, present)}:{app.port}"
+    return f"http://{app_host(app, present)}:{require_port(app)}"
 
 
 def _transient(status: int) -> bool:
@@ -566,7 +566,7 @@ def _with_download_client_fields(
     updated["removeCompletedDownloads"] = True
     updated["removeFailedDownloads"] = True
     updated = _with_field(updated, "host", app_host(downloader, present))
-    updated = _with_field(updated, "port", downloader.port)
+    updated = _with_field(updated, "port", require_port(downloader))
     updated = _with_field(updated, "useSsl", False)
     updated = _with_field(updated, "urlBase", "")
     updated = _with_field(updated, "apiKey", qbit_key)
@@ -615,7 +615,7 @@ async def ensure_download_client(
         if _download_client_matches(
             existing,
             host=host,
-            port=downloader.port,
+            port=require_port(downloader),
             category_field=category_field,
             category=category,
         ):

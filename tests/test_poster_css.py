@@ -201,6 +201,30 @@ def test_the_paused_dot_is_warning_not_error() -> None:
     assert paused_index > down_index
 
 
+def test_recyclarrs_late_and_failed_states_are_warning_not_error() -> None:
+    css = _HUB_CSS.read_text()
+
+    ring_body = _block_for(css, '.hub-poster[data-sync-state="failed"]')
+    assert "border-color: var(--warning);" in ring_body
+    assert "box-shadow" in ring_body
+
+    dot_body = _block_for(css, '.hub-poster[data-sync-state="failed"] .hub-dot')
+    assert "background: var(--warning);" in dot_body
+
+    # No raw colour literal anywhere in either rule - tokens only.
+    for body in (ring_body, dot_body):
+        assert "#" not in body
+
+
+def test_sync_now_is_hidden_while_syncing_not_removed() -> None:
+    body = _block_for(
+        _HUB_CSS.read_text(),
+        '.hub-poster[data-sync-state="syncing"] ~ .hub-tile-actions [data-role="sync-now"]',
+    )
+
+    assert "display: none" in body
+
+
 def test_the_tile_links_tap_target_comes_from_padding_not_a_fixed_height() -> None:
     body = _block_for(_HUB_CSS.read_text(), ".hub-tile-link")
 

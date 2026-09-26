@@ -16,12 +16,17 @@ import re
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Final, Literal
 
 from marrquee import seeding, vpn, words
 from marrquee.catalog import apps_in_order
 from marrquee.state import write_json_atomic
 from marrquee.words import QUESTION_PICK_ONE
+
+Quality = Literal["1080p", "4k"]
+DEFAULT_QUALITY: Final[Quality] = "1080p"
+TV_QUALITY_FIELD: Final = "tv_quality"
+MOVIE_QUALITY_FIELD: Final = "movie_quality"
 
 _ANSWERS_FILE_NAME = "answers.json"
 _ANSWERS_VERSION = 1
@@ -93,6 +98,12 @@ class QuestionStep:
     lede: str
     fields: tuple[QuestionField, ...]
     check: Callable[[Mapping[str, str]], QuestionCheck]
+    # Set only on a step that belongs to one app (`app_id`) but is also
+    # asked when a DIFFERENT app is being added - Recyclarr's quality
+    # question, owned by Sonarr/Radarr (`sonarr.tv_quality`), asked again
+    # when Recyclarr itself is added later. `None` for every step that is
+    # only ever asked alongside its own app.
+    asked_with: str | None = None
 
     def __post_init__(self) -> None:
         # `step_id` becomes a URL fragment, an HTML id and a data-attribute
@@ -270,19 +281,97 @@ SEEDING_STEP = QuestionStep(
 )
 
 
+# --- The quality steps: owned by Sonarr/Radarr, asked whenever Recyclarr is
+# (or will be) part of the install too. `check_step` has already refused any
+# value outside the field's own options by the time this adapter runs, so it
+# only ever has an accepted answer to hand back. -----------------------------
+
+
+def _check_quality_step(answers: Mapping[str, str]) -> QuestionCheck:
+    return QuestionCheck(ok=True, answers=answers, problem=None, field=None)
+
+
+TV_QUALITY_STEP = QuestionStep(
+    app_id="sonarr",
+    step_id="quality",
+    title=words.QUALITY_TV_STEP_TITLE,
+    lede=words.QUALITY_TV_STEP_LEDE,
+    fields=(
+        QuestionField(
+            name=TV_QUALITY_FIELD,
+            label=words.QUALITY_LABEL,
+            kind="choice",
+            options=(
+                QuestionOption("1080p", words.QUALITY_1080P, words.QUALITY_TV_1080P_HINT),
+                QuestionOption("4k", words.QUALITY_4K, words.QUALITY_TV_4K_HINT),
+            ),
+            default="1080p",
+        ),
+    ),
+    check=_check_quality_step,
+    asked_with="recyclarr",
+)
+
+MOVIE_QUALITY_STEP = QuestionStep(
+    app_id="radarr",
+    step_id="quality",
+    title=words.QUALITY_MOVIE_STEP_TITLE,
+    lede=words.QUALITY_MOVIE_STEP_LEDE,
+    fields=(
+        QuestionField(
+            name=MOVIE_QUALITY_FIELD,
+            label=words.QUALITY_LABEL,
+            kind="choice",
+            options=(
+                QuestionOption("1080p", words.QUALITY_1080P, words.QUALITY_MOVIE_1080P_HINT),
+                QuestionOption("4k", words.QUALITY_4K, words.QUALITY_MOVIE_4K_HINT),
+            ),
+            default="1080p",
+        ),
+    ),
+    check=_check_quality_step,
+    asked_with="recyclarr",
+)
+
+
 # Read only through `question_steps_for`/`find_step`, both of which look up
 # this name from the module's own globals at call time, so a test can
 # monkeypatch `marrquee.questions.QUESTION_STEPS` and have both functions
 # see the replacement. No other module may import this name directly.
-QUESTION_STEPS: tuple[QuestionStep, ...] = (VPN_STEP, SEEDING_STEP)
+QUESTION_STEPS: tuple[QuestionStep, ...] = (
+    VPN_STEP,
+    SEEDING_STEP,
+    TV_QUALITY_STEP,
+    MOVIE_QUALITY_STEP,
+)
 
 
-def question_steps_for(app_ids: Iterable[str]) -> tuple[QuestionStep, ...]:
-    """Every registered step for `app_ids`, in catalog order and then in
-    the order each app's own steps were declared.
+def question_steps_for(
+    app_ids: Iterable[str], *, present: Iterable[str] = ()
+) -> tuple[QuestionStep, ...]:
+    """Every registered step that applies to `app_ids`, in catalog order
+    and then in the order each app's own steps were declared.
+
+    `present` names whatever is already installed (or, for the wizard,
+    already ticked alongside `app_ids`) - a step is included either because
+    its own app is in `app_ids` (the ordinary case), or because it is
+    `asked_with` an app in `app_ids` and its own app is already part of the
+    install (Recyclarr's add asking Sonarr's already-answered question
+    again). The sort index is built from `app_ids | present` rather than
+    `app_ids` alone, so a step whose own app is only in `present` (Sonarr,
+    while adding Recyclarr) still has a catalog position to sort by instead
+    of raising `KeyError`.
     """
-    order_index = {app.id: index for index, app in enumerate(apps_in_order(app_ids))}
-    matching = [step for step in QUESTION_STEPS if step.app_id in order_index]
+    adding = set(app_ids)
+    present_ids = set(present)
+    everyone = adding | present_ids
+    order_index = {app.id: index for index, app in enumerate(apps_in_order(everyone))}
+    matching = [
+        step
+        for step in QUESTION_STEPS
+        if (step.app_id in adding and (step.asked_with is None or step.asked_with in everyone))
+        or (step.asked_with in adding and step.app_id in everyone)
+    ]
     matching.sort(key=lambda step: order_index[step.app_id])
     return tuple(matching)
 

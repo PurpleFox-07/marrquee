@@ -28,7 +28,12 @@ from test_deploy import (
     _settings,
     _StatefulEngine,
 )
-from test_deploy_add import _deployed_to_finale, _finish_add, _RecordingWiringRunner
+from test_deploy_add import (
+    _deployed_to_finale,
+    _finish_add,
+    _RecordingSyncTrigger,
+    _RecordingWiringRunner,
+)
 from test_deploy_login import _already_finale_manager, _finish_login
 
 import marrquee.deploy as deploy_module
@@ -372,6 +377,30 @@ async def test_restore_asks_for_no_check(tmp_path: Path) -> None:
     assert trigger.calls == 0
 
 
+async def test_restore_asks_for_no_sync(tmp_path: Path) -> None:
+    """Restore ends in `_run_wiring_for_add` directly, the same as the drive
+    check just above - it never reaches either trigger site.
+    """
+    manager, engine, settings = await _qbittorrent_without_vpn_to_finale(tmp_path)
+    trigger = _RecordingSyncTrigger()
+    manager._recyclarr = trigger  # type: ignore[attr-defined]
+    save_step_answers(settings.config_dir, "gluetun", _GLUETUN_ANSWERS)
+    engine._logs["gluetun"] = "AUTH: Received control message: AUTH_FAILED, retrying"  # type: ignore[attr-defined]
+
+    assert manager.add_app("gluetun") == "started"
+    failed = await _finish_add(manager)
+    assert failed.adding is not None
+    assert failed.adding.state == "error"
+    assert trigger.calls == 0
+
+    ok = await manager.cancel_add()
+    assert ok is True
+    final = await _finish_add(manager)
+
+    assert final.adding is None
+    assert trigger.calls == 0
+
+
 async def test_cancel_of_a_move_without_the_confirmation_refuses_and_keeps_the_record(
     tmp_path: Path,
 ) -> None:
@@ -453,6 +482,24 @@ async def test_change_vpn_asks_for_no_check(tmp_path: Path) -> None:
     manager, engine, settings = await _protected_qbittorrent_to_finale(tmp_path)
     trigger = _RecordingHardlinkTrigger()
     manager._hardlinks = trigger  # type: ignore[attr-defined]
+
+    new_answers = dict(_GLUETUN_ANSWERS, openvpn_user="a-brand-new-username")
+    save_step_answers(settings.config_dir, "gluetun", new_answers)
+
+    assert manager.change_vpn() == "started"
+    final = await _finish_add(manager)
+
+    assert final.adding is None
+    assert trigger.calls == 0
+
+
+async def test_change_vpn_asks_for_no_sync(tmp_path: Path) -> None:
+    """Change VPN ends in `_run_wiring_for_add` directly, the same as the
+    drive check just above - it never reaches either trigger site.
+    """
+    manager, engine, settings = await _protected_qbittorrent_to_finale(tmp_path)
+    trigger = _RecordingSyncTrigger()
+    manager._recyclarr = trigger  # type: ignore[attr-defined]
 
     new_answers = dict(_GLUETUN_ANSWERS, openvpn_user="a-brand-new-username")
     save_step_answers(settings.config_dir, "gluetun", new_answers)

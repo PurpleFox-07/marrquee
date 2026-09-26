@@ -27,7 +27,7 @@ from starlette.datastructures import FormData
 
 from marrquee import words
 from marrquee.addresses import authority_from_headers, proxy_suspected
-from marrquee.catalog import get_app
+from marrquee.catalog import RECYCLARR_APP_ID, get_app
 from marrquee.config import Settings
 from marrquee.deploy import AddStart, DeployManager, DeploySnapshot
 from marrquee.docker_client import DockerEngine
@@ -69,6 +69,7 @@ from marrquee.login import (
     save_login,
 )
 from marrquee.questions import SEEDING_STEP, VPN_STEP, check_step, load_answers, save_step_answers
+from marrquee.recyclarr import RecyclarrControl, SyncStatus
 from marrquee.state import load_state
 from marrquee.vpn import VPN_APP_ID, TunnelPlace
 from marrquee.vpn_control import GluetunControl
@@ -127,10 +128,19 @@ async def read_hub_view(request: Request) -> HubView:
     engine: DockerEngine = request.app.state.docker_engine
     link_probe: LinkProbe = request.app.state.link_probe
     monitor: HardlinkMonitor = request.app.state.hardlinks
+    recyclarr: RecyclarrControl = request.app.state.recyclarr
 
     snapshot = manager.snapshot()
     app_ids = tuple(app.app_id for app in snapshot.apps)
     links = load_links(settings.config_dir)
+
+    async def _sync_status() -> SyncStatus | None:
+        # Asked for only when Recyclarr is actually installed - the same
+        # "ask nothing you don't need to" rule `read_link_health` already
+        # follows for a Hub with no saved links.
+        if RECYCLARR_APP_ID not in app_ids:
+            return None
+        return await recyclarr.status()
 
     # Gluetun's own key only exists once the VPN is actually installed - a
     # deploy with no VPN never touches its control server at all, the same
@@ -141,16 +151,18 @@ async def read_hub_view(request: Request) -> HubView:
     vpn_place: TunnelPlace | None
     if "gluetun" in app_ids and vpn_key:
         vpn_control: GluetunControl = request.app.state.vpn_control
-        healths, link_healths, vpn_place = await asyncio.gather(
+        healths, link_healths, vpn_place, recyclarr_status = await asyncio.gather(
             read_health(engine, app_ids),
             read_link_health(link_probe, links),
             vpn_control.public_ip(vpn_key),
+            _sync_status(),
         )
     else:
         vpn_place = None
-        healths, link_healths = await asyncio.gather(
+        healths, link_healths, recyclarr_status = await asyncio.gather(
             read_health(engine, app_ids),
             read_link_health(link_probe, links),
+            _sync_status(),
         )
 
     login = login_view(
@@ -177,6 +189,7 @@ async def read_hub_view(request: Request) -> HubView:
         vpn_place=vpn_place,
         without_vpn=without_vpn_confirmed(settings.config_dir),
         drive=monitor.latest(),
+        recyclarr=recyclarr_status,
     )
 
 
@@ -712,4 +725,17 @@ async def post_hub_app_reconnect(app_id: str, request: Request) -> Response:
     manager: DeployManager = request.app.state.deploy
     if any(progress.app_id == app_id for progress in manager.snapshot().apps):
         manager.reconnect(app_id)
+    return RedirectResponse("/", status_code=303)
+
+
+@router.post("/hub/apps/{app_id}/sync")
+async def post_hub_app_sync(app_id: str, request: Request) -> Response:
+    manager: DeployManager = request.app.state.deploy
+    installed = any(
+        progress.app_id == app_id and get_app(app_id).kind == "sync"
+        for progress in manager.snapshot().apps
+    )
+    if installed:
+        recyclarr: RecyclarrControl = request.app.state.recyclarr
+        recyclarr.request_sync()
     return RedirectResponse("/", status_code=303)

@@ -12,6 +12,7 @@ import html
 import os
 import re
 import time
+from collections.abc import Sequence
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -26,6 +27,8 @@ from marrquee.docker_client import (
     ContainerStopResult,
     DockerFailure,
     DockerStatus,
+    ExecStartResult,
+    ExecState,
     FakeDockerEngine,
     NetworkConnectResult,
 )
@@ -77,6 +80,12 @@ class _CountingDockerEngine:
     async def stop_container(self, name: str, *, timeout_seconds: int = 30) -> ContainerStopResult:
         raise NotImplementedError("the alive page never stops a container")
 
+    async def exec_start(self, container: str, cmd: Sequence[str]) -> ExecStartResult:
+        raise NotImplementedError("the alive page never execs into a container")
+
+    async def exec_inspect(self, exec_id: str) -> ExecState:
+        raise NotImplementedError("the alive page never execs into a container")
+
 
 class _ExplodingDockerEngine:
     """A DockerEngine whose every method always raises.
@@ -111,6 +120,12 @@ class _ExplodingDockerEngine:
         raise RuntimeError("healthz must never call the Docker engine")
 
     async def stop_container(self, name: str, *, timeout_seconds: int = 30) -> ContainerStopResult:
+        raise RuntimeError("healthz must never call the Docker engine")
+
+    async def exec_start(self, container: str, cmd: Sequence[str]) -> ExecStartResult:
+        raise RuntimeError("healthz must never call the Docker engine")
+
+    async def exec_inspect(self, exec_id: str) -> ExecState:
         raise RuntimeError("healthz must never call the Docker engine")
 
 

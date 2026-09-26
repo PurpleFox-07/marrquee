@@ -61,6 +61,13 @@ def test_app_url_is_none_when_the_host_cannot_be_trusted() -> None:
     assert app_url("2001:db8::1", 8989) is None
 
 
+def test_app_url_with_no_port_is_none() -> None:
+    """A `kind="sync"` app (Recyclarr) has no port at all - a trustworthy
+    host must never be enough on its own to fabricate a link for it.
+    """
+    assert app_url("192.168.1.50:7788", None) is None
+
+
 # --- proxy_suspected -----------------------------------------------------------
 
 

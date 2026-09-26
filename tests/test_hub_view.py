@@ -36,6 +36,7 @@ from marrquee.hub import (
 from marrquee.links import LinkCard
 from marrquee.login import LoginRecord, SavedLogin
 from marrquee.questions import QuestionCheck, QuestionField, QuestionStep
+from marrquee.recyclarr import SyncRecord, SyncStatus
 from marrquee.vpn import TunnelPlace
 
 _NOW = datetime(2026, 9, 23, 12, 0, 0, tzinfo=UTC)
@@ -141,6 +142,232 @@ def test_no_trustworthy_address_gives_the_no_address_line_and_no_url() -> None:
         assert tile.url is None
         assert tile.aria is None
         assert "couldn't work out this machine's address" in tile.line
+
+
+def test_an_unknown_recyclarr_tile_never_shows_a_port() -> None:
+    """Recyclarr (`kind="sync"`, `port=None`) has no address to fall back
+    to - an unknown container state must read as plainly unknown, never as
+    "no address" with a fabricated port number.
+    """
+    unknown = _health("recyclarr", state="unknown")
+
+    view = hub_view(["recyclarr"], [unknown], authority=_AUTHORITY, proxied=False, now=_NOW)
+
+    assert view.tiles[0].line == words.hub_line_unknown("Recyclarr")
+    assert view.tiles[0].url is None
+
+
+def _sync(
+    *,
+    syncing: bool = False,
+    last: SyncRecord | None = None,
+    start_failed: bool = False,
+    run_failed: bool = False,
+) -> SyncStatus:
+    return SyncStatus(syncing=syncing, last=last, start_failed=start_failed, run_failed=run_failed)
+
+
+def test_syncing_hides_sync_now_but_keeps_actions_sync() -> None:
+    """The design correction: `actions` stays `"sync"` through every up
+    state, syncing included, so the structure signature never flips - only
+    the CSS (driven by `sync_state`) hides the button while syncing.
+    """
+    up = _health("recyclarr", state="up")
+
+    view = hub_view(
+        ["recyclarr"],
+        [up],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        recyclarr=_sync(syncing=True),
+    )
+
+    tile = view.tiles[0]
+    assert tile.sync_state == "syncing"
+    assert tile.actions == "sync"
+    assert tile.line == words.RECYCLARR_LINE_SYNCING
+
+
+def test_never_synced_shows_sync_now() -> None:
+    up = _health("recyclarr", state="up")
+
+    view = hub_view(
+        ["recyclarr"], [up], authority=_AUTHORITY, proxied=False, now=_NOW, recyclarr=_sync()
+    )
+
+    tile = view.tiles[0]
+    assert tile.sync_state == "never"
+    assert tile.actions == "sync"
+    assert tile.line == words.RECYCLARR_LINE_NEVER
+
+
+def test_ok_under_48_hours_shows_last_synced() -> None:
+    finished = _NOW - timedelta(hours=2)
+    up = _health("recyclarr", state="up")
+
+    view = hub_view(
+        ["recyclarr"],
+        [up],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        recyclarr=_sync(last=SyncRecord(finished_at=finished, ok=True)),
+    )
+
+    tile = view.tiles[0]
+    assert tile.sync_state == "ok"
+    assert tile.line == words.recyclarr_line_last_synced(words.relative_time(2 * 3600))
+
+
+def test_49_hours_old_is_late_and_amber() -> None:
+    finished = _NOW - timedelta(hours=49)
+    up = _health("recyclarr", state="up")
+
+    view = hub_view(
+        ["recyclarr"],
+        [up],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        recyclarr=_sync(last=SyncRecord(finished_at=finished, ok=True)),
+    )
+
+    tile = view.tiles[0]
+    assert tile.sync_state == "late"
+    assert tile.chip == words.RECYCLARR_CHIP_NEEDS_LOOK
+    assert tile.line == words.recyclarr_line_late(words.relative_time(49 * 3600))
+
+
+def test_failed_with_partners_up_gives_the_generic_line() -> None:
+    finished = _NOW - timedelta(hours=1)
+
+    view = hub_view(
+        ["sonarr", "recyclarr"],
+        [_health("sonarr", state="up"), _health("recyclarr", state="up")],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        recyclarr=_sync(last=SyncRecord(finished_at=finished, ok=False)),
+    )
+
+    tile = next(t for t in view.tiles if t.app_id == "recyclarr")
+    assert tile.sync_state == "failed"
+    assert tile.line == words.recyclarr_line_failed(words.relative_time(3600))
+
+
+def test_a_down_partner_gives_the_app_down_reason() -> None:
+    finished = _NOW - timedelta(hours=1)
+
+    view = hub_view(
+        ["sonarr", "radarr", "recyclarr"],
+        [
+            _health("sonarr", state="up"),
+            _health("radarr", state="down"),
+            _health("recyclarr", state="up"),
+        ],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        recyclarr=_sync(last=SyncRecord(finished_at=finished, ok=False)),
+    )
+
+    tile = next(t for t in view.tiles if t.app_id == "recyclarr")
+    assert tile.sync_state == "failed"
+    assert tile.line == words.recyclarr_line_app_down("Radarr")
+
+
+def test_an_unknown_or_starting_partner_falls_to_the_generic_failed_line() -> None:
+    """The amendment's own correction: only a partner truly `state="down"`
+    earns the specific line - unknown or starting is not yet dishonest
+    enough to blame by name.
+    """
+    finished = _NOW - timedelta(hours=1)
+
+    view = hub_view(
+        ["sonarr", "radarr", "recyclarr"],
+        [
+            _health("sonarr", state="up"),
+            _health("radarr", state="unknown"),
+            _health("recyclarr", state="up"),
+        ],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        recyclarr=_sync(last=SyncRecord(finished_at=finished, ok=False)),
+    )
+
+    tile = next(t for t in view.tiles if t.app_id == "recyclarr")
+    assert tile.line == words.recyclarr_line_failed(words.relative_time(3600))
+
+
+def test_couldnt_start_is_failed() -> None:
+    up = _health("recyclarr", state="up")
+
+    view = hub_view(
+        ["recyclarr"],
+        [up],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        recyclarr=_sync(start_failed=True, run_failed=True),
+    )
+
+    tile = view.tiles[0]
+    assert tile.sync_state == "failed"
+    assert tile.line == words.RECYCLARR_LINE_COULDNT_START
+
+
+def test_a_run_failure_with_no_confirming_log_is_couldnt_start() -> None:
+    """A run that started but never produced (or was never checked against)
+    a log of its own - `run_failed` without `start_failed` and with no
+    `last` at all - is still Marrquee's own failure to report, not a silent
+    "never synced".
+    """
+    up = _health("recyclarr", state="up")
+
+    view = hub_view(
+        ["recyclarr"],
+        [up],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        recyclarr=_sync(run_failed=True),
+    )
+
+    tile = view.tiles[0]
+    assert tile.sync_state == "failed"
+    assert tile.line == words.RECYCLARR_LINE_COULDNT_START
+
+
+def test_a_stopped_recyclarr_is_the_ordinary_down_with_no_sync_now() -> None:
+    down = _health("recyclarr", state="down")
+
+    view = hub_view(
+        ["recyclarr"],
+        [down],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        recyclarr=_sync(last=SyncRecord(finished_at=_NOW - timedelta(hours=1), ok=False)),
+    )
+
+    tile = view.tiles[0]
+    assert tile.state == "down"
+    assert tile.sync_state is None
+    assert tile.actions == "none"
+
+
+def test_the_recyclarr_tile_never_has_a_url_or_aria() -> None:
+    up = _health("recyclarr", state="up")
+
+    view = hub_view(
+        ["recyclarr"], [up], authority=_AUTHORITY, proxied=False, now=_NOW, recyclarr=_sync()
+    )
+
+    tile = view.tiles[0]
+    assert tile.url is None
+    assert tile.aria is None
 
 
 def test_tiles_come_back_in_catalog_order_and_unknown_ids_are_dropped() -> None:
@@ -359,7 +586,12 @@ def test_a_down_link_never_raises_any_down_or_docker_unreachable() -> None:
 def test_installable_is_the_catalog_minus_the_deploy_in_catalog_order() -> None:
     view = hub_view(["radarr"], [_health("radarr")], authority=_AUTHORITY, proxied=False, now=_NOW)
 
-    assert [app.id for app in view.installable] == ["prowlarr", "sonarr", "qbittorrent"]
+    assert [app.id for app in view.installable] == [
+        "prowlarr",
+        "sonarr",
+        "qbittorrent",
+        "recyclarr",
+    ]
 
     every_id = [app.id for app in CATALOG]
     full_view = hub_view(
@@ -513,7 +745,7 @@ def test_install_rows_exclude_the_app_being_added_and_grey_an_unavailable_one(
 
     ids = [row.app.id for row in view.install_rows]
     assert "sonarr" not in ids
-    assert ids == ["prowlarr", "radarr", "qbittorrent"]
+    assert ids == ["prowlarr", "radarr", "qbittorrent", "recyclarr"]
     by_id = {row.app.id: row for row in view.install_rows}
     assert isinstance(by_id["radarr"], InstallRow)
     assert by_id["prowlarr"].unavailable is None
@@ -539,6 +771,18 @@ def test_install_rows_carry_each_apps_registered_question_steps() -> None:
     by_id = {row.app.id: row for row in view.install_rows}
     assert by_id["prowlarr"].steps == (fixture_step,)
     assert by_id["sonarr"].steps == ()
+
+
+def test_the_hub_install_row_for_recyclarr_carries_the_steps_for_installed_arr_apps() -> None:
+    """Recyclarr's own install row asks each already-installed arr app's
+    quality question, owned by that app (`asked_with="recyclarr"`) -
+    proof that `install_rows` passes `present=deployed_ids` through to
+    `question_steps_for`.
+    """
+    view = hub_view(["sonarr"], [_health("sonarr")], authority=_AUTHORITY, proxied=False, now=_NOW)
+
+    by_id = {row.app.id: row for row in view.install_rows}
+    assert by_id["recyclarr"].steps == (questions_module.TV_QUALITY_STEP,)
 
 
 def test_qbittorrents_install_row_holds_the_vpn_step_then_seeding() -> None:

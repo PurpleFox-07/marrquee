@@ -25,7 +25,7 @@ from test_deploy import (
 )
 from test_deploy_add import _deployed_to_finale, _finish_add
 
-from marrquee.catalog import CatalogApp, get_app
+from marrquee.catalog import CatalogApp, get_app, require_port
 from marrquee.deploy import AppProgress, DeployManager, DeploySnapshot, FakeReadinessProbe
 from marrquee.docker_client import ContainerSnapshot, DockerStatus, FakeDockerEngine
 from marrquee.login import SavedLogin, load_login, pending_app_ids, save_login
@@ -393,7 +393,7 @@ async def test_apply_login_refuses_while_an_add_runs(tmp_path: Path) -> None:
     manager, engine, settings = await _deployed_to_finale(tmp_path)
     radarr = get_app("radarr")
     manager._probe = FakeReadinessProbe(  # type: ignore[attr-defined]
-        responses={(radarr.id, radarr.port): [False] * 1000}, default=False
+        responses={(radarr.id, require_port(radarr)): [False] * 1000}, default=False
     )
 
     result = manager.add_app("radarr")

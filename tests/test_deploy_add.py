@@ -29,6 +29,7 @@ from test_deploy import (
     _settings,
     _StatefulEngine,
 )
+from test_deploy_recyclarr import _RecordingSyncTrigger
 
 from marrquee.catalog import AppRule, CatalogApp, get_app
 from marrquee.config import Settings
@@ -44,8 +45,9 @@ from marrquee.docker_client import ComposeResult
 from marrquee.login import SavedLogin, load_login, save_login
 from marrquee.login_apply import FakeLoginApplier, LoginApplyResult
 from marrquee.questions import save_step_answers
+from marrquee.recyclarr import recyclarr_config_host_path
 from marrquee.state import InstallState, load_state, save_state, write_json_atomic
-from marrquee.storage import read_marker
+from marrquee.storage import read_marker, to_host_view
 from marrquee.vpn import TunnelPlace
 from marrquee.vpn_control import FakeGluetunControl, GluetunControl, NoGluetunControl
 from marrquee.wiring import WiringStep
@@ -360,6 +362,55 @@ async def test_a_failed_add_asks_for_no_check(tmp_path: Path) -> None:
     assert trigger.calls == 0
 
 
+# --- A sync is asked for only when the add actually affects Recyclarr's own -
+# --- config: Recyclarr itself, or one of the two apps it configures --------
+
+
+async def test_adding_sonarr_with_recyclarr_installed_requests_one_sync(tmp_path: Path) -> None:
+    manager, engine, settings = await _deployed_to_finale(tmp_path, ("radarr", "recyclarr"))
+    trigger = _RecordingSyncTrigger()
+    manager._recyclarr = trigger  # type: ignore[attr-defined]
+
+    result = manager.add_app("sonarr")
+    assert result == "started"
+    final = await _finish_add(manager)
+
+    assert final.adding is None
+    assert trigger.calls == 1
+
+
+async def test_adding_prowlarr_with_recyclarr_installed_requests_no_sync(tmp_path: Path) -> None:
+    manager, engine, settings = await _deployed_to_finale(tmp_path, ("radarr", "recyclarr"))
+    trigger = _RecordingSyncTrigger()
+    manager._recyclarr = trigger  # type: ignore[attr-defined]
+
+    result = manager.add_app("prowlarr")
+    assert result == "started"
+    final = await _finish_add(manager)
+
+    assert final.adding is None
+    assert trigger.calls == 0
+
+
+async def test_a_failed_add_of_sonarr_with_recyclarr_installed_requests_no_sync(
+    tmp_path: Path,
+) -> None:
+    manager, engine, settings = await _deployed_to_finale(tmp_path, ("radarr", "recyclarr"))
+    trigger = _RecordingSyncTrigger()
+    manager._recyclarr = trigger  # type: ignore[attr-defined]
+    engine._compose_results["sonarr"] = ComposeResult(  # type: ignore[attr-defined]
+        ok=False, exit_code=1, output="Error: port is already allocated"
+    )
+
+    result = manager.add_app("sonarr")
+    assert result == "started"
+    final = await _finish_add(manager)
+
+    assert final.adding is not None
+    assert final.adding.state == "error"
+    assert trigger.calls == 0
+
+
 # --- Cancel: only ever removes a container it created, never a folder -------
 
 
@@ -394,6 +445,37 @@ async def test_cancel_removes_only_a_container_it_created_and_shrinks_install(
     root_path = settings.host_mount / "volume1" / "media"
     assert (root_path / "marrquee").exists()  # never deletes a folder
     assert manager.snapshot().adding is None
+
+
+async def test_cancel_of_a_failed_recyclarr_add_removes_the_container_and_its_config(
+    tmp_path: Path,
+) -> None:
+    manager, engine, settings = await _deployed_to_finale(tmp_path, ("prowlarr", "sonarr"))
+    engine._compose_results["recyclarr"] = ComposeResult(  # type: ignore[attr-defined]
+        ok=False, exit_code=1, output="Error: something went wrong"
+    )
+
+    manager.add_app("recyclarr")
+    failed = await _finish_add(manager)
+    assert failed.adding is not None and failed.adding.state == "error"
+
+    grown = load_state(settings.config_dir)
+    assert grown is not None and grown.storage_root is not None
+    root = PurePosixPath(grown.storage_root)
+    container_root = to_host_view(settings, str(root))
+    config_path = container_root / recyclarr_config_host_path(root).relative_to(root)
+    # `_write_recyclarr_conf` runs before `compose_up` even on a failed
+    # attempt - the file this cancel must remove is genuinely there.
+    assert config_path.is_file()
+
+    ok = await manager.cancel_add()
+    assert ok is True
+    assert any(call[0] == "remove_container" and call[1] == ("recyclarr",) for call in engine.calls)
+    assert not config_path.exists()
+
+    after_cancel = load_state(settings.config_dir)
+    assert after_cancel is not None
+    assert after_cancel.app_ids == ("prowlarr", "sonarr")
 
 
 async def test_cancel_of_a_failed_add_rewrites_compose_still_holding_gluetun(
@@ -652,6 +734,22 @@ async def test_reconnect_asks_for_no_check(tmp_path: Path) -> None:
     manager, engine, settings = await _deployed_to_finale(tmp_path)
     trigger = _RecordingHardlinkTrigger()
     manager._hardlinks = trigger  # type: ignore[attr-defined]
+
+    result = manager.reconnect("sonarr")
+    assert result == "started"
+    final = await _finish_add(manager)
+
+    assert final.adding is None
+    assert trigger.calls == 0
+
+
+async def test_reconnect_asks_for_no_sync(tmp_path: Path) -> None:
+    """Reconnect ends in `_run_wiring_for_add` directly, the same as the
+    drive check just above - it never reaches either trigger site.
+    """
+    manager, engine, settings = await _deployed_to_finale(tmp_path)
+    trigger = _RecordingSyncTrigger()
+    manager._recyclarr = trigger  # type: ignore[attr-defined]
 
     result = manager.reconnect("sonarr")
     assert result == "started"

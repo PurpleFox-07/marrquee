@@ -25,12 +25,13 @@ from marrquee import questions as questions_module
 from marrquee import words
 from marrquee.config import Settings
 from marrquee.deploy import AppAdd, AppProgress, DeploySnapshot
-from marrquee.docker_client import DockerStatus, FakeDockerEngine
+from marrquee.docker_client import ContainerSnapshot, DockerStatus, FakeDockerEngine
 from marrquee.health import FakeLinkProbe
 from marrquee.links import LinkCard, save_links
 from marrquee.login import save_login
 from marrquee.main import create_app
 from marrquee.questions import QuestionCheck, QuestionField, QuestionStep
+from marrquee.recyclarr import RecyclarrControl, SyncStatus
 from marrquee.routes.api import HubInstallOut, HubStatusOut, HubTileOut, LinkTileOut
 from marrquee.state import STATE_VERSION, InstallState, save_state, write_json_atomic
 from marrquee.words import STATUS_CHIP_DONE
@@ -159,6 +160,30 @@ def test_app_fields_include_paused() -> None:
     assert "paused" in arrays["APP_FIELDS"]
 
 
+def test_app_fields_include_sync_state() -> None:
+    """Recyclarr's own poster has to repaint on every poll - without
+    `sync_state` in `APP_FIELDS`, `paintTile` would never see the field it
+    sets `data-sync-state` and the Sync now button's own class from.
+    """
+    script = _HUB_JS_PATH.read_text()
+    arrays = _field_arrays(script)
+
+    assert "sync_state" in arrays["APP_FIELDS"]
+
+
+def test_sync_state_never_reaches_the_reload_guard_signature() -> None:
+    """`actions` stays `"sync"` through every up state, syncing included -
+    `sync_state` itself must never fold into `structureSignature`, or a
+    sync starting/finishing would reload the page for no reason.
+    """
+    script = _HUB_JS_PATH.read_text()
+    match = re.search(r"function structureSignature\([^)]*\)\s*\{.*?\n  \}", script, re.DOTALL)
+    assert match is not None, "expected a structureSignature function in hub.js"
+
+    assert "sync_state" not in match.group(0)
+    assert "syncState" not in match.group(0)
+
+
 def test_the_reload_guard_signature_folds_in_the_login_banner() -> None:
     """`structureSignature` has to actually combine both inputs - a version
     that quietly went back to `return actions;` would still poll and paint
@@ -249,10 +274,33 @@ def _write_snapshot(settings: Settings, snapshot: DeploySnapshot) -> None:
     write_json_atomic(settings.config_dir / "deploy.json", dataclasses.asdict(snapshot))
 
 
-def _client(settings: Settings) -> TestClient:
-    engine = FakeDockerEngine(DockerStatus(connected=True, version="27.3.1"))
-    app = create_app(settings=settings, engine=engine, link_probe=FakeLinkProbe())
+def _client(
+    settings: Settings,
+    *,
+    engine: FakeDockerEngine | None = None,
+    recyclarr: RecyclarrControl | None = None,
+) -> TestClient:
+    if engine is None:
+        engine = FakeDockerEngine(DockerStatus(connected=True, version="27.3.1"))
+    app = create_app(
+        settings=settings, engine=engine, link_probe=FakeLinkProbe(), recyclarr=recyclarr
+    )
     return TestClient(app)
+
+
+class _FakeRecyclarr:
+    """A fixed `SyncStatus`, so the sync-fixture render below always draws
+    the same tile - the sync request count is never read by this file.
+    """
+
+    def __init__(self, status: SyncStatus) -> None:
+        self._status = status
+
+    def request_sync(self) -> object:
+        return None
+
+    async def status(self) -> SyncStatus:
+        return self._status
 
 
 def test_every_hook_the_script_queries_exists_on_the_rendered_hub(
@@ -314,7 +362,30 @@ def test_every_hook_the_script_queries_exists_on_the_rendered_hub(
     )
     adding_page = _client(adding_settings).get("/").text
 
-    rendered = (edit_page, install_page, adding_page)
+    # A running Recyclarr, for `data-sync-state` and the Sync now button's
+    # own `data-role="sync-now"` - neither ever appears on any other tile.
+    sync_settings = _settings(tmp_path / "sync")
+    save_state(sync_settings.config_dir, _install_state(("recyclarr",)))
+    _write_snapshot(sync_settings, _finale_snapshot(("recyclarr",)))
+    sync_engine = FakeDockerEngine(
+        DockerStatus(connected=True, version="27.3.1"),
+        containers={
+            "recyclarr": ContainerSnapshot(
+                name="recyclarr",
+                exists=True,
+                state="running",
+                exit_code=None,
+                image=None,
+                detail=None,
+            )
+        },
+    )
+    sync_recyclarr = _FakeRecyclarr(
+        SyncStatus(syncing=False, last=None, start_failed=False, run_failed=False)
+    )
+    sync_page = _client(sync_settings, engine=sync_engine, recyclarr=sync_recyclarr).get("/").text
+
+    rendered = (edit_page, install_page, adding_page, sync_page)
     for hook in hooks:
         assert any(hook in page for page in rendered), (
             f"{hook!r} is read by hub.js but never rendered on any page"

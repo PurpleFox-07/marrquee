@@ -172,6 +172,38 @@ class NetworkConnectResult:
     detail: str | None
 
 
+@dataclass(frozen=True)
+class ExecStartResult:
+    """The outcome of asking Docker to create and detach-start one exec.
+
+    `exec_id` is carried even on a start failure (the create half can
+    succeed while start fails) so a caller can still poll or log against it.
+    `detail` carries the status code and Docker's own message, for logs and
+    the diagnostics file only - same contract as every other `detail`-shaped
+    field in this codebase. A 409 on create means "the container is
+    stopped" - Docker's own wording, not anything this codebase invents.
+    """
+
+    ok: bool
+    exec_id: str | None
+    detail: str | None
+
+
+@dataclass(frozen=True)
+class ExecState:
+    """The answer to "is this exec still running, and how did it end?".
+
+    `known=False` covers both a 404 (Docker has forgotten this exec id, or
+    never had it) and any other reply this codebase doesn't understand -
+    a caller that only cares "is it done" treats both the same way.
+    """
+
+    known: bool
+    running: bool
+    exit_code: int | None
+    detail: str | None
+
+
 class DockerEngine(Protocol):
     """Access to Docker: the original read-only status check, plus the
     read and write operations the deploy engine needs to start and watch
@@ -191,6 +223,8 @@ class DockerEngine(Protocol):
     async def stop_container(
         self, name: str, *, timeout_seconds: int = 30
     ) -> ContainerStopResult: ...
+    async def exec_start(self, container: str, cmd: Sequence[str]) -> ExecStartResult: ...
+    async def exec_inspect(self, exec_id: str) -> ExecState: ...
 
 
 class SocketDockerEngine:
@@ -438,6 +472,102 @@ class SocketDockerEngine:
             return ContainerStopResult(ok=False, detail=str(error))
 
         return _classify_stop_response(response)
+
+    async def exec_start(self, container: str, cmd: Sequence[str]) -> ExecStartResult:
+        try:
+            async with self._client() as client:
+                create_response = await client.post(
+                    f"/containers/{container}/exec",
+                    json={
+                        "AttachStdin": False,
+                        "AttachStdout": False,
+                        "AttachStderr": False,
+                        "Tty": False,
+                        "Cmd": list(cmd),
+                    },
+                )
+        except (httpx.TimeoutException, httpx.ConnectError) as error:
+            return ExecStartResult(ok=False, exec_id=None, detail=str(error))
+
+        if create_response.status_code != 201:
+            # A 409 here is Docker's own way of saying the container isn't
+            # running - the caller reads that from `detail`, same as every
+            # other failure in this codebase.
+            return ExecStartResult(
+                ok=False,
+                exec_id=None,
+                detail=f"HTTP {create_response.status_code}: "
+                f"{_docker_error_message(create_response)}",
+            )
+
+        try:
+            created = create_response.json()
+        except ValueError as error:
+            return ExecStartResult(ok=False, exec_id=None, detail=str(error))
+
+        exec_id = created.get("Id") if isinstance(created, dict) else None
+        if not isinstance(exec_id, str):
+            return ExecStartResult(
+                ok=False,
+                exec_id=None,
+                detail=f"Docker's exec-create reply had no 'Id': {created!r}",
+            )
+
+        try:
+            async with self._client() as client:
+                start_response = await client.post(
+                    f"/exec/{exec_id}/start", json={"Detach": True, "Tty": False}
+                )
+        except (httpx.TimeoutException, httpx.ConnectError) as error:
+            return ExecStartResult(ok=False, exec_id=exec_id, detail=str(error))
+
+        if start_response.status_code != 200:
+            return ExecStartResult(
+                ok=False,
+                exec_id=exec_id,
+                detail=f"HTTP {start_response.status_code}: "
+                f"{_docker_error_message(start_response)}",
+            )
+
+        return ExecStartResult(ok=True, exec_id=exec_id, detail=None)
+
+    async def exec_inspect(self, exec_id: str) -> ExecState:
+        try:
+            async with self._client() as client:
+                response = await client.get(f"/exec/{exec_id}/json")
+        except (httpx.TimeoutException, httpx.ConnectError) as error:
+            return ExecState(known=False, running=False, exit_code=None, detail=str(error))
+
+        if response.status_code == 404:
+            return ExecState(known=False, running=False, exit_code=None, detail=None)
+        if response.status_code != 200:
+            return ExecState(
+                known=False,
+                running=False,
+                exit_code=None,
+                detail=f"HTTP {response.status_code}: {_docker_error_message(response)}",
+            )
+
+        try:
+            payload = response.json()
+        except ValueError as error:
+            return ExecState(known=False, running=False, exit_code=None, detail=str(error))
+
+        if not isinstance(payload, dict):
+            return ExecState(
+                known=False,
+                running=False,
+                exit_code=None,
+                detail=f"unexpected exec-inspect payload: {payload!r}",
+            )
+
+        exit_code = payload.get("ExitCode")
+        return ExecState(
+            known=True,
+            running=bool(payload.get("Running")),
+            exit_code=exit_code if isinstance(exit_code, int) else None,
+            detail=None,
+        )
 
 
 def _classify_remove_response(response: httpx.Response) -> ContainerRemoveResult:
@@ -716,6 +846,8 @@ class FakeDockerEngine:
         remove_results: Mapping[str, bool] | None = None,
         logs: Mapping[str, str] | None = None,
         frames: Mapping[str, Sequence[ContainerSnapshot]] | None = None,
+        exec_exit_codes: Mapping[str, int] | None = None,
+        exec_running_polls: int = 0,
     ) -> None:
         self._status = status
         self._containers = dict(containers) if containers is not None else {}
@@ -723,6 +855,14 @@ class FakeDockerEngine:
         self._compose_results = dict(compose_results) if compose_results is not None else {}
         self._remove_results = dict(remove_results) if remove_results is not None else {}
         self._logs = dict(logs) if logs is not None else {}
+        # A scripted exec's exit code, keyed by the CONTAINER it ran in
+        # (never the exec id, which this fake mints itself) - `0` is Docker's
+        # own "the command succeeded" default for a test that doesn't care.
+        self._exec_exit_codes = dict(exec_exit_codes) if exec_exit_codes is not None else {}
+        self._exec_running_polls = exec_running_polls
+        self._exec_containers: dict[str, str] = {}
+        self._exec_polls: dict[str, int] = {}
+        self._exec_sequence = 0
         # A VPN whose health changes tick by tick is state the fake must
         # model (docker-fakes-model-state) - each name scripted here drains
         # in order, then repeats its last frame, and always wins over
@@ -878,3 +1018,36 @@ class FakeDockerEngine:
         if name in self._containers:
             self._containers[name] = replace(self._containers[name], state="exited")
         return ContainerStopResult(ok=True, detail=None)
+
+    async def exec_start(self, container: str, cmd: Sequence[str]) -> ExecStartResult:
+        self.calls.append(("exec_start", (container, tuple(cmd))))
+        # Read `_containers` directly, never through `inspect()` - `inspect`
+        # also consults `_frames` and advances them, and a Sync-now request
+        # must never itself tick a scripted health sequence forward.
+        snapshot = self._containers.get(container)
+        if snapshot is None or snapshot.state != "running":
+            return ExecStartResult(ok=False, exec_id=None, detail="container is not running")
+
+        self._exec_sequence += 1
+        exec_id = f"exec-{self._exec_sequence}"
+        self._exec_containers[exec_id] = container
+        self._exec_polls[exec_id] = 0
+        return ExecStartResult(ok=True, exec_id=exec_id, detail=None)
+
+    async def exec_inspect(self, exec_id: str) -> ExecState:
+        self.calls.append(("exec_inspect", (exec_id,)))
+        container = self._exec_containers.get(exec_id)
+        if container is None:
+            return ExecState(known=False, running=False, exit_code=None, detail=None)
+
+        polls_done = self._exec_polls[exec_id]
+        if polls_done < self._exec_running_polls:
+            self._exec_polls[exec_id] = polls_done + 1
+            return ExecState(known=True, running=True, exit_code=None, detail=None)
+
+        return ExecState(
+            known=True,
+            running=False,
+            exit_code=self._exec_exit_codes.get(container, 0),
+            detail=None,
+        )

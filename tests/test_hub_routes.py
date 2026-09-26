@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import html
 import re
 import time
 from datetime import UTC, datetime, timedelta
@@ -58,6 +59,7 @@ from marrquee.questions import (
     load_answers,
     save_step_answers,
 )
+from marrquee.recyclarr import RecyclarrControl, SyncRecord, SyncStatus
 from marrquee.routes.wizard import router as wizard_router
 from marrquee.state import STATE_VERSION, InstallState, load_state, save_state, write_json_atomic
 from marrquee.vpn import VPN_PROVIDERS, TunnelPlace, provider_wiki_url
@@ -111,7 +113,7 @@ def _install_state(app_ids: tuple[str, ...]) -> InstallState:
     )
 
 
-def _progress(app_id: str, name: str, port: int) -> AppProgress:
+def _progress(app_id: str, name: str, port: int | None) -> AppProgress:
     return AppProgress(
         app_id=app_id,
         name=name,
@@ -183,6 +185,7 @@ def _client(
     link_probe: FakeLinkProbe | None = None,
     vpn_control: FakeGluetunControl | None = None,
     hardlinks: HardlinkMonitor | None = None,
+    recyclarr: RecyclarrControl | None = None,
 ) -> TestClient:
     if engine is None:
         engine = FakeDockerEngine(DockerStatus(connected=True, version="27.3.1"))
@@ -194,8 +197,28 @@ def _client(
         link_probe=link_probe,
         vpn_control=vpn_control,
         hardlinks=hardlinks,
+        recyclarr=recyclarr,
     )
     return TestClient(app)
+
+
+class _RecordingRecyclarr:
+    """Stands in for `RecyclarrMonitor` on a Hub route test: a fixed status
+    to hand back, and a count of how many times a sync was ever requested -
+    the same recording-fake shape `_RecordingSyncTrigger` gives the deploy
+    engine's own tests.
+    """
+
+    def __init__(self, status: SyncStatus) -> None:
+        self._status = status
+        self.sync_calls = 0
+
+    def request_sync(self) -> object:
+        self.sync_calls += 1
+        return None
+
+    async def status(self) -> SyncStatus:
+        return self._status
 
 
 def _running_containers(app_ids: tuple[str, ...]) -> dict[str, ContainerSnapshot]:
@@ -228,6 +251,29 @@ def _posters(page_html: str) -> dict[str, dict[str, str | None]]:
     collector = _PosterCollector()
     collector.feed(page_html)
     return collector.posters
+
+
+class _ButtonCollector(HTMLParser):
+    """Collects every `<button data-role="...">`'s own attributes, keyed by
+    that role - the Sync now button's own class (`btn-primary`/`btn-ghost`)
+    lives on the tag itself, not any wrapping element.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.buttons: dict[str, dict[str, str | None]] = {}
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attrs_dict = dict(attrs)
+        role = attrs_dict.get("data-role")
+        if tag == "button" and role is not None:
+            self.buttons[role] = attrs_dict
+
+
+def _buttons(page_html: str) -> dict[str, dict[str, str | None]]:
+    collector = _ButtonCollector()
+    collector.feed(page_html)
+    return collector.buttons
 
 
 class _RootCollector(HTMLParser):
@@ -1094,7 +1140,7 @@ def test_panel_nonsense_and_edit_unknown_link_draw_it_closed(tmp_path: Path) -> 
 
 def test_install_pane_is_truthful(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
-    all_offered = ("prowlarr", "sonarr", "radarr", "qbittorrent")
+    all_offered = ("prowlarr", "sonarr", "radarr", "qbittorrent", "recyclarr")
     save_state(settings.config_dir, _install_state(all_offered))
     _write_snapshot(settings, _finale_snapshot(all_offered))
     save_login(settings.config_dir, "owner", "s3cret-password-1", honor_reset=None)
@@ -1299,6 +1345,134 @@ def test_retry_cancel_and_reconnect_for_the_wrong_app_change_nothing_and_303(
         assert response.status_code == 303
         assert response.headers["location"] == "/"
     assert (settings.config_dir / "deploy.json").read_bytes() == before
+
+
+# --- Recyclarr's own poster: last synced, amber with a reason, Sync now -----
+
+
+def test_page_and_poll_agree_on_the_app_down_reason(tmp_path: Path) -> None:
+    """FIRST TEST (has-data-pipeline): a failed sync's own reason names
+    Radarr because Marrquee's own health read says it's down - never
+    because of anything Recyclarr's log itself says - and `GET /` and
+    `GET /api/hub/status` must never disagree about it.
+    """
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr", "radarr", "recyclarr")))
+    _write_snapshot(settings, _finale_snapshot(("sonarr", "radarr", "recyclarr")))
+    engine = FakeDockerEngine(
+        DockerStatus(connected=True, version="27.3.1"),
+        containers={
+            **_running_containers(("sonarr", "recyclarr")),
+            "radarr": ContainerSnapshot(
+                name="radarr", exists=True, state="exited", exit_code=1, image=None, detail=None
+            ),
+        },
+    )
+    recyclarr = _RecordingRecyclarr(
+        SyncStatus(
+            syncing=False,
+            last=SyncRecord(finished_at=datetime.now(UTC), ok=False),
+            start_failed=False,
+            run_failed=False,
+        )
+    )
+    client = _client(settings, engine, recyclarr=recyclarr)
+
+    page = client.get("/")
+    poll = client.get("/api/hub/status")
+
+    expected_line = words.recyclarr_line_app_down("Radarr")
+    assert expected_line in html.unescape(page.text)
+    poll_apps = {app["app_id"]: app for app in poll.json()["apps"]}
+    assert poll_apps["recyclarr"]["line"] == expected_line
+    assert poll_apps["recyclarr"]["sync_state"] == "failed"
+    assert _posters(page.text)["recyclarr"]["data-sync-state"] == "failed"
+
+
+def test_sync_now_posts_once_and_redirects(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr", "recyclarr")))
+    _write_snapshot(settings, _finale_snapshot(("sonarr", "recyclarr")))
+    recyclarr = _RecordingRecyclarr(
+        SyncStatus(syncing=False, last=None, start_failed=False, run_failed=False)
+    )
+    client = _client(settings, recyclarr=recyclarr)
+
+    response = client.post("/hub/apps/recyclarr/sync", follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/"
+    assert recyclarr.sync_calls == 1
+
+
+def test_a_sync_post_for_a_non_sync_app_changes_nothing(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr", "recyclarr")))
+    _write_snapshot(settings, _finale_snapshot(("sonarr", "recyclarr")))
+    recyclarr = _RecordingRecyclarr(
+        SyncStatus(syncing=False, last=None, start_failed=False, run_failed=False)
+    )
+    client = _client(settings, recyclarr=recyclarr)
+
+    response = client.post("/hub/apps/sonarr/sync", follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/"
+    assert recyclarr.sync_calls == 0
+
+
+def test_a_stopped_recyclarr_is_the_ordinary_down_poster_with_no_sync_now(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("recyclarr",)))
+    _write_snapshot(settings, _finale_snapshot(("recyclarr",)))
+    engine = FakeDockerEngine(
+        DockerStatus(connected=True, version="27.3.1"),
+        containers={
+            "recyclarr": ContainerSnapshot(
+                name="recyclarr", exists=True, state="exited", exit_code=1, image=None, detail=None
+            )
+        },
+    )
+    client = _client(settings, engine)
+
+    response = client.get("/")
+
+    poster = _posters(response.text)["recyclarr"]
+    assert poster["data-state"] == "down"
+    assert "data-sync-state" not in poster
+    assert 'action="/hub/apps/recyclarr/sync"' not in response.text
+
+
+def test_sync_now_button_is_primary_when_failed_and_ghost_when_ok(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("recyclarr",)))
+    _write_snapshot(settings, _finale_snapshot(("recyclarr",)))
+    engine = FakeDockerEngine(
+        DockerStatus(connected=True, version="27.3.1"),
+        containers=_running_containers(("recyclarr",)),
+    )
+    failed = _RecordingRecyclarr(
+        SyncStatus(
+            syncing=False,
+            last=SyncRecord(finished_at=datetime.now(UTC), ok=False),
+            start_failed=False,
+            run_failed=False,
+        )
+    )
+    ok = _RecordingRecyclarr(
+        SyncStatus(
+            syncing=False,
+            last=SyncRecord(finished_at=datetime.now(UTC), ok=True),
+            start_failed=False,
+            run_failed=False,
+        )
+    )
+
+    failed_page = _client(settings, engine, recyclarr=failed).get("/").text
+    ok_page = _client(settings, engine, recyclarr=ok).get("/").text
+
+    assert _buttons(failed_page)["sync-now"]["class"] == "btn-primary"
+    assert _buttons(ok_page)["sync-now"]["class"] == "btn-ghost"
 
 
 def test_retry_re_runs_a_failed_add_from_scratch(tmp_path: Path) -> None:

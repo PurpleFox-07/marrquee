@@ -14,13 +14,15 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Literal
+from typing import Final, Literal
 
 from marrquee.words import (
     PROWLARR_DESCRIPTION,
     QBITTORRENT_DESCRIPTION,
     QBITTORRENT_DESCRIPTION_NO_VPN,
     RADARR_DESCRIPTION,
+    RECYCLARR_DESCRIPTION,
+    RECYCLARR_NEEDS_ARR,
     SONARR_DESCRIPTION,
     VPN_DESCRIPTION,
 )
@@ -60,7 +62,11 @@ LoginKind = Literal["arr", "none", "qbittorrent"]
 # with no web page, no API key and its own compose shape; "downloader" is
 # qBittorrent - it rides another app's network (`network_via`) instead of
 # getting its own, and it is never reached with arr's `X-Api-Key` header.
-AppKind = Literal["arr", "vpn", "downloader"]
+# "sync" is Recyclarr: it has no web page and no port of its own either -
+# it reuses "downloader"'s no-web-page poster pattern rather than a second
+# poster mechanism, but is "ready" once its container is running, never
+# through an HTTP probe.
+AppKind = Literal["arr", "vpn", "downloader", "sync"]
 
 
 @dataclass(frozen=True)
@@ -71,6 +77,10 @@ class CatalogApp:
     check instead of faking the arr fields (`api_base`, `login_kind`) it
     has no use for. `kind="downloader"` (qBittorrent) does the same for an
     app that rides another app's network instead of getting its own.
+    `kind="sync"` (Recyclarr) has no web page and no port at all - `port`
+    is `None` for it, and every reader of `port` either narrows through
+    `require_port` (a real bug if one is ever reached for this app) or is
+    written to handle `None` honestly.
     `offered=False` keeps an app like that out of every screen that lets an
     owner choose it directly (the wizard's grid, the Hub's "+" panel, `GET
     /api/catalog`) while it stays a normal entry everywhere else (catalog
@@ -96,7 +106,7 @@ class CatalogApp:
     name: str
     description: str
     image: str
-    port: int
+    port: int | None
     env_prefix: str
     api_base: str
     media_folders: tuple[str, ...]
@@ -114,13 +124,16 @@ class CatalogApp:
     description_without_vpn: str = ""
 
 
-# Prowlarr, Sonarr, Radarr, Gluetun (the VPN tunnel) and qBittorrent (the
-# downloader). Gluetun is `offered=False`: it never appears as its own "+"
-# choice or wizard tick - whatever needs it (qBittorrent, today) adds it as
-# a companion instead. qBittorrent's `network_via="gluetun"` is what
-# enforces "the downloader must never run outside the tunnel": it has no
-# network or API key of its own, and `build_stack_plan` refuses any install
-# that has it without Gluetun.
+RECYCLARR_APP_ID: Final = "recyclarr"
+
+# Prowlarr, Sonarr, Radarr, Gluetun (the VPN tunnel), qBittorrent (the
+# downloader) and Recyclarr (quality settings from the TRaSH guides).
+# Gluetun is `offered=False`: it never appears as its own "+" choice or
+# wizard tick - whatever needs it (qBittorrent, today) adds it as a
+# companion instead. qBittorrent's `network_via="gluetun"` is what enforces
+# "the downloader must never run outside the tunnel": it has no network or
+# API key of its own, and `build_stack_plan` refuses any install that has
+# it without Gluetun.
 CATALOG: tuple[CatalogApp, ...] = (
     CatalogApp(
         id="prowlarr",
@@ -203,6 +216,27 @@ CATALOG: tuple[CatalogApp, ...] = (
         api_key_style="qbt",
         description_without_vpn=QBITTORRENT_DESCRIPTION_NO_VPN,
     ),
+    CatalogApp(
+        id=RECYCLARR_APP_ID,
+        name="Recyclarr",
+        description=RECYCLARR_DESCRIPTION,
+        image="ghcr.io/recyclarr/recyclarr:8.7.2",
+        port=None,
+        env_prefix="RECYCLARR",
+        api_base="",
+        media_folders=(),
+        needs_data_mount=False,
+        glyph="RC",
+        order=5,
+        default_ticked=False,
+        web_page=False,
+        rules=(
+            AppRule(kind="needs_any", app_ids=("sonarr", "radarr"), reason=RECYCLARR_NEEDS_ARR),
+        ),
+        kind="sync",
+        offered=True,
+        login_kind="none",
+    ),
 )
 
 
@@ -216,6 +250,21 @@ def get_app(app_id: str) -> CatalogApp:
         if app.id == app_id:
             return app
     raise KeyError(app_id)
+
+
+def require_port(app: CatalogApp) -> int:
+    """`app.port`, for every reader that only ever makes sense for a
+    ported app (the compose builder's arr/vpn/downloader branches, the
+    readiness probe, a wiring partner's base URL).
+
+    Raises rather than silently faking a port (`0`, say) - a `kind="sync"`
+    app like Recyclarr reaching one of these callers is a real bug, not
+    something to paper over with a number that would leak into a poster,
+    a deploy link or a "no address" line.
+    """
+    if app.port is None:
+        raise ValueError(f"{app.id} has no port")
+    return app.port
 
 
 def apps_in_order(app_ids: Iterable[str]) -> tuple[CatalogApp, ...]:

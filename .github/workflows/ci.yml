@@ -1885,6 +1885,310 @@ jobs:
             exit 1
           fi
 
+      # A real Recyclarr container, added through the same Hub endpoint the
+      # owner uses, actually creates the guide-backed profiles in Sonarr
+      # and Radarr, and Marrquee's own log read agrees with what really
+      # happened. None of this is provable by reading source alone - the
+      # log's shape, the guide sync itself, a detached exec over the Docker
+      # socket, and running as a user id with no passwd entry only settle
+      # on a real daemon.
+      - name: Recyclarr syncs quality from the TRaSH guides
+        run: |
+          set -euo pipefail
+
+          # Radarr was left running by the drive check above - starting it
+          # again here is a cheap, idempotent guard rather than a bet that
+          # every earlier step in this job will always leave it that way.
+          docker start radarr
+          radarr_state=""
+          for _ in $(seq 1 90); do
+            status=$(curl -fsS http://127.0.0.1:7788/api/hub/status) || status=""
+            if [ -n "$status" ]; then
+              radarr_state=$(echo "$status" | jq -r '.apps[] | select(.app_id == "radarr") | .state')
+              if [ "$radarr_state" = "up" ]; then
+                break
+              fi
+            fi
+            sleep 2
+          done
+          if [ "$radarr_state" != "up" ]; then
+            echo "::error::Radarr was not Up ahead of the Recyclarr sync proof"
+            exit 1
+          fi
+
+          response=$(curl -s -w '\n%{http_code}' -X POST \
+            http://127.0.0.1:7788/api/hub/apps/recyclarr/install \
+            -H "Content-Type: application/json" \
+            -d '{"answers":{"tv_quality":"1080p","movie_quality":"4k"}}')
+          code=$(echo "$response" | tail -n1)
+          body=$(echo "$response" | sed '$d')
+          echo "hub install response (${code}): ${body}"
+          if [ "$code" != "202" ]; then
+            echo "::error::POST /api/hub/apps/recyclarr/install returned ${code}, expected 202: ${body}"
+            exit 1
+          fi
+
+          add_state=""
+          sync_state=""
+          line=""
+          for _ in $(seq 1 120); do
+            status=$(curl -fsS http://127.0.0.1:7788/api/hub/status) || status=""
+            if [ -n "$status" ]; then
+              recyclarr=$(echo "$status" | jq -c '.apps[] | select(.app_id == "recyclarr")')
+              add_state=$(echo "$recyclarr" | jq -r '.add_state')
+              sync_state=$(echo "$recyclarr" | jq -r '.sync_state')
+              line=$(echo "$recyclarr" | jq -r '.line')
+              echo "recyclarr add_state: $add_state / sync_state: $sync_state"
+              if [ "$sync_state" = "failed" ]; then
+                MESSAGE="Recyclarr's first sync failed: ${line}" \
+                  python3 -c "import os; text = os.environ['MESSAGE'][:500].replace('%', '%25').replace(chr(13), '%0D').replace(chr(10), '%0A').replace('::', ': :'); print('::error::' + text)"
+                exit 1
+              fi
+              if [ "$add_state" = "null" ] && [ "$sync_state" = "ok" ]; then
+                break
+              fi
+            fi
+            sleep 5
+          done
+          if [ "$add_state" != "null" ] || [ "$sync_state" != "ok" ]; then
+            echo "::error::Recyclarr never finished adding and syncing within 10 minutes (add_state=${add_state}, sync_state=${sync_state})"
+            exit 1
+          fi
+
+          log_dir="/host${RUNNER_TEMP}/marrquee-smoke/media/marrquee/apps/recyclarr/logs/cli"
+          if ! logs=$(docker exec marrquee-stack-smoke sh -c "ls '${log_dir}'") || [ -z "$logs" ]; then
+            echo "::error::Recyclarr wrote no log where Marrquee reads it"
+            exit 1
+          fi
+          if ! echo "$logs" | grep -qE '^recyclarr_.*\.debug\.log$'; then
+            echo "::error::Recyclarr wrote no log where Marrquee reads it"
+            exit 1
+          fi
+
+          if ! ids=$(docker exec marrquee-stack-smoke python3 -c "import json; install = json.load(open('/config/install.json')); print(install['puid'], install['pgid'])") || [ -z "$ids" ]; then
+            echo "::error::couldn't read PUID/PGID from /config/install.json"
+            exit 1
+          fi
+          read -r puid pgid <<< "$ids"
+
+          # The guide-backed profiles really landing in a live Sonarr and
+          # Radarr, read with the same keys Marrquee itself generated -
+          # never trusted from Recyclarr's own log wording.
+          cat > "$RUNNER_TEMP/recyclarr_profile_check.py" <<'PY'
+          import asyncio
+          import json
+          from pathlib import Path
+
+          import httpx
+
+
+          async def main() -> None:
+              install = json.loads(Path("/config/install.json").read_text())
+              api_keys = install["api_keys"]
+
+              async with httpx.AsyncClient(timeout=10.0) as client:
+                  sonarr = await client.get(
+                      "http://sonarr:8989/api/v3/qualityprofile",
+                      headers={"X-Api-Key": api_keys["sonarr"]},
+                  )
+                  sonarr.raise_for_status()
+                  sonarr_names = {profile["name"] for profile in sonarr.json()}
+                  if "WEB-1080p" not in sonarr_names:
+                      raise SystemExit(
+                          f"Sonarr never got its WEB-1080p profile (has: {sorted(sonarr_names)})"
+                      )
+
+                  radarr = await client.get(
+                      "http://radarr:7878/api/v3/qualityprofile",
+                      headers={"X-Api-Key": api_keys["radarr"]},
+                  )
+                  radarr.raise_for_status()
+                  radarr_names = {profile["name"] for profile in radarr.json()}
+                  if "UHD Bluray + WEB" not in radarr_names:
+                      raise SystemExit(
+                          f"Radarr never got its UHD Bluray + WEB profile (has: {sorted(radarr_names)})"
+                      )
+
+
+          asyncio.run(main())
+          PY
+
+          docker cp "$RUNNER_TEMP/recyclarr_profile_check.py" marrquee-stack-smoke:/tmp/recyclarr_profile_check.py
+          if ! output=$(docker exec marrquee-stack-smoke python3 /tmp/recyclarr_profile_check.py 2>&1); then
+            echo "$output"
+            MESSAGE="Recyclarr's guide-backed profiles never landed: ${output}" \
+              python3 -c "import os; text = os.environ['MESSAGE'][:500].replace('%', '%25').replace(chr(13), '%0D').replace(chr(10), '%0A').replace('::', ': :'); print('::error::' + text)"
+            exit 1
+          fi
+          echo "$output"
+
+          # WHICH USER runs this: Recyclarr's own image ignores PUID/PGID,
+          # so this is the one live proof that `user:` really lands it on
+          # the drive owner instead of the image's own default.
+          if ! container_user=$(docker inspect -f '{{.Config.User}}' recyclarr) || [ -z "$container_user" ]; then
+            echo "::error::couldn't read recyclarr's container user"
+            exit 1
+          fi
+          if [ "$container_user" != "${puid}:${pgid}" ]; then
+            echo "::error::recyclarr's container did not run as ${puid}:${pgid} (got: ${container_user})"
+            exit 1
+          fi
+
+          if ! docker exec marrquee-stack-smoke sh -c 'command -v stat' > /dev/null; then
+            echo "::error::stat is not available inside marrquee-stack-smoke to check recyclarr.yml's permissions"
+            exit 1
+          fi
+          config_path="/host${RUNNER_TEMP}/marrquee-smoke/media/marrquee/apps/recyclarr/recyclarr.yml"
+          if ! config_perms=$(docker exec marrquee-stack-smoke stat -c '%a %u' "$config_path") || [ -z "$config_perms" ]; then
+            echo "::error::couldn't stat recyclarr.yml at ${config_path}"
+            exit 1
+          fi
+          if [ "$config_perms" != "600 ${puid}" ]; then
+            echo "::error::recyclarr.yml was not 0600 owned by puid ${puid} (got: ${config_perms})"
+            exit 1
+          fi
+
+          # No install API key ever leaks into compose.yaml's recyclarr
+          # block - checked as root inside marrquee-stack-smoke, with a
+          # tool-exists check first and a POSITIVE CONTROL (Sonarr's own
+          # key IS found in Sonarr's own block) before the real check, so a
+          # grep that could never find anything would fail loudly instead
+          # of passing by accident.
+          if ! docker exec marrquee-stack-smoke sh -c 'command -v grep' > /dev/null; then
+            echo "::error::grep is not available inside marrquee-stack-smoke to check for a leaked API key"
+            exit 1
+          fi
+          if ! keys=$(docker exec marrquee-stack-smoke python3 -c "import json; install = json.load(open('/config/install.json')); print(install['api_keys']['sonarr'], install['api_keys']['radarr'])") || [ -z "$keys" ]; then
+            echo "::error::couldn't read Sonarr/Radarr API keys from install.json"
+            exit 1
+          fi
+          read -r sonarr_key radarr_key <<< "$keys"
+
+          compose_path="/host${RUNNER_TEMP}/marrquee-smoke/media/marrquee/compose.yaml"
+          if ! sonarr_block=$(docker exec marrquee-stack-smoke sed -n '/^  sonarr:/,/^$/p' "$compose_path") || [ -z "$sonarr_block" ]; then
+            echo "::error::couldn't read Sonarr's own service block out of compose.yaml"
+            exit 1
+          fi
+          if ! echo "$sonarr_block" | grep -qF "$sonarr_key"; then
+            echo "::error::the positive control failed - Sonarr's own key was not found in its own compose.yaml block, so the check below would prove nothing"
+            exit 1
+          fi
+
+          if ! recyclarr_block=$(docker exec marrquee-stack-smoke sed -n '/^  recyclarr:/,/^$/p' "$compose_path") || [ -z "$recyclarr_block" ]; then
+            echo "::error::couldn't read Recyclarr's own service block out of compose.yaml"
+            exit 1
+          fi
+          for key in "$sonarr_key" "$radarr_key"; do
+            set +e
+            echo "$recyclarr_block" | grep -qF "$key"
+            leaked=$?
+            set -e
+            case "$leaked" in
+              1) ;;
+              0) echo "::error::an install API key leaked into the recyclarr service block of compose.yaml"; exit 1 ;;
+              *) echo "::error::couldn't check the recyclarr service block for a leaked API key (grep exit ${leaked})"; exit 1 ;;
+            esac
+          done
+
+      # The amber half: a sync that cannot reach a stopped Radarr turns the
+      # poster amber with the exact plain reason `recyclarr_line_app_down`
+      # gives, never anything Recyclarr's own log says in English. Step
+      # 1's `sync_state == "ok"` doubles as this step's positive control:
+      # it already proved the same poll loop and the same JSON field can
+      # read a genuine success, so a poll that could never settle either
+      # way would already have failed step 1, not silently passed here.
+      - name: A failed Recyclarr sync turns amber with a reason
+        run: |
+          set -euo pipefail
+
+          docker stop radarr
+
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:7788/hub/apps/recyclarr/sync)
+          if [ "$code" != "303" ]; then
+            echo "::error::POST /hub/apps/recyclarr/sync returned ${code}, expected 303"
+            exit 1
+          fi
+
+          sync_state=""
+          line=""
+          for _ in $(seq 1 150); do
+            status=$(curl -fsS http://127.0.0.1:7788/api/hub/status) || status=""
+            if [ -n "$status" ]; then
+              recyclarr=$(echo "$status" | jq -c '.apps[] | select(.app_id == "recyclarr")')
+              sync_state=$(echo "$recyclarr" | jq -r '.sync_state')
+              line=$(echo "$recyclarr" | jq -r '.line')
+              echo "recyclarr sync_state: $sync_state"
+              if [ "$sync_state" = "failed" ]; then
+                break
+              fi
+            fi
+            sleep 2
+          done
+          if [ "$sync_state" != "failed" ]; then
+            echo "::error::A failed sync was not reported (state ${sync_state})"
+            exit 1
+          fi
+
+          # The reason line is plain JSON text, never Jinja-escaped - but
+          # the comparison itself runs inside the container against the
+          # exact same word function the poster calls, unescaping rather
+          # than re-encoding so a real apostrophe still equals a real
+          # apostrophe either way.
+          cat > "$RUNNER_TEMP/recyclarr_line_check.py" <<'PY'
+          import html
+          import os
+
+          from marrquee.words import recyclarr_line_app_down
+
+          expected = recyclarr_line_app_down("Radarr")
+          actual = html.unescape(os.environ["ACTUAL_LINE"])
+          raise SystemExit(0 if actual == expected else 1)
+          PY
+          docker cp "$RUNNER_TEMP/recyclarr_line_check.py" marrquee-stack-smoke:/tmp/recyclarr_line_check.py
+          if ! docker exec -e ACTUAL_LINE="$line" marrquee-stack-smoke python3 /tmp/recyclarr_line_check.py; then
+            echo "::error::the failed sync's reason did not match recyclarr_line_app_down('Radarr'): ${line}"
+            exit 1
+          fi
+
+          docker start radarr
+          radarr_state=""
+          for _ in $(seq 1 60); do
+            status=$(curl -fsS http://127.0.0.1:7788/api/hub/status) || status=""
+            if [ -n "$status" ]; then
+              radarr_state=$(echo "$status" | jq -r '.apps[] | select(.app_id == "radarr") | .state')
+              if [ "$radarr_state" = "up" ]; then
+                break
+              fi
+            fi
+            sleep 2
+          done
+          if [ "$radarr_state" != "up" ]; then
+            echo "::error::Radarr never came back Up after being restarted to close out the amber-sync proof"
+            exit 1
+          fi
+
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:7788/hub/apps/recyclarr/sync)
+          if [ "$code" != "303" ]; then
+            echo "::error::the restore Sync now returned ${code}, expected 303"
+            exit 1
+          fi
+
+          sync_state=""
+          for _ in $(seq 1 150); do
+            status=$(curl -fsS http://127.0.0.1:7788/api/hub/status) || status=""
+            if [ -n "$status" ]; then
+              sync_state=$(echo "$status" | jq -r '.apps[] | select(.app_id == "recyclarr") | .sync_state')
+              if [ "$sync_state" = "ok" ]; then
+                break
+              fi
+            fi
+            sleep 2
+          done
+          if [ "$sync_state" != "ok" ]; then
+            echo "::error::Recyclarr never recovered to sync_state=ok after Radarr came back and Sync now was pressed again"
+            exit 1
+          fi
+
       # The one place technical detail is allowed to show up, and exactly
       # where a first-time developer needs it: a red run here is debuggable
       # from the workflow's own log, not just "it failed". The same text
@@ -1905,11 +2209,13 @@ jobs:
           fi
           echo "---- docker logs marrquee-stack-smoke ----"
           docker logs marrquee-stack-smoke || true
+          echo "---- docker logs recyclarr ----"
+          docker logs recyclarr || true
 
       - name: Clean up every container, network and temp folder this job made
         if: always()
         run: |
-          docker rm -f prowlarr sonarr radarr gluetun qbittorrent marrquee-stack-smoke 2>/dev/null || true
+          docker rm -f prowlarr sonarr radarr gluetun qbittorrent recyclarr marrquee-stack-smoke 2>/dev/null || true
           docker network rm marrquee 2>/dev/null || true
           # Some of what's under here (a container's own /config contents)
           # can be created by the Docker daemon as root, which would block a
