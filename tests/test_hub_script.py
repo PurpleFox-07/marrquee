@@ -398,6 +398,27 @@ def test_the_script_composes_no_hub_links_url() -> None:
     assert "/hub/links" not in script
 
 
+def test_the_install_click_listener_never_reaches_for_data_sign_in() -> None:
+    """The Plex sign-in button posts natively through its own
+    `formaction`/`formmethod` - it carries none of `bindInstall`'s own
+    trigger attributes, so its click must never be intercepted the way
+    every other install control's is.
+    """
+    script = _HUB_JS_PATH.read_text()
+    match = re.search(r"function bindInstall\([^)]*\)\s*\{.*?\n  \}", script, re.DOTALL)
+    assert match is not None, "expected a bindInstall function in hub.js"
+    body = match.group(0)
+
+    assert "data-sign-in" not in body
+    for selector in (
+        "[data-install-app]",
+        "[data-install-next]",
+        "[data-install-back]",
+        "[data-install-submit]",
+    ):
+        assert selector in body
+
+
 def test_the_install_collector_reads_select_values_too() -> None:
     """A `list` field (the VPN provider dropdown) is a `<select>`, not an
     `<input>` - `collectAnswers` has to query both, or a provider choice

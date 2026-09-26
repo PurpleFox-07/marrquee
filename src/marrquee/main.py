@@ -21,11 +21,14 @@ from marrquee.docker_client import DockerEngine, SocketDockerEngine
 from marrquee.hardlinks import HardlinkMonitor
 from marrquee.health import HttpLinkProbe, LinkProbe
 from marrquee.login_apply import HttpLoginApplier, LoginApplier
+from marrquee.plex import HttpPlexServer, HttpPlexTv, PlexServer, PlexTv, plex_host_address
 from marrquee.recyclarr import RecyclarrControl, RecyclarrMonitor
 from marrquee.routes.alive import router as alive_router
 from marrquee.routes.api import router as api_router
 from marrquee.routes.deploy import router as deploy_router
 from marrquee.routes.hub import router as hub_router
+from marrquee.routes.plex import PlexSignInStore
+from marrquee.routes.plex import router as plex_router
 from marrquee.routes.wizard import router as wizard_router
 from marrquee.same_origin import SameOriginGuard
 from marrquee.vpn_control import GluetunControl, HttpGluetunControl
@@ -54,6 +57,8 @@ def create_app(
     qbit_client: QbitClient | None = None,
     hardlinks: HardlinkMonitor | None = None,
     recyclarr: RecyclarrControl | None = None,
+    plex_tv: PlexTv | None = None,
+    plex_server: PlexServer | None = None,
 ) -> FastAPI:
     """Build the Marrquee app.
 
@@ -88,7 +93,20 @@ def create_app(
     `hardlinks=` too if that manager should ask for the same checks.
     `recyclarr=None` builds one real `RecyclarrMonitor(settings, engine)` the
     same way, handed to a freshly-built `DeployManager` as `recyclarr=` AND
-    kept on `app.state.recyclarr` for the Hub to read.
+    kept on `app.state.recyclarr` for the Hub to read. `plex_tv=None` and
+    `plex_server=None` each build one real `HttpPlexTv()`/`HttpPlexServer()`
+    the same way, handed to a freshly-built `DeployManager` as
+    `plex_tv=`/`plex_server=` AND kept on `app.state.plex_tv`/
+    `app.state.plex_server` for the sign-in routes to share. `plex_server` is
+    also handed to a freshly-built `WiringEngine` (only when no `wiring=` is
+    injected) alongside a closure over `engine` that resolves Marrquee's own
+    reachable address fresh on every wiring run - the wiring engine never
+    caches that address itself. An injected `manager=` keeps whichever pair
+    it was itself built with - a test that passes its own manager still
+    needs its own `plex_tv=`/`plex_server=` too if a route under test should
+    see that same fake. `app.state.plex_sign_in` is a fresh, in-memory
+    `PlexSignInStore` every time - the sign-in round trip's own pending pins
+    are never worth injecting or persisting.
     """
     if settings is None:
         settings = Settings.from_env()
@@ -102,6 +120,17 @@ def create_app(
         hardlinks = HardlinkMonitor(settings)
     if recyclarr is None:
         recyclarr = RecyclarrMonitor(settings, engine)
+    if plex_tv is None:
+        plex_tv = HttpPlexTv()
+    if plex_server is None:
+        plex_server = HttpPlexServer()
+
+    async def _plex_address() -> str | None:
+        # Resolved fresh on every wiring run (see `WiringEngine.run`), never
+        # cached here - Marrquee's own container can in principle change
+        # which network's gateway is reachable between one run and the next.
+        return await plex_host_address(engine, await engine.self_container_id())
+
     if manager is None:
         manager = DeployManager(
             settings,
@@ -110,7 +139,13 @@ def create_app(
             wiring=(
                 wiring
                 if wiring is not None
-                else WiringEngine(qbit=qbit_client, vpn=vpn_control, config_dir=settings.config_dir)
+                else WiringEngine(
+                    qbit=qbit_client,
+                    vpn=vpn_control,
+                    config_dir=settings.config_dir,
+                    plex=plex_server,
+                    plex_address=_plex_address,
+                )
             ),
             login=(
                 login_applier if login_applier is not None else HttpLoginApplier(qbit=qbit_client)
@@ -119,6 +154,8 @@ def create_app(
             qbit=qbit_client,
             hardlinks=hardlinks,
             recyclarr=recyclarr,
+            plex_tv=plex_tv,
+            plex_server=plex_server,
         )
     if link_probe is None:
         link_probe = HttpLinkProbe()
@@ -138,6 +175,9 @@ def create_app(
     app.state.qbit_client = qbit_client
     app.state.hardlinks = hardlinks
     app.state.recyclarr = recyclarr
+    app.state.plex_tv = plex_tv
+    app.state.plex_server = plex_server
+    app.state.plex_sign_in = PlexSignInStore()
     app.state.templates = Jinja2Templates(directory=_TEMPLATES_DIR)
 
     app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
@@ -146,5 +186,6 @@ def create_app(
     app.include_router(deploy_router)
     app.include_router(hub_router)
     app.include_router(wizard_router)
+    app.include_router(plex_router)
 
     return app

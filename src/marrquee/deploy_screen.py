@@ -241,7 +241,7 @@ def _links(apps: tuple[AppProgress, ...], authority: str | None) -> tuple[LinkVi
         catalog_app = _CATALOG_BY_ID.get(app.app_id)
         if catalog_app is not None and not catalog_app.web_page:
             continue
-        url = app_url(authority, app.port)
+        url = app_url(authority, app.port, path=catalog_app.web_path if catalog_app else "/")
         if url is not None:
             links.append(LinkView(label=open_app_label(app.name), url=url))
     return tuple(links)

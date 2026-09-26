@@ -225,6 +225,7 @@ class DockerEngine(Protocol):
     ) -> ContainerStopResult: ...
     async def exec_start(self, container: str, cmd: Sequence[str]) -> ExecStartResult: ...
     async def exec_inspect(self, exec_id: str) -> ExecState: ...
+    async def host_gateway(self, container: str) -> str | None: ...
 
 
 class SocketDockerEngine:
@@ -569,6 +570,23 @@ class SocketDockerEngine:
             detail=None,
         )
 
+    async def host_gateway(self, container: str) -> str | None:
+        try:
+            async with self._client() as client:
+                response = await client.get(f"/containers/{container}/json")
+        except (httpx.TimeoutException, httpx.ConnectError):
+            return None
+
+        if response.status_code != 200:
+            return None
+
+        try:
+            payload = response.json()
+        except ValueError:
+            return None
+
+        return _parse_host_gateway_payload(payload)
+
 
 def _classify_remove_response(response: httpx.Response) -> ContainerRemoveResult:
     """204 means removed, 404 means already gone - Cancel treats both as
@@ -729,6 +747,57 @@ def _parse_inspect_payload(name: str, payload: object) -> ContainerSnapshot:
     )
 
 
+# Mirrors compose.py's own `_NETWORK_NAME` literally, rather than importing
+# it - this module is a leaf (nothing under `marrquee.*` imports anything),
+# and the two constants have no reason to ever drift: compose only ever
+# names Marrquee's shared bridge network this one way.
+_MARRQUEE_NETWORK_NAME = "marrquee"
+
+
+def _parse_host_gateway_payload(payload: object) -> str | None:
+    """`GET /containers/{name}/json`'s payload, read for the one address a
+    host-networked Plex can be reached at from inside a container.
+
+    Marrquee itself running with `network_mode: host` answers every
+    request at `127.0.0.1` (there is no bridge gateway to read at all in
+    that case) - checked first, and regardless of `NetworkSettings`, since
+    Docker leaves a host-networked container's `Networks` map populated
+    with stale, unreachable entries. Otherwise, the `marrquee` network's
+    own gateway is preferred (the network this codebase actually manages);
+    falling back to the first non-empty IPv4 gateway, in network-name
+    order, covers Marrquee joined to nothing but a NAS app's own default
+    network.
+    """
+    if not isinstance(payload, dict):
+        return None
+
+    host_config = payload.get("HostConfig")
+    host_config = host_config if isinstance(host_config, dict) else {}
+    if host_config.get("NetworkMode") == "host":
+        return "127.0.0.1"
+
+    network_settings = payload.get("NetworkSettings")
+    network_settings = network_settings if isinstance(network_settings, dict) else {}
+    networks = network_settings.get("Networks")
+    networks = networks if isinstance(networks, dict) else {}
+
+    marrquee_network = networks.get(_MARRQUEE_NETWORK_NAME)
+    if isinstance(marrquee_network, dict):
+        gateway = marrquee_network.get("Gateway")
+        if isinstance(gateway, str) and gateway:
+            return gateway
+
+    for name in sorted(networks):
+        network = networks[name]
+        if not isinstance(network, dict):
+            continue
+        gateway = network.get("Gateway")
+        if isinstance(gateway, str) and gateway:
+            return gateway
+
+    return None
+
+
 def _docker_error_message(response: httpx.Response) -> str:
     """Docker's own `message` field from an error body, or the raw response
     text when the body isn't the JSON shape Docker normally sends.
@@ -848,6 +917,7 @@ class FakeDockerEngine:
         frames: Mapping[str, Sequence[ContainerSnapshot]] | None = None,
         exec_exit_codes: Mapping[str, int] | None = None,
         exec_running_polls: int = 0,
+        host_gateway: str | None = "172.18.0.1",
     ) -> None:
         self._status = status
         self._containers = dict(containers) if containers is not None else {}
@@ -883,6 +953,7 @@ class FakeDockerEngine:
         self._network_connects_override = network_connects
         self._network_exists = network_exists
         self._self_container_id = self_container_id
+        self._host_gateway = host_gateway
         self.calls: list[tuple[str, tuple[object, ...]]] = []
         # What a real Docker daemon uses to decide whether a recreate is a
         # no-op: the service's own rendered config, as last seen. Tracked
@@ -1051,3 +1122,11 @@ class FakeDockerEngine:
             exit_code=self._exec_exit_codes.get(container, 0),
             detail=None,
         )
+
+    async def host_gateway(self, container: str) -> str | None:
+        self.calls.append(("host_gateway", (container,)))
+        # An unknown container has no networks at all (docker-fakes-model-
+        # state) - only Marrquee's own self container ever gets an answer.
+        if container == self._self_container_id:
+            return self._host_gateway
+        return None

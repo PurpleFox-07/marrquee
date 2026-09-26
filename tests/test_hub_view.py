@@ -121,6 +121,15 @@ def test_a_down_or_starting_tile_has_no_url_and_no_aria_label() -> None:
     assert starting_view.tiles[0].line == "Sonarr is starting up."
 
 
+def test_plex_hub_tile_links_to_web() -> None:
+    health = _health("plex", state="up")
+
+    view = hub_view(["plex"], [health], authority=_AUTHORITY, proxied=False, now=_NOW)
+
+    tile = view.tiles[0]
+    assert tile.url == "http://192.168.1.50:32400/web"
+
+
 def test_a_not_sure_tile_keeps_its_url() -> None:
     health = _health("sonarr", state="unknown")
 
@@ -591,6 +600,7 @@ def test_installable_is_the_catalog_minus_the_deploy_in_catalog_order() -> None:
         "sonarr",
         "qbittorrent",
         "recyclarr",
+        "plex",
     ]
 
     every_id = [app.id for app in CATALOG]
@@ -745,7 +755,7 @@ def test_install_rows_exclude_the_app_being_added_and_grey_an_unavailable_one(
 
     ids = [row.app.id for row in view.install_rows]
     assert "sonarr" not in ids
-    assert ids == ["prowlarr", "radarr", "qbittorrent", "recyclarr"]
+    assert ids == ["prowlarr", "radarr", "qbittorrent", "recyclarr", "plex"]
     by_id = {row.app.id: row for row in view.install_rows}
     assert isinstance(by_id["radarr"], InstallRow)
     assert by_id["prowlarr"].unavailable is None
@@ -819,6 +829,45 @@ def test_an_already_installed_gluetun_never_repeats_its_own_step() -> None:
 
     by_id = {row.app.id: row for row in view.install_rows}
     assert [step.step_id for step in by_id["qbittorrent"].steps] == ["seeding"]
+
+
+# --- Plex's own row: needs_sign_in and sign_in_answers ------------------------
+
+
+def test_plex_row_needs_sign_in_until_a_sign_in_answer_is_saved() -> None:
+    unsigned = hub_view([], [], authority=_AUTHORITY, proxied=False, now=_NOW)
+    by_id = {row.app.id: row for row in unsigned.install_rows}
+    assert by_id["plex"].needs_sign_in is True
+    assert by_id["plex"].sign_in_answers == {}
+
+    signed_in = hub_view(
+        [],
+        [],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        answers={"plex": {"plex_account": "ryan"}},
+    )
+    by_id = {row.app.id: row for row in signed_in.install_rows}
+    assert by_id["plex"].needs_sign_in is False
+    assert by_id["plex"].sign_in_answers == {"plex_account": "ryan"}
+
+
+def test_sign_in_answers_never_carries_a_different_steps_saved_answer() -> None:
+    """qBittorrent's own row asks Gluetun's VPN question - none of it is a
+    `sign_in` field, so `sign_in_answers` must stay empty even when a VPN
+    password is genuinely saved for it.
+    """
+    view = hub_view(
+        [],
+        [],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        answers={"gluetun": {"wireguard_private_key": "top-secret"}},
+    )
+    by_id = {row.app.id: row for row in view.install_rows}
+    assert by_id["qbittorrent"].sign_in_answers == {}
 
 
 def test_a_starting_add_gets_a_spotlit_tile_with_no_url() -> None:

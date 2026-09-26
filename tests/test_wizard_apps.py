@@ -197,6 +197,7 @@ def test_a_saved_install_ticks_exactly_the_saved_apps(tmp_path: Path) -> None:
         "radarr": True,
         "qbittorrent": False,
         "recyclarr": False,
+        "plex": False,
     }
 
 
@@ -213,6 +214,7 @@ def test_an_unknown_id_in_the_query_string_is_dropped_not_a_500(tmp_path: Path) 
         "radarr": True,
         "qbittorrent": False,
         "recyclarr": False,
+        "plex": False,
     }
 
 

@@ -246,6 +246,14 @@
   outline-offset: 2px;
 }
 
+/* A `sign_in` field's own "Signed in to Plex as ..." line - shares the
+ * step's own type scale, never a distinct Plex brand colour. */
+.question-signed-in {
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  margin-bottom: var(--space-3);
+}
+
 /* --- The break-glass confirmation: the typed phrase and its two actions -
  * shared by the Hub's own "without-vpn" pane and the wizard's full page. */
 

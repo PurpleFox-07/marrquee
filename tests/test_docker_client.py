@@ -964,6 +964,123 @@ async def test_exec_inspect_parses_running_and_exit_code_and_404_is_unknown(dock
     assert unknown == ExecState(known=False, running=False, exit_code=None, detail=None)
 
 
+# --- host_gateway() ----------------------------------------------------------
+
+
+async def test_host_gateway_prefers_marrquee_falls_back_handles_host_mode(docker_stub):
+    """FIRST TEST - a Plex-only stack never creates the `marrquee` network
+    (compose only creates a service's own bridge network as a side effect of
+    a `compose up` that includes it), so Marrquee's own networks - not the
+    stack's - are the only reliable source of an address a host-networked
+    Plex can be reached at.
+    """
+    stub, socket_path = docker_stub
+    engine = SocketDockerEngine(socket_path=socket_path)
+
+    # Prefers the `marrquee` network's own gateway over any other network.
+    stub.respond_with_json(
+        {
+            "HostConfig": {"NetworkMode": "marrquee-apps_default"},
+            "NetworkSettings": {
+                "Networks": {
+                    "bridge": {"Gateway": "172.17.0.1"},
+                    "marrquee": {"Gateway": "172.19.0.1"},
+                }
+            },
+        }
+    )
+    assert await engine.host_gateway("self") == "172.19.0.1"
+    assert stub.request_lines[-1] == "GET /containers/self/json HTTP/1.1"
+
+    # No `marrquee` network: falls back to the first non-empty gateway, in
+    # network-name order - "bridge" sorts before "custom".
+    stub.respond_with_json(
+        {
+            "HostConfig": {"NetworkMode": "bridge"},
+            "NetworkSettings": {
+                "Networks": {
+                    "custom": {"Gateway": "172.20.0.1"},
+                    "bridge": {"Gateway": ""},
+                    "another": {"Gateway": "172.21.0.1"},
+                }
+            },
+        }
+    )
+    assert await engine.host_gateway("self") == "172.21.0.1"
+
+    # Marrquee itself is host-networked: 127.0.0.1, regardless of Networks.
+    stub.respond_with_json(
+        {
+            "HostConfig": {"NetworkMode": "host"},
+            "NetworkSettings": {"Networks": {"marrquee": {"Gateway": "172.19.0.1"}}},
+        }
+    )
+    assert await engine.host_gateway("self") == "127.0.0.1"
+
+
+async def test_host_gateway_returns_none_on_a_missing_container(docker_stub):
+    stub, socket_path = docker_stub
+    stub.respond_with_json(
+        {"message": "no such container: self"}, status_line="HTTP/1.1 404 Not Found"
+    )
+    engine = SocketDockerEngine(socket_path=socket_path)
+
+    assert await engine.host_gateway("self") is None
+
+
+async def test_host_gateway_returns_none_when_no_network_has_a_gateway(docker_stub):
+    stub, socket_path = docker_stub
+    stub.respond_with_json(
+        {
+            "HostConfig": {"NetworkMode": "bridge"},
+            "NetworkSettings": {"Networks": {"bridge": {"Gateway": ""}}},
+        }
+    )
+    engine = SocketDockerEngine(socket_path=socket_path)
+
+    assert await engine.host_gateway("self") is None
+
+
+async def test_host_gateway_returns_none_on_a_malformed_body(docker_stub):
+    stub, socket_path = docker_stub
+    stub.respond_with("HTTP/1.1 200 OK", b"not json")
+    engine = SocketDockerEngine(socket_path=socket_path)
+
+    assert await engine.host_gateway("self") is None
+
+
+async def test_host_gateway_returns_none_on_a_connection_error(tmp_path: Path) -> None:
+    engine = SocketDockerEngine(socket_path=tmp_path / "no-such.sock")
+
+    assert await engine.host_gateway("self") is None
+
+
+# --- FakeDockerEngine.host_gateway() -----------------------------------------
+
+
+async def test_fake_host_gateway_answers_only_for_the_self_container() -> None:
+    fake = FakeDockerEngine(DockerStatus(connected=True), self_container_id="marrquee")
+
+    address = await fake.host_gateway("marrquee")
+    unknown = await fake.host_gateway("sonarr")
+
+    assert address == "172.18.0.1"
+    assert unknown is None
+    assert fake.calls == [("host_gateway", ("marrquee",)), ("host_gateway", ("sonarr",))]
+
+
+async def test_fake_host_gateway_is_scriptable_and_can_be_turned_off() -> None:
+    fake = FakeDockerEngine(
+        DockerStatus(connected=True), self_container_id="marrquee", host_gateway="10.0.0.1"
+    )
+    assert await fake.host_gateway("marrquee") == "10.0.0.1"
+
+    off = FakeDockerEngine(
+        DockerStatus(connected=True), self_container_id="marrquee", host_gateway=None
+    )
+    assert await off.host_gateway("marrquee") is None
+
+
 # --- FakeDockerEngine.exec_start() / exec_inspect() -------------------------
 
 
@@ -1035,6 +1152,7 @@ async def test_the_fake_satisfies_the_widened_protocol_and_records_its_calls() -
     await fake.self_container_id()
     await fake.remove_container("sonarr")
     await fake.stop_container("sonarr")
+    await fake.host_gateway("abc")
 
     assert [name for name, _args in fake.calls] == [
         "status",
@@ -1046,6 +1164,7 @@ async def test_the_fake_satisfies_the_widened_protocol_and_records_its_calls() -
         "self_container_id",
         "remove_container",
         "stop_container",
+        "host_gateway",
     ]
 
 

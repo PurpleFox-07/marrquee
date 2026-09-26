@@ -422,6 +422,29 @@ _EXPECTED_INVENTORY = (
     "recyclarr_line_late",
     "recyclarr_line_failed",
     "recyclarr_line_app_down",
+    "PLEX_DESCRIPTION",
+    "PLEX_EXCLUDES_JELLYFIN",
+    "PLEX_STEP_TITLE",
+    "PLEX_STEP_LEDE",
+    "PLEX_ACCOUNT_LABEL",
+    "PLEX_SIGN_IN_BUTTON",
+    "PLEX_SIGN_IN_OTHER",
+    "plex_signed_in_as",
+    "PLEX_SIGN_IN_HINT",
+    "PLEX_PROBLEM_SIGN_IN_FIRST",
+    "PLEX_SIGN_IN_DIDNT_FINISH",
+    "PLEX_COMPOSE_COMMENT",
+    "MEDIA_LIBRARY_MOUNT_COMMENT",
+    "PLEX_SECRETS_MOUNT_COMMENT",
+    "FAILURE_PLEX_SIGN_IN_NEEDED",
+    "FAILURE_PLEX_NOT_CLAIMED",
+    "FAILURE_PLEX_PORT_TAKEN",
+    "wiring_line_libraries",
+    "PLEX_LIBRARY_MOVIES",
+    "PLEX_LIBRARY_TV",
+    "WIRING_LINE_PLEX_DIRECT_PLAY",
+    "PLEX_NOTE_DIRECT_PLAY",
+    "WIRING_PLEX_SIGN_IN_NEEDED",
 )
 
 _DEPLOY_ENGINE_WORD_COUNT = 40
@@ -437,6 +460,7 @@ _QBIT_WORD_COUNT = 29
 _VPN_CHANGE_WORD_COUNT = 32
 _DRIVE_WORD_COUNT = 27
 _RECYCLARR_WORD_COUNT = 24
+_PLEX_WORD_COUNT = 23
 
 
 def test_words_inventory_is_pinned() -> None:
@@ -785,9 +809,9 @@ def test_the_drive_section_precedes_the_recyclarr_section() -> None:
     assert "RECYCLARR_DESCRIPTION" not in drive_names
 
 
-def test_the_recyclarr_section_is_last() -> None:
-    """Recyclarr is the newest section. Later chunks in this story bump
-    `_RECYCLARR_WORD_COUNT` as they append more words to it.
+def test_the_recyclarr_section_precedes_the_plex_section() -> None:
+    """Recyclarr used to be the newest section - Plex now follows it, so
+    this slice is closed the same move every earlier story made.
     """
     recyclarr_start = (
         _DEPLOY_ENGINE_WORD_COUNT
@@ -803,14 +827,44 @@ def test_the_recyclarr_section_is_last() -> None:
         + _VPN_CHANGE_WORD_COUNT
         + _DRIVE_WORD_COUNT
     )
+    recyclarr_end = recyclarr_start + _RECYCLARR_WORD_COUNT
 
-    recyclarr_names = words.WORDS_INVENTORY[recyclarr_start:]
+    recyclarr_names = words.WORDS_INVENTORY[recyclarr_start:recyclarr_end]
 
-    assert recyclarr_names == _EXPECTED_INVENTORY[recyclarr_start:]
+    assert recyclarr_names == _EXPECTED_INVENTORY[recyclarr_start:recyclarr_end]
     assert recyclarr_names[0] == "RECYCLARR_DESCRIPTION"
-    assert len(words.WORDS_INVENTORY) == len(_EXPECTED_INVENTORY)
     assert len(recyclarr_names) == _RECYCLARR_WORD_COUNT
     assert "LINK_TEST_FILE_TEXT" not in recyclarr_names
+    assert "PLEX_DESCRIPTION" not in recyclarr_names
+
+
+def test_the_plex_section_is_last() -> None:
+    """Plex is the newest section. Later chunks in this story bump
+    `_PLEX_WORD_COUNT` as they append more words to it.
+    """
+    plex_start = (
+        _DEPLOY_ENGINE_WORD_COUNT
+        + _WIZARD_WORD_COUNT
+        + _WIRING_WORD_COUNT
+        + _DEPLOY_SCREEN_WORD_COUNT
+        + _HUB_WORD_COUNT
+        + _HUB_LINK_WORD_COUNT
+        + _HUB_INSTALL_WORD_COUNT
+        + _LOGIN_WORD_COUNT
+        + _VPN_WORD_COUNT
+        + _QBIT_WORD_COUNT
+        + _VPN_CHANGE_WORD_COUNT
+        + _DRIVE_WORD_COUNT
+        + _RECYCLARR_WORD_COUNT
+    )
+
+    plex_names = words.WORDS_INVENTORY[plex_start:]
+
+    assert plex_names == _EXPECTED_INVENTORY[plex_start:]
+    assert plex_names[0] == "PLEX_DESCRIPTION"
+    assert len(words.WORDS_INVENTORY) == len(_EXPECTED_INVENTORY)
+    assert len(plex_names) == _PLEX_WORD_COUNT
+    assert "RECYCLARR_DESCRIPTION" not in plex_names
 
 
 def test_drive_reason_and_todo_words_name_the_folder_and_match_content_direction() -> None:
@@ -1383,3 +1437,30 @@ def test_vpn_failure_functions_carry_the_companys_own_name() -> None:
     assert "Mullvad" in words.failure_vpn_refused("Mullvad")
     assert "Mullvad" in words.failure_vpn_settings_refused("Mullvad")
     assert "2" in words.failure_vpn_not_connected(2)
+
+
+def test_plex_words_never_call_it_a_media_server() -> None:
+    """The Alignment rule: "media server" names the whole setup, never
+    Plex on its own - every screen that names Plex says "Plex or Jellyfin".
+    """
+    for word in (
+        words.PLEX_DESCRIPTION,
+        words.PLEX_EXCLUDES_JELLYFIN,
+        words.PLEX_STEP_TITLE,
+        words.PLEX_STEP_LEDE,
+        words.PLEX_ACCOUNT_LABEL,
+        words.PLEX_SIGN_IN_HINT,
+        words.PLEX_PROBLEM_SIGN_IN_FIRST,
+        words.PLEX_SIGN_IN_DIDNT_FINISH,
+    ):
+        assert "media server" not in word.lower()
+
+
+def test_plex_sign_in_words_have_apostrophes_and_match_content_direction() -> None:
+    assert words.PLEX_SIGN_IN_BUTTON == "Sign in with Plex"
+    assert words.PLEX_STEP_TITLE == "Sign in with Plex"
+    assert words.PLEX_SIGN_IN_OTHER == "Use a different Plex account"
+    assert words.plex_signed_in_as("ryan") == "Signed in to Plex as ryan."
+    assert "didn't" in words.PLEX_SIGN_IN_DIDNT_FINISH
+    assert "can't" in words.PLEX_STEP_LEDE
+    assert "won't" in words.PLEX_STEP_LEDE

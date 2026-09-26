@@ -27,13 +27,14 @@ Quality = Literal["1080p", "4k"]
 DEFAULT_QUALITY: Final[Quality] = "1080p"
 TV_QUALITY_FIELD: Final = "tv_quality"
 MOVIE_QUALITY_FIELD: Final = "movie_quality"
+PLEX_ACCOUNT_FIELD: Final = "plex_account"
 
 _ANSWERS_FILE_NAME = "answers.json"
 _ANSWERS_VERSION = 1
 
 _STEP_ID_PATTERN = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 
-FieldKind = Literal["text", "password", "choice", "list"]
+FieldKind = Literal["text", "password", "choice", "list", "sign_in"]
 
 
 @dataclass(frozen=True)
@@ -334,6 +335,40 @@ MOVIE_QUALITY_STEP = QuestionStep(
 )
 
 
+# --- The Plex sign-in step: a `sign_in` field instead of a text box - the
+# owner never types "signed in", they press a button that lands them on
+# plex.tv and comes back to a route that writes this field for them. -------
+
+
+def _check_plex_step(answers: Mapping[str, str]) -> QuestionCheck:
+    account = answers.get(PLEX_ACCOUNT_FIELD, "")
+    if not account:
+        return QuestionCheck(
+            ok=False,
+            answers=answers,
+            problem=words.PLEX_PROBLEM_SIGN_IN_FIRST,
+            field=PLEX_ACCOUNT_FIELD,
+        )
+    return QuestionCheck(ok=True, answers=answers, problem=None, field=None)
+
+
+PLEX_STEP = QuestionStep(
+    app_id="plex",
+    step_id="sign-in",
+    title=words.PLEX_STEP_TITLE,
+    lede=words.PLEX_STEP_LEDE,
+    fields=(
+        QuestionField(
+            name=PLEX_ACCOUNT_FIELD,
+            label=words.PLEX_ACCOUNT_LABEL,
+            kind="sign_in",
+            hint=words.PLEX_SIGN_IN_HINT,
+        ),
+    ),
+    check=_check_plex_step,
+)
+
+
 # Read only through `question_steps_for`/`find_step`, both of which look up
 # this name from the module's own globals at call time, so a test can
 # monkeypatch `marrquee.questions.QUESTION_STEPS` and have both functions
@@ -343,6 +378,7 @@ QUESTION_STEPS: tuple[QuestionStep, ...] = (
     SEEDING_STEP,
     TV_QUALITY_STEP,
     MOVIE_QUALITY_STEP,
+    PLEX_STEP,
 )
 
 
@@ -393,10 +429,16 @@ def check_step(
     in `posted` is dropped. `text`, `choice` and `list` values are
     stripped; `password` never is, and a blank `password` keeps whatever
     was already saved for that field instead of overwriting it with
-    nothing.
+    nothing. A `sign_in` field never reads `posted` at all - a browser must
+    never be able to type "signed in": only the sign-in route itself ever
+    writes that field, so `check_step` always answers with whatever is
+    already saved for it.
     """
     cleaned: dict[str, str] = {}
     for field in step.fields:
+        if field.kind == "sign_in":
+            cleaned[field.name] = saved.get(field.name, "")
+            continue
         raw = posted.get(field.name, "")
         if not isinstance(raw, str):
             raw = ""

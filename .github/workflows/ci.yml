@@ -2189,6 +2189,274 @@ jobs:
             exit 1
           fi
 
+      # Plex is added to the in-memory compose plan only - install.json and
+      # the real compose.yaml on disk are never touched, so this fake claim
+      # code can never become part of the real install a later run
+      # continues from. Mirrors `DeployManager._stack_plan`'s own
+      # `without_vpn=without_vpn_confirmed(...)` call, because qBittorrent
+      # is already running without Gluetun at this point in the job and
+      # `build_stack_plan` would otherwise refuse the whole plan.
+      - name: Plex runs on the host network and Marrquee reaches it
+        run: |
+          set -euo pipefail
+
+          cat > "$RUNNER_TEMP/ci_plex_bring_up.py" <<'PY'
+          import asyncio
+          import os
+          from pathlib import Path, PurePosixPath
+
+          from marrquee.compose import build_stack_plan, render_compose
+          from marrquee.config import Settings
+          from marrquee.docker_client import SocketDockerEngine
+          from marrquee.install import with_app_added
+          from marrquee.plex import write_plex_claim
+          from marrquee.questions import load_answers
+          from marrquee.state import load_state
+          from marrquee.without_vpn import without_vpn_confirmed
+
+
+          async def main() -> None:
+              settings = Settings.from_env()
+              state = load_state(settings.config_dir)
+              if state is None:
+                  raise SystemExit("no install.json to grow")
+              answers = load_answers(settings.config_dir)
+
+              grown = with_app_added(state, "plex")
+              root = PurePosixPath(state.storage_root)
+              write_plex_claim(settings, root, "claim-marrquee-ci-not-real")
+
+              plan = build_stack_plan(
+                  grown, answers, without_vpn=without_vpn_confirmed(settings.config_dir)
+              )
+              compose_path = Path(
+                  f"/host{os.environ['RUNNER_TEMP']}/marrquee-smoke/ci-plex-compose.yaml"
+              )
+              compose_path.write_text(render_compose(plan))
+
+              engine = SocketDockerEngine(
+                  settings.docker_socket, compose_binary=settings.compose_binary
+              )
+              result = await engine.compose_up("marrquee-apps", compose_path, "plex")
+              if not result.ok:
+                  raise SystemExit(f"compose up for plex failed: {result.output}")
+              print("plex compose up: ok")
+
+
+          asyncio.run(main())
+          PY
+
+          docker cp "$RUNNER_TEMP/ci_plex_bring_up.py" marrquee-stack-smoke:/tmp/ci_plex_bring_up.py
+
+          pull_start=$(date +%s)
+          if ! bring_up_output=$(docker exec -e RUNNER_TEMP="$RUNNER_TEMP" marrquee-stack-smoke python3 /tmp/ci_plex_bring_up.py 2>&1) || [ -z "$bring_up_output" ]; then
+            echo "$bring_up_output"
+            echo "::error::Plex's in-memory compose bring-up failed"
+            exit 1
+          fi
+          echo "$bring_up_output"
+          pull_elapsed=$(( $(date +%s) - pull_start ))
+          echo "::notice::Plex's image pull and compose up took ${pull_elapsed}s"
+
+          if ! network_mode=$(docker inspect -f '{{.HostConfig.NetworkMode}}' plex) || [ -z "$network_mode" ]; then
+            echo "::error::couldn't inspect the plex container's network mode"
+            exit 1
+          fi
+          echo "plex network mode: $network_mode"
+          if [ "$network_mode" != "host" ]; then
+            echo "::error::Plex is not on the host network"
+            exit 1
+          fi
+
+          cat > "$RUNNER_TEMP/ci_plex_address.py" <<'PY'
+          import asyncio
+
+          from marrquee.config import Settings
+          from marrquee.docker_client import SocketDockerEngine
+          from marrquee.plex import plex_host_address
+
+
+          async def main() -> None:
+              settings = Settings.from_env()
+              engine = SocketDockerEngine(
+                  settings.docker_socket, compose_binary=settings.compose_binary
+              )
+              self_id = await engine.self_container_id()
+              address = await plex_host_address(engine, self_id)
+              if address is None:
+                  raise SystemExit("Marrquee could not work out its own reachable address")
+              print(address)
+
+
+          asyncio.run(main())
+          PY
+          docker cp "$RUNNER_TEMP/ci_plex_address.py" marrquee-stack-smoke:/tmp/ci_plex_address.py
+
+          if ! address=$(docker exec marrquee-stack-smoke python3 /tmp/ci_plex_address.py) || [ -z "$address" ]; then
+            echo "::error::Marrquee could not work out its own reachable address for Plex"
+            exit 1
+          fi
+          echo "plex address: $address"
+
+          cat > "$RUNNER_TEMP/ci_plex_identity.py" <<'PY'
+          import asyncio
+          import os
+
+          from marrquee.plex import HttpPlexServer, plex_base_url
+
+
+          async def main() -> None:
+              address = os.environ["PLEX_ADDRESS"]
+              server = HttpPlexServer()
+              identity = await server.identity(plex_base_url(address))
+              if identity is None:
+                  print("none")
+                  return
+              print("claimed" if identity.claimed else "unclaimed")
+
+
+          asyncio.run(main())
+          PY
+          docker cp "$RUNNER_TEMP/ci_plex_identity.py" marrquee-stack-smoke:/tmp/ci_plex_identity.py
+
+          identity_state=""
+          for _ in $(seq 1 60); do
+            identity_state=$(docker exec -e PLEX_ADDRESS="$address" marrquee-stack-smoke python3 /tmp/ci_plex_identity.py) || identity_state=""
+            echo "plex identity: $identity_state"
+            if [ -n "$identity_state" ] && [ "$identity_state" != "none" ]; then
+              break
+            fi
+            sleep 5
+          done
+          if [ "$identity_state" = "none" ] || [ -z "$identity_state" ]; then
+            echo "::error::Marrquee couldn't reach Plex through the host address ${address}"
+            exit 1
+          fi
+          if [ "$identity_state" != "unclaimed" ]; then
+            echo "::error::A fake claim code was reported as linked"
+            exit 1
+          fi
+
+          if ! docker exec marrquee-stack-smoke sh -c 'command -v grep' > /dev/null; then
+            echo "::error::grep is not available inside marrquee-stack-smoke to check Plex's own logs"
+            exit 1
+          fi
+          plex_logs=$(docker logs plex 2>&1 || true)
+          for phrase in "PLEX_CLAIM set from FILE__PLEX_CLAIM" "Unable to claim Plex server"; do
+            set +e
+            echo "$plex_logs" | grep -qF "$phrase"
+            found=$?
+            set -e
+            case "$found" in
+              0) ;;
+              1) echo "::error::Plex's own log never said: ${phrase}"; exit 1 ;;
+              *) echo "::error::couldn't check Plex's own logs for its claim code (grep exit ${found})"; exit 1 ;;
+            esac
+          done
+
+          # The web UI can lag `/identity` by a few seconds, so this polls
+          # rather than asserting a single request - and a connection
+          # refused (curl's own non-zero exit) must never abort the step
+          # silently under `set -euo pipefail`.
+          web_code=""
+          for _ in $(seq 1 12); do
+            web_code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:32400/web/index.html) || web_code=""
+            echo "plex /web/index.html: $web_code"
+            if [ "$web_code" = "200" ]; then
+              break
+            fi
+            sleep 5
+          done
+          if [ "$web_code" != "200" ]; then
+            echo "::error::Plex's /web/index.html did not answer 200 (got ${web_code})"
+            exit 1
+          fi
+
+      # WHICH USER runs this: linuxserver's own init reads the claim code as
+      # root, and only Marrquee is ever meant to see it - checked as root
+      # inside marrquee-stack-smoke, with a tool-exists check first and a
+      # POSITIVE CONTROL (the fake code IS found inside its own secrets
+      # file) before the real negative check, so a grep that could never
+      # find anything would fail loudly instead of passing by accident. The
+      # real compose.yaml on disk never carries Plex at all (it was only
+      # ever added in memory above), so this also stands as proof that
+      # in-memory experiment never leaked into it.
+      - name: Plex's one-time link code stays root-only
+        run: |
+          set -euo pipefail
+
+          secrets_dir="/host${RUNNER_TEMP}/marrquee-smoke/media/marrquee/plex"
+          claim_path="${secrets_dir}/plex_claim"
+          compose_path="/host${RUNNER_TEMP}/marrquee-smoke/media/marrquee/compose.yaml"
+
+          if ! docker exec marrquee-stack-smoke sh -c 'command -v stat' > /dev/null; then
+            echo "::error::stat is not available inside marrquee-stack-smoke to check Plex's secrets folder"
+            exit 1
+          fi
+          if ! dir_perms=$(docker exec marrquee-stack-smoke stat -c '%a %u' "$secrets_dir") || [ -z "$dir_perms" ]; then
+            echo "::error::couldn't stat Plex's secrets folder at ${secrets_dir}"
+            exit 1
+          fi
+          if [ "$dir_perms" != "700 0" ]; then
+            echo "::error::Plex's secrets folder was not 0700 owned by root (got: ${dir_perms})"
+            exit 1
+          fi
+          if ! file_perms=$(docker exec marrquee-stack-smoke stat -c '%a %u' "$claim_path") || [ -z "$file_perms" ]; then
+            echo "::error::couldn't stat Plex's claim file at ${claim_path}"
+            exit 1
+          fi
+          if [ "$file_perms" != "600 0" ]; then
+            echo "::error::Plex's claim file was not 0600 owned by root (got: ${file_perms})"
+            exit 1
+          fi
+
+          if ! docker exec marrquee-stack-smoke sh -c 'command -v grep' > /dev/null; then
+            echo "::error::grep is not available inside marrquee-stack-smoke to check for a leaked Plex claim code"
+            exit 1
+          fi
+          if ! docker exec marrquee-stack-smoke grep -qF "claim-marrquee-ci-not-real" "$claim_path"; then
+            echo "::error::the positive control failed - the fake claim code was not found in its own secrets file, so the check below would prove nothing"
+            exit 1
+          fi
+
+          set +e
+          docker exec marrquee-stack-smoke grep -qF "claim-marrquee-ci-not-real" "$compose_path"
+          leaked=$?
+          set -e
+          case "$leaked" in
+            1) ;;
+            0) echo "::error::the fake Plex claim code leaked into the real compose.yaml"; exit 1 ;;
+            *) echo "::error::couldn't check compose.yaml for a leaked Plex claim code (grep exit ${leaked})"; exit 1 ;;
+          esac
+
+          cat > "$RUNNER_TEMP/ci_plex_clear_claim.py" <<'PY'
+          from pathlib import PurePosixPath
+
+          from marrquee.config import Settings
+          from marrquee.plex import clear_plex_claim
+          from marrquee.state import load_state
+
+          settings = Settings.from_env()
+          state = load_state(settings.config_dir)
+          if state is None:
+              raise SystemExit("no install.json to read the storage root from")
+          clear_plex_claim(settings, PurePosixPath(state.storage_root))
+          PY
+          docker cp "$RUNNER_TEMP/ci_plex_clear_claim.py" marrquee-stack-smoke:/tmp/ci_plex_clear_claim.py
+          if ! docker exec marrquee-stack-smoke python3 /tmp/ci_plex_clear_claim.py; then
+            echo "::error::clear_plex_claim failed to run"
+            exit 1
+          fi
+
+          if ! remaining=$(docker exec marrquee-stack-smoke sh -c "ls -A '${secrets_dir}'"); then
+            echo "::error::couldn't list Plex's secrets folder after clearing the claim"
+            exit 1
+          fi
+          if [ -n "$remaining" ]; then
+            echo "::error::Plex's secrets folder was not empty after clear_plex_claim (${remaining})"
+            exit 1
+          fi
+
       # The one place technical detail is allowed to show up, and exactly
       # where a first-time developer needs it: a red run here is debuggable
       # from the workflow's own log, not just "it failed". The same text
@@ -2211,11 +2479,13 @@ jobs:
           docker logs marrquee-stack-smoke || true
           echo "---- docker logs recyclarr ----"
           docker logs recyclarr || true
+          echo "---- docker logs plex ----"
+          docker logs plex || true
 
       - name: Clean up every container, network and temp folder this job made
         if: always()
         run: |
-          docker rm -f prowlarr sonarr radarr gluetun qbittorrent recyclarr marrquee-stack-smoke 2>/dev/null || true
+          docker rm -f prowlarr sonarr radarr gluetun qbittorrent recyclarr plex marrquee-stack-smoke 2>/dev/null || true
           docker network rm marrquee 2>/dev/null || true
           # Some of what's under here (a container's own /config contents)
           # can be created by the Docker daemon as root, which would block a

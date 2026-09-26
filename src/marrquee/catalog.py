@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from typing import Final, Literal
 
 from marrquee.words import (
+    PLEX_DESCRIPTION,
+    PLEX_EXCLUDES_JELLYFIN,
     PROWLARR_DESCRIPTION,
     QBITTORRENT_DESCRIPTION,
     QBITTORRENT_DESCRIPTION_NO_VPN,
@@ -65,8 +67,12 @@ LoginKind = Literal["arr", "none", "qbittorrent"]
 # "sync" is Recyclarr: it has no web page and no port of its own either -
 # it reuses "downloader"'s no-web-page poster pattern rather than a second
 # poster mechanism, but is "ready" once its container is running, never
-# through an HTTP probe.
-AppKind = Literal["arr", "vpn", "downloader", "sync"]
+# through an HTTP probe. "media_server" is Plex (and, later, Jellyfin): the
+# one app the owner actually watches through - it has its own compose
+# shape and bring-up rules (no pre-generated API key, its own claim/sign-in
+# door), and `library_folders` names the shared library it opens onto
+# instead of a per-app media folder of its own.
+AppKind = Literal["arr", "vpn", "downloader", "sync", "media_server"]
 
 
 @dataclass(frozen=True)
@@ -100,6 +106,14 @@ class CatalogApp:
     install - an app whose normal description promises "only ever through
     your VPN" needs a second, honest sentence for the one deliberate
     exception that lets it run without one.
+
+    `web_path` is appended to `app_url`'s host and port - every arr app
+    keeps the default `"/"`, but Plex's own web UI lives at `/web`, and a
+    bare `:32400/` answers an unauthenticated 401 instead of the player.
+    `library_folders` names the shared `data/media/<m>` folders this app's
+    library opens onto (`plan_folders` plans them even when nothing else in
+    the install has a `media_folders` entry of its own) - unlike
+    `media_folders`, it never makes this app a Prowlarr sync partner.
     """
 
     id: str
@@ -122,18 +136,29 @@ class CatalogApp:
     api_key_style: Literal["hex32", "qbt"] = "hex32"
     network_via: str | None = None
     description_without_vpn: str = ""
+    web_path: str = "/"
+    library_folders: tuple[str, ...] = ()
 
 
 RECYCLARR_APP_ID: Final = "recyclarr"
+PLEX_APP_ID: Final = "plex"
+
+# The id every media-server door registers under - read by `media_server_of`
+# and, later, Stories 9/10's connect/Seerr flows, so a media-server-shaped
+# app never has to be spelled out as a literal a second time.
+MEDIA_SERVER_APP_IDS: Final = ("plex", "jellyfin")
 
 # Prowlarr, Sonarr, Radarr, Gluetun (the VPN tunnel), qBittorrent (the
-# downloader) and Recyclarr (quality settings from the TRaSH guides).
+# downloader), Recyclarr (quality settings from the TRaSH guides) and Plex
+# (a media server, linked to the owner's own Plex account).
 # Gluetun is `offered=False`: it never appears as its own "+" choice or
 # wizard tick - whatever needs it (qBittorrent, today) adds it as a
 # companion instead. qBittorrent's `network_via="gluetun"` is what enforces
 # "the downloader must never run outside the tunnel": it has no network or
 # API key of its own, and `build_stack_plan` refuses any install that has
-# it without Gluetun.
+# it without Gluetun. Plex keeps an ordinary, unused Marrquee API key (like
+# Recyclarr) - it authenticates only with the owner's own Plex account
+# token, never Marrquee's key.
 CATALOG: tuple[CatalogApp, ...] = (
     CatalogApp(
         id="prowlarr",
@@ -236,6 +261,27 @@ CATALOG: tuple[CatalogApp, ...] = (
         kind="sync",
         offered=True,
         login_kind="none",
+    ),
+    CatalogApp(
+        id=PLEX_APP_ID,
+        name="Plex",
+        description=PLEX_DESCRIPTION,
+        image="lscr.io/linuxserver/plex:latest",
+        port=32400,
+        env_prefix="PLEX",
+        api_base="",
+        media_folders=(),
+        needs_data_mount=False,
+        glyph="PX",
+        order=6,
+        default_ticked=False,
+        web_page=True,
+        rules=(AppRule(kind="excludes_any", app_ids=("jellyfin",), reason=PLEX_EXCLUDES_JELLYFIN),),
+        login_kind="none",
+        kind="media_server",
+        offered=True,
+        web_path="/web",
+        library_folders=("movies", "tv"),
     ),
 )
 
@@ -364,3 +410,17 @@ def riders_of(app_id: str, present: Iterable[str]) -> tuple[CatalogApp, ...]:
     that are actually part of this install.
     """
     return tuple(app for app in apps_in_order(present) if app.network_via == app_id)
+
+
+def media_server_of(app_ids: Iterable[str]) -> CatalogApp | None:
+    """The one `kind="media_server"` app among `app_ids`, in catalog order,
+    or `None` when it holds neither Plex nor Jellyfin.
+
+    Callers (Stories 8b/9/10) never have to know there can be at most one -
+    the "one media server per install" rule lives in the wizard/Hub refusal
+    (`AppRule("excludes_any", ...)` on each media-server entry), not here.
+    """
+    for app in apps_in_order(app_ids):
+        if app.kind == "media_server":
+            return app
+    return None

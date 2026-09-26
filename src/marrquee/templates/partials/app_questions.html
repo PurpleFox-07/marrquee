@@ -11,7 +11,11 @@
   a "Can't use a VPN right now?" link is drawn after the fields, leading to
   the break-glass confirmation. Every other step, and every step drawn with
   no `escape_url` in scope (the Change VPN pane's own form, among others),
-  never gets one.
+  never gets one. `sign_in_then` names which screen a `sign_in` field's
+  button should return to ("hub" or "wizard") - it falls back to "hub" for
+  every include that never sets it, since only Plex's own step ever draws
+  one. A `sign_in` field never renders an `<input>` at all: the owner's
+  account name comes from `/plex/signed-in`, never from typing it in.
 #}
 {% set step_key = step.app_id ~ ":" ~ step.step_id %}
 <fieldset class="question-step" data-question-step="{{ step_key }}">
@@ -80,6 +84,31 @@
     target="_blank"
     rel="noopener noreferrer"
   >{{ field.guide_label }}</a>
+  {% endif %}
+  {% elif field.kind == "sign_in" %}
+  {% if saved %}
+  <p class="question-signed-in" data-role="signed-in">{{ words.plex_signed_in_as(saved) }}</p>
+  <button
+    type="submit"
+    class="btn-ghost"
+    formaction="/plex/sign-in"
+    formmethod="post"
+    formnovalidate
+    name="then"
+    value="{{ sign_in_then|default('hub') }}"
+    data-sign-in="plex"
+  >{{ words.PLEX_SIGN_IN_OTHER }}</button>
+  {% else %}
+  <button
+    type="submit"
+    class="btn-primary"
+    formaction="/plex/sign-in"
+    formmethod="post"
+    formnovalidate
+    name="then"
+    value="{{ sign_in_then|default('hub') }}"
+    data-sign-in="plex"
+  >{{ words.PLEX_SIGN_IN_BUTTON }}</button>
   {% endif %}
   {% else %}
   <label class="field-label" for="{{ field_id }}">{{ field.label }}</label>

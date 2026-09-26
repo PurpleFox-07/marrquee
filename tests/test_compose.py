@@ -619,6 +619,106 @@ def test_arr_services_are_byte_for_byte_unchanged_by_the_recyclarr_branch() -> N
         assert _service_block(text, name) == _service_block(_GOLDEN_THREE_APP_COMPOSE, name)
 
 
+# --- Plex's own compose branch: host networking, no key, a read-only library -
+
+_PLEX_KEY = "7" * 32
+
+
+def _plex_state(app_ids: tuple[str, ...] = ("plex",)) -> InstallState:
+    all_keys = {"sonarr": _SONARR_KEY, "plex": _PLEX_KEY}
+    return InstallState(
+        version=STATE_VERSION,
+        storage_root="/volume1/media",
+        app_ids=app_ids,
+        api_keys={app_id: all_keys[app_id] for app_id in app_ids},
+        puid=1000,
+        pgid=1000,
+        umask="002",
+        timezone="Etc/UTC",
+        created="2026-09-19T00:00:00+00:00",
+    )
+
+
+def test_plex_service_uses_host_networking_and_joins_no_network() -> None:
+    """The name-the-network rule: a stack with Plex beside an arr app still
+    proves both what Plex joins (nothing - it shares the host's own network
+    namespace) and what the arr app joins (`marrquee`, exactly as before).
+    """
+    doc = _rendered_doc(_plex_state(("sonarr", "plex")))
+    services = _services(doc)
+
+    plex = services["plex"]
+    assert plex["network_mode"] == "host"
+    assert "networks" not in plex
+    assert "ports" not in plex
+    assert services["sonarr"]["networks"] == ["marrquee"]
+
+
+def test_plex_env_is_exact_and_carries_no_key() -> None:
+    state = _plex_state()
+    doc = _rendered_doc(state)
+    plex = _services(doc)["plex"]
+
+    environment = _environment(plex)
+    assert list(environment.keys()) == [
+        "PUID",
+        "PGID",
+        "TZ",
+        "UMASK",
+        "VERSION",
+        "FILE__PLEX_CLAIM",
+    ]
+    assert environment == {
+        "PUID": "1000",
+        "PGID": "1000",
+        "TZ": "Etc/UTC",
+        "UMASK": "002",
+        "VERSION": "docker",
+        "FILE__PLEX_CLAIM": "/run/secrets/plex_claim",
+    }
+
+    text = compose.render_compose(compose.build_stack_plan(state))
+    plex_block = _service_block(text, "plex")
+    for key in state.api_keys.values():
+        assert key not in plex_block
+    assert "__AUTH__" not in plex_block
+
+
+def test_plex_media_and_secrets_mounts_are_read_only() -> None:
+    doc = _rendered_doc(_plex_state())
+    volumes = _volumes(_services(doc)["plex"])
+
+    assert volumes == [
+        "/volume1/media/marrquee/apps/plex:/config",
+        "/volume1/media/data/media:/data/media:ro",
+        "/volume1/media/marrquee/plex:/run/secrets:ro",
+    ]
+
+
+def test_plex_secrets_mount_gets_the_plex_comment_never_the_vpn_comment() -> None:
+    """Design correction: both mounts end in the same `:/run/secrets:ro`
+    suffix Gluetun's own secrets mount uses, so the Plex-specific, longer
+    tail has to be checked first or Plex's folder would be captioned as
+    Gluetun's.
+    """
+    text = compose.render_compose(compose.build_stack_plan(_plex_state()))
+    plex_block = _service_block(text, "plex")
+    comments = _comment_text(plex_block)
+
+    assert words.PLEX_SECRETS_MOUNT_COMMENT in comments
+    assert words.VPN_SECRETS_MOUNT_COMMENT not in comments
+    assert words.MEDIA_LIBRARY_MOUNT_COMMENT in comments
+    assert words.PLEX_COMPOSE_COMMENT in comments
+
+
+def test_plex_does_not_disturb_an_arr_service_rendered_beside_it() -> None:
+    state = _plex_state(("sonarr", "plex"))
+
+    text = compose.render_compose(compose.build_stack_plan(state))
+
+    assert _service_block(text, "sonarr") == _service_block(_GOLDEN_THREE_APP_COMPOSE, "sonarr")
+
+
 # --- the single highest-consequence path bug in the story --------------------
 
 

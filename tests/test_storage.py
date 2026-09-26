@@ -333,6 +333,50 @@ def test_check_storage_root_refuses_a_root_that_is_a_symlink_to_a_system_path(
 # --- plan_folders: the pure, TRaSH-shaped folder tree -----------------------
 
 
+def test_plex_library_folders_are_planned_without_torrents() -> None:
+    """FIRST TEST - Plex has no `media_folders` of its own (it must never
+    look like a Prowlarr sync partner), so without this its `library_folders`
+    would plan nothing at all and the `:ro` media mount would have no
+    source.
+    """
+    assert storage.plan_folders(("plex",)) == (
+        PurePosixPath("data/media/movies"),
+        PurePosixPath("data/media/tv"),
+        PurePosixPath("marrquee"),
+        PurePosixPath("marrquee/apps/plex"),
+    )
+    for relative in storage.plan_folders(("plex",)):
+        assert not str(relative).startswith("data/torrents")
+
+
+def test_arr_only_folder_plan_is_unchanged_by_library_folders() -> None:
+    """Pinned byte-for-byte: adding Plex's `library_folders` mechanism must
+    never alter a plan with no media-server app in it.
+    """
+    assert storage.plan_folders(("sonarr", "radarr")) == (
+        PurePosixPath("data/torrents/tv"),
+        PurePosixPath("data/torrents/movies"),
+        PurePosixPath("data/media/tv"),
+        PurePosixPath("data/media/movies"),
+        PurePosixPath("marrquee"),
+        PurePosixPath("marrquee/apps/sonarr"),
+        PurePosixPath("marrquee/apps/radarr"),
+    )
+
+
+def test_a_plex_library_folder_already_planned_by_an_arr_app_is_not_duplicated() -> None:
+    result = storage.plan_folders(("sonarr", "plex"))
+
+    assert result == (
+        PurePosixPath("data/torrents/tv"),
+        PurePosixPath("data/media/tv"),
+        PurePosixPath("data/media/movies"),
+        PurePosixPath("marrquee"),
+        PurePosixPath("marrquee/apps/sonarr"),
+        PurePosixPath("marrquee/apps/plex"),
+    )
+
+
 def test_the_planned_tree_matches_trashs_shape_for_two_chosen_apps() -> None:
     assert storage.plan_folders(("sonarr", "radarr")) == (
         PurePosixPath("data/torrents/tv"),
@@ -473,6 +517,25 @@ def test_our_own_marker_makes_a_rerun_acceptable_even_with_files_present(tmp_pat
     check = storage.check_fresh_start(settings, root, ("radarr",))
 
     assert check.ok is True
+
+
+def test_a_populated_plex_library_folder_is_refused_on_a_first_deploy(tmp_path: Path) -> None:
+    """Plex's `library_folders` plan `data/media/<m>` the same as an arr
+    app's `media_folders` - a Plex-only install must refuse a target that
+    already holds someone else's library exactly the same way.
+    """
+    settings = Settings(host_mount=tmp_path)
+    root = PurePosixPath("/volume1/media")
+    container_root = tmp_path / "volume1" / "media"
+    movies_dir = container_root / "data" / "media" / "movies"
+    movies_dir.mkdir(parents=True)
+    (movies_dir / "Old Film.mkv").write_text("")
+
+    check = storage.check_fresh_start(settings, root, ("plex",))
+
+    assert check.ok is False
+    assert check.reason == "already_has_files"
+    assert check.occupied == ("data/media/movies",)
 
 
 def test_torrents_folders_do_not_count_toward_occupancy(tmp_path: Path) -> None:

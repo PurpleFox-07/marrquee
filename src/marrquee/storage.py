@@ -418,6 +418,12 @@ def plan_folders(app_ids: Iterable[str]) -> tuple[PurePosixPath, ...]:
     `data/torrents` is planned even for apps with no downloader yet, so a
     later cycle never has to restructure an owner's live library to add
     one.
+
+    An app's own `library_folders` (Plex's Movies and TV Shows) plan a
+    `data/media/<m>` entry the same way `media_folders` does, but never a
+    matching `data/torrents/<m>` - a media server has nothing to download
+    into, only a shared library to open onto, so it must never look like a
+    Prowlarr sync partner or gain a torrents folder of its own.
     """
     apps = apps_in_order(app_ids)
 
@@ -434,6 +440,14 @@ def plan_folders(app_ids: Iterable[str]) -> tuple[PurePosixPath, ...]:
         # root on first start, and the downloader couldn't write to it.
         planned.append(PurePosixPath("data", "torrents"))
     planned += [PurePosixPath("data", "media", media) for media in media_types]
+
+    library_only_types: list[str] = []
+    for app in apps:
+        for library_folder in app.library_folders:
+            if library_folder not in media_types and library_folder not in library_only_types:
+                library_only_types.append(library_folder)
+    planned += [PurePosixPath("data", "media", media) for media in library_only_types]
+
     planned.append(PurePosixPath("marrquee"))
     planned += [PurePosixPath("marrquee", "apps", app.id) for app in apps]
     return tuple(planned)

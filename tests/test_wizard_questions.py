@@ -9,6 +9,8 @@ No catalog app has a question yet, so every test here monkeypatches
 from __future__ import annotations
 
 import dataclasses
+import html
+import re
 from pathlib import Path
 
 import pytest
@@ -20,7 +22,13 @@ from marrquee.config import Settings
 from marrquee.deploy import AppProgress, DeploySnapshot
 from marrquee.docker_client import DockerStatus, FakeDockerEngine
 from marrquee.main import create_app
-from marrquee.questions import QuestionCheck, QuestionField, QuestionStep, load_answers
+from marrquee.questions import (
+    QuestionCheck,
+    QuestionField,
+    QuestionStep,
+    load_answers,
+    save_step_answers,
+)
 from marrquee.state import write_json_atomic
 
 
@@ -313,3 +321,70 @@ def test_the_question_page_loads_questions_js_with_defer(
     assert response.status_code == 200
     assert "<script defer" in response.text
     assert "js/questions.js" in response.text
+
+
+# --- Plex's own real step: a sign-in field, not a text box -------------------
+#
+# Uses the real, registered `PLEX_STEP` rather than a fixture - the whole
+# point here is `check_step`'s own "a posted value is never read" rule for a
+# `sign_in` field, and the actual refusal/confirmation wording.
+
+
+def test_wizard_next_without_signing_in_is_refused_on_plex_account(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    client = _client(settings)
+
+    response = client.post(
+        "/setup/questions/plex/sign-in",
+        data={"apps": "plex", "plex_account": "typed-by-a-browser"},
+    )
+
+    assert response.status_code == 200
+    assert words.PLEX_PROBLEM_SIGN_IN_FIRST in html.unescape(response.text)
+    assert load_answers(settings.config_dir).get("plex", {}) == {}
+
+
+def test_a_saved_sign_in_lets_the_wizard_step_move_on(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_step_answers(settings.config_dir, "plex", {"plex_account": "ryan"})
+    client = _client(settings)
+
+    response = client.post(
+        "/setup/questions/plex/sign-in", data={"apps": "plex"}, follow_redirects=False
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/setup/drive?apps=plex"
+
+
+def test_the_plex_step_shows_signed_in_as_once_a_sign_in_is_saved(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_step_answers(settings.config_dir, "plex", {"plex_account": "ryan"})
+    client = _client(settings)
+
+    response = client.get("/setup/questions/plex/sign-in", params={"apps": "plex"})
+
+    assert response.status_code == 200
+    assert words.plex_signed_in_as("ryan") in html.unescape(response.text)
+    assert "<input" not in _fieldset(response.text, "plex:sign-in")
+
+
+def test_an_abandoned_sign_in_shows_the_wizard_refusal(tmp_path: Path) -> None:
+    client = _client(_settings(tmp_path))
+
+    response = client.get(
+        "/setup/questions/plex/sign-in", params={"apps": "plex", "sign_in": "failed"}
+    )
+
+    assert response.status_code == 200
+    assert words.PLEX_SIGN_IN_DIDNT_FINISH in html.unescape(response.text)
+
+
+def _fieldset(page_html: str, step_key: str) -> str:
+    match = re.search(
+        rf'<fieldset[^>]*data-question-step="{re.escape(step_key)}".*?</fieldset>',
+        page_html,
+        re.DOTALL,
+    )
+    assert match is not None, f"no fieldset found for {step_key!r}"
+    return match.group(0)

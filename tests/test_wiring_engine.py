@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from marrquee import questions, words
+from marrquee.plex import FakePlexServer, PlexResponse, save_plex_sign_in
 from marrquee.state import STATE_VERSION, InstallState
 from marrquee.vpn_control import FakeGluetunControl
 from marrquee.wiring import WiringRunner, WiringStep
@@ -23,6 +24,8 @@ from marrquee.wiring.engine import (
     AppSyncTask,
     DownloadClientTask,
     ExplainTask,
+    PlexDirectPlayTask,
+    PlexLibrariesTask,
     QbitSettingsTask,
     RootFolderTask,
     WiringEngine,
@@ -817,3 +820,200 @@ async def test_a_category_failure_stops_before_the_client_is_ever_written() -> N
     frames = _frames_by_key(steps)["download-client:sonarr"]
     assert frames[-1].state == "error"
     assert not any(call[2].startswith("api/v3/downloadclient") for call in fake_arr.calls)
+
+
+# --- plan_wiring: Plex's libraries and direct-play tasks --------------------
+
+
+def _plex_ok(payload: object = None, status: int = 200) -> PlexResponse:
+    return PlexResponse(ok=True, status=status, payload=payload, detail=None)
+
+
+def _plex_prefs_on() -> PlexResponse:
+    return _plex_ok(
+        {"MediaContainer": {"Setting": [{"id": "TranscoderCanOnlyRemuxVideo", "value": True}]}}
+    )
+
+
+def _plex_no_libraries() -> PlexResponse:
+    return _plex_ok({"MediaContainer": {"Directory": []}})
+
+
+async def _no_plex_address() -> str | None:
+    return None
+
+
+async def _fake_plex_address() -> str | None:
+    return "192.168.1.5"
+
+
+def test_plan_wiring_appends_the_plex_tasks_last_only_when_plex_is_installed() -> None:
+    state = _install_state(("prowlarr", "sonarr", "plex"))
+
+    keys = [task.key for task in plan_wiring(state)]
+
+    assert keys == [
+        "app-sync:sonarr",
+        "root-folder:sonarr",
+        "libraries:plex",
+        "direct-play:plex",
+    ]
+
+    without_plex_keys = [task.key for task in plan_wiring(_install_state(("prowlarr", "sonarr")))]
+    assert "libraries:plex" not in without_plex_keys
+    assert "direct-play:plex" not in without_plex_keys
+
+
+def test_plex_tasks_about_equals_involved() -> None:
+    tasks = {task.key: task for task in plan_wiring(_install_state(("plex",)))}
+
+    libraries = tasks["libraries:plex"]
+    assert isinstance(libraries, PlexLibrariesTask)
+    assert libraries.involved == ("plex",)
+    assert libraries.about == libraries.involved
+
+    direct_play = tasks["direct-play:plex"]
+    assert isinstance(direct_play, PlexDirectPlayTask)
+    assert direct_play.involved == ("plex",)
+    assert direct_play.about == direct_play.involved
+
+
+def test_plex_task_lines_match_content_direction() -> None:
+    tasks = {task.key: task for task in plan_wiring(_install_state(("plex",)))}
+
+    assert tasks["libraries:plex"].line == words.wiring_line_libraries("Plex")
+    assert tasks["direct-play:plex"].line == words.WIRING_LINE_PLEX_DIRECT_PLAY
+
+
+# --- WiringEngine.run: resolving Plex's address and saved token ------------
+
+
+async def test_missing_plex_address_reports_unreachable_for_both_tasks() -> None:
+    engine = WiringEngine(
+        client=FakeArrClient({}),
+        plex=FakePlexServer(),
+        plex_address=_no_plex_address,
+    )
+    steps: list[WiringStep] = []
+
+    await engine.run(_install_state(("plex",)), steps.append)
+
+    frames = _frames_by_key(steps)
+    assert frames["libraries:plex"][-1].state == "error"
+    assert frames["libraries:plex"][-1].note == words.wiring_failure_unreachable("Plex")
+    assert frames["direct-play:plex"][-1].state == "error"
+    assert frames["direct-play:plex"][-1].note == words.wiring_failure_unreachable("Plex")
+
+
+async def test_missing_plex_token_reports_sign_in_needed(tmp_path: Path) -> None:
+    engine = WiringEngine(
+        client=FakeArrClient({}),
+        plex=FakePlexServer(),
+        plex_address=_fake_plex_address,
+        config_dir=tmp_path,
+    )
+    steps: list[WiringStep] = []
+
+    await engine.run(_install_state(("plex",)), steps.append)
+
+    frames = _frames_by_key(steps)
+    assert frames["libraries:plex"][-1].state == "error"
+    assert frames["libraries:plex"][-1].note == words.WIRING_PLEX_SIGN_IN_NEEDED
+    assert frames["direct-play:plex"][-1].state == "error"
+    assert frames["direct-play:plex"][-1].note == words.WIRING_PLEX_SIGN_IN_NEEDED
+
+
+async def test_plex_tasks_use_the_resolved_address_and_saved_token(tmp_path: Path) -> None:
+    save_plex_sign_in(tmp_path, "the-plex-token", "owner")
+    server = FakePlexServer(
+        script={
+            ("GET", "/library/sections"): [_plex_no_libraries()],
+            ("POST", "/library/sections"): [_plex_ok(), _plex_ok()],
+            ("GET", "/:/prefs"): [_plex_prefs_on()],
+        }
+    )
+    engine = WiringEngine(
+        client=FakeArrClient({}),
+        plex=server,
+        plex_address=_fake_plex_address,
+        config_dir=tmp_path,
+    )
+    steps: list[WiringStep] = []
+
+    await engine.run(_install_state(("plex",)), steps.append)
+
+    frames = _frames_by_key(steps)
+    assert frames["libraries:plex"][-1].state == "done"
+    assert frames["direct-play:plex"][-1].state == "done"
+
+
+async def test_a_401_from_plex_is_retried_then_errors(tmp_path: Path) -> None:
+    save_plex_sign_in(tmp_path, "the-plex-token", "owner")
+    server = FakePlexServer(
+        script={
+            ("GET", "/library/sections"): [
+                PlexResponse(ok=False, status=401, payload=None, detail=None) for _ in range(4)
+            ],
+            ("GET", "/:/prefs"): [_plex_prefs_on()],
+        }
+    )
+    clock = _FakeClock()
+    engine = WiringEngine(
+        client=FakeArrClient({}),
+        plex=server,
+        plex_address=_fake_plex_address,
+        config_dir=tmp_path,
+        clock=clock.time,
+        sleep=clock.sleep,
+        attempts=4,
+    )
+    steps: list[WiringStep] = []
+
+    await engine.run(_install_state(("plex",)), steps.append)
+
+    frames = _frames_by_key(steps)
+    assert frames["libraries:plex"][-1].state == "error"
+    gets = [call for call in server.calls if call[0] == "GET" and call[1] == "/library/sections"]
+    assert len(gets) == 4
+
+
+async def test_plex_free_run_never_resolves_the_plex_address_or_reads_plex_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A plex-free install must cost nothing extra: `plex_address()` and the
+    plex.json loader must never even be CALLED, not merely "answer nothing" -
+    the cost of the Plex feature must be zero for every install that never
+    added Plex.
+    """
+    import marrquee.wiring.engine as engine_module
+
+    address_calls: list[None] = []
+
+    async def _recording_address() -> str | None:
+        address_calls.append(None)
+        return None
+
+    load_calls: list[Path] = []
+
+    def _recording_load(config_dir: Path) -> None:
+        load_calls.append(config_dir)
+        return None
+
+    monkeypatch.setattr(engine_module, "load_plex_account", _recording_load)
+
+    fake = FakeArrClient(
+        {
+            ("GET", "http://sonarr:8989", "api/v3/system/status"): [_ok(None)],
+            ("GET", "http://sonarr:8989", "api/v3/rootfolder"): [
+                _ok([{"id": 1, "path": "/data/media/tv"}])
+            ],
+        }
+    )
+    engine = WiringEngine(client=fake, config_dir=tmp_path, plex_address=_recording_address)
+    steps: list[WiringStep] = []
+
+    await engine.run(_install_state(("sonarr",)), steps.append)
+
+    assert address_calls == []
+    assert load_calls == []
+    assert _frames_by_key(steps)["root-folder:sonarr"][-1].state == "done"

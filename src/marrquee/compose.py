@@ -31,6 +31,7 @@ from marrquee.catalog import (
     riders_of,
 )
 from marrquee.config import Settings
+from marrquee.plex import plex_secrets_host_path
 from marrquee.state import InstallState
 from marrquee.storage import ChownFn, to_host_view
 from marrquee.vpn import GluetunConfig, build_gluetun_config
@@ -39,6 +40,9 @@ from marrquee.words import (
     DATA_MOUNT_COMMENT,
     DOWNLOADER_COMPOSE_COMMENT,
     DOWNLOADER_NO_VPN_COMPOSE_COMMENT,
+    MEDIA_LIBRARY_MOUNT_COMMENT,
+    PLEX_COMPOSE_COMMENT,
+    PLEX_SECRETS_MOUNT_COMMENT,
     RECYCLARR_COMPOSE_COMMENT,
     VPN_SECRETS_MOUNT_COMMENT,
 )
@@ -68,6 +72,14 @@ _VPN_CONFIG_MOUNT_SUFFIX = ":/gluetun"
 # Read-only: Gluetun reads its login from here, but nothing it does should
 # ever be able to write back into Marrquee's own root-only copy of it.
 _VPN_SECRETS_MOUNT_SUFFIX = ":/run/secrets:ro"
+# Plex's own read-only library mount - distinct from `_DATA_MOUNT_SUFFIX`
+# (":/data"), which the arr apps' whole shared `/data` mount ends with, so
+# neither one is ever mistaken for the other's comment.
+_MEDIA_LIBRARY_MOUNT_SUFFIX = ":/data/media:ro"
+# Plex's own secrets mount ends in the same ":/run/secrets:ro" Gluetun's
+# does - this longer, host-path-anchored tail is what tells the two apart,
+# and it must be checked before `_VPN_SECRETS_MOUNT_SUFFIX` below.
+_PLEX_SECRETS_MOUNT_TAIL = "/marrquee/plex:/run/secrets:ro"
 _COMMENT_WIDTH = 78
 
 
@@ -189,6 +201,9 @@ def _service_plan(
 
     if app.kind == "sync":
         return _recyclarr_service_plan(app, state, root)
+
+    if app.kind == "media_server":
+        return _plex_service_plan(app, state, root)
 
     try:
         api_key = state.api_keys[app.id]
@@ -388,6 +403,49 @@ def _recyclarr_service_plan(
     )
 
 
+def _plex_service_plan(app: CatalogApp, state: InstallState, root: PurePosixPath) -> ServicePlan:
+    """Plex's own branch: host networking, no key in its environment, and a
+    claim code read through a file rather than written into this file.
+
+    linuxserver's own README recommends `network_mode: host` over publishing
+    Plex's port on a bridge network - bridged, Plex would see itself at a
+    172.x address and present that to every LAN TV and phone, breaking the
+    direct play and local discovery the owner asked for. Host networking
+    means no `ports:` and no `networks:` of its own (`ServicePlan.ports=()`
+    and `network_mode="host"` are what make `_render_service` skip both).
+    `VERSION=docker` and `FILE__PLEX_CLAIM` are linuxserver's own baseimage
+    convention for handing a container a secret without ever writing it
+    into this file - the claim code is only good for a few minutes, and a
+    compose.yaml value would go stale the moment the owner reread it. This
+    branch never reads `state.api_keys`: the owner's own Plex account,
+    saved separately by the sign-in door, is Plex's only credential.
+    """
+    config_mount = f"{root / 'marrquee' / 'apps' / app.id}{_CONFIG_MOUNT_SUFFIX}"
+    media_mount = f"{root / 'data' / 'media'}{_MEDIA_LIBRARY_MOUNT_SUFFIX}"
+    secrets_mount = f"{plex_secrets_host_path(root)}{_VPN_SECRETS_MOUNT_SUFFIX}"
+
+    environment: tuple[tuple[str, str], ...] = (
+        ("PUID", str(state.puid)),
+        ("PGID", str(state.pgid)),
+        ("TZ", state.timezone),
+        ("UMASK", state.umask),
+        ("VERSION", "docker"),
+        ("FILE__PLEX_CLAIM", "/run/secrets/plex_claim"),
+    )
+
+    return ServicePlan(
+        app_id=app.id,
+        service=app.id,
+        image=app.image,
+        container_name=app.id,
+        ports=(),
+        environment=environment,
+        volumes=(config_mount, media_mount, secrets_mount),
+        comment=f"{app.description} {PLEX_COMPOSE_COMMENT}",
+        network_mode="host",
+    )
+
+
 def render_compose(plan: StackPlan) -> str:
     """Render `plan` as a human-readable Docker Compose file.
 
@@ -444,6 +502,17 @@ def _render_service(service: ServicePlan, network: str) -> list[str]:
     for volume in service.volumes:
         if volume.endswith(_DATA_MOUNT_SUFFIX):
             lines.extend(f"      {comment}" for comment in _comment_lines(DATA_MOUNT_COMMENT))
+        elif volume.endswith(_MEDIA_LIBRARY_MOUNT_SUFFIX):
+            lines.extend(
+                f"      {comment}" for comment in _comment_lines(MEDIA_LIBRARY_MOUNT_COMMENT)
+            )
+        # Checked before `_VPN_SECRETS_MOUNT_SUFFIX` below: both end in the
+        # same ":/run/secrets:ro", and this longer, host-path-anchored tail
+        # is what tells Plex's own secrets mount apart from Gluetun's.
+        elif volume.endswith(_PLEX_SECRETS_MOUNT_TAIL):
+            lines.extend(
+                f"      {comment}" for comment in _comment_lines(PLEX_SECRETS_MOUNT_COMMENT)
+            )
         elif volume.endswith(_VPN_SECRETS_MOUNT_SUFFIX):
             lines.extend(
                 f"      {comment}" for comment in _comment_lines(VPN_SECRETS_MOUNT_COMMENT)

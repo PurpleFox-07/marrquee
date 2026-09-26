@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import re
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -44,6 +45,13 @@ from marrquee.deploy import (
 from marrquee.docker_client import ComposeResult
 from marrquee.login import SavedLogin, load_login, save_login
 from marrquee.login_apply import FakeLoginApplier, LoginApplyResult
+from marrquee.plex import (
+    FakePlexServer,
+    FakePlexTv,
+    load_plex_account,
+    save_plex_sign_in,
+    write_plex_claim,
+)
 from marrquee.questions import save_step_answers
 from marrquee.recyclarr import recyclarr_config_host_path
 from marrquee.state import InstallState, load_state, save_state, write_json_atomic
@@ -476,6 +484,66 @@ async def test_cancel_of_a_failed_recyclarr_add_removes_the_container_and_its_co
     after_cancel = load_state(settings.config_dir)
     assert after_cancel is not None
     assert after_cancel.app_ids == ("prowlarr", "sonarr")
+
+
+async def test_adding_plex_mints_an_ordinary_api_key(tmp_path: Path) -> None:
+    """Plex has no `api_key_source` field (the plan refresh amendment) - it
+    mints an ordinary, unused hex32 key the same way Recyclarr does, through
+    the exact same `with_app_added` growth every other add goes through.
+    """
+    manager, engine, settings = await _deployed_to_finale(tmp_path, ("prowlarr", "sonarr"))
+    manager._plex_tv = FakePlexTv()  # type: ignore[attr-defined]
+    manager._plex_server = FakePlexServer()  # type: ignore[attr-defined]
+    save_plex_sign_in(settings.config_dir, "tok-secret-123", "owner")
+    # Plex's own bring-up isn't the point of this test - a fast, scripted
+    # compose failure is enough to prove the key was already minted and
+    # saved before Docker was ever asked to do anything.
+    engine._compose_results["plex"] = ComposeResult(  # type: ignore[attr-defined]
+        ok=False, exit_code=1, output="Error: something went wrong"
+    )
+
+    manager.add_app("plex")
+    await _finish_add(manager)
+
+    grown = load_state(settings.config_dir)
+    assert grown is not None
+    assert re.fullmatch(r"[0-9a-f]{32}", grown.api_keys.get("plex", ""))
+
+
+async def test_cancel_of_a_failed_plex_add_clears_the_claim_file(tmp_path: Path) -> None:
+    manager, engine, settings = await _deployed_to_finale(tmp_path, ("prowlarr", "sonarr"))
+    manager._plex_tv = FakePlexTv()  # type: ignore[attr-defined]
+    manager._plex_server = FakePlexServer()  # type: ignore[attr-defined]
+    save_plex_sign_in(settings.config_dir, "tok-secret-123", "owner")
+    engine._compose_results["plex"] = ComposeResult(  # type: ignore[attr-defined]
+        ok=False, exit_code=1, output="Error: something went wrong"
+    )
+
+    manager.add_app("plex")
+    failed = await _finish_add(manager)
+    assert failed.adding is not None and failed.adding.state == "error"
+
+    grown = load_state(settings.config_dir)
+    assert grown is not None and grown.storage_root is not None
+    root = PurePosixPath(grown.storage_root)
+    claim_file = to_host_view(settings, str(root)) / "marrquee" / "plex" / "plex_claim"
+    # The bring-up's own `finally` already cleared whatever it wrote - a
+    # fresh file gives Cancel's own `clear_plex_claim` call something real
+    # of its own to clear.
+    write_plex_claim(settings, root, "claim-still-here")
+    assert claim_file.exists()
+
+    ok = await manager.cancel_add()
+    assert ok is True
+    assert any(call[0] == "remove_container" and call[1] == ("plex",) for call in engine.calls)
+    assert not claim_file.exists()
+
+    after_cancel = load_state(settings.config_dir)
+    assert after_cancel is not None
+    assert after_cancel.app_ids == ("prowlarr", "sonarr")
+    # Cancel undoes the ADD, never the sign-in - plex.json survives so the
+    # owner isn't asked to sign in with Plex again on the next attempt.
+    assert load_plex_account(settings.config_dir) is not None
 
 
 async def test_cancel_of_a_failed_add_rewrites_compose_still_holding_gluetun(

@@ -20,6 +20,7 @@ from pathlib import Path, PurePosixPath
 from typing import Final, Protocol
 
 from marrquee.catalog import CATALOG, CatalogApp, apps_in_order
+from marrquee.plex import HttpPlexServer, PlexServer, load_plex_account, plex_base_url
 from marrquee.qbittorrent import QBIT_BASE_PREFERENCES
 from marrquee.questions import load_answers
 from marrquee.seeding import seeding_preferences
@@ -28,6 +29,7 @@ from marrquee.storage import container_media_path, host_media_path
 from marrquee.vpn_control import GluetunControl, NoGluetunControl
 from marrquee.wiring import WiringStep, WiringStepState
 from marrquee.wiring.arr_client import ArrClient, HttpArrClient
+from marrquee.wiring.plex_steps import ensure_plex_direct_play, ensure_plex_libraries
 from marrquee.wiring.qbit_client import HttpQbitClient, QbitClient
 from marrquee.wiring.steps import (
     StepOutcome,
@@ -44,12 +46,15 @@ from marrquee.words import (
     WIRING_CHIP_ERROR,
     WIRING_CHIP_RUNNING,
     WIRING_CHIP_SKIPPED,
+    WIRING_LINE_PLEX_DIRECT_PLAY,
     WIRING_NOTHING_TO_CONNECT,
+    WIRING_PLEX_SIGN_IN_NEEDED,
     WIRING_SKIP_PROWLARR_ALONE,
     wiring_failure_unreachable,
     wiring_line_app_sync,
     wiring_line_download_client,
     wiring_line_downloader_settings,
+    wiring_line_libraries,
     wiring_line_root_folder,
     wiring_note_still_waking,
     wiring_skip_no_prowlarr,
@@ -82,7 +87,9 @@ class WiringContext:
     ordinary arr-only run never touches either. `answers` is read fresh at
     the start of every `run()` (see `WiringEngine.run`), never cached across
     runs, so a "Change seeding" saved a moment ago is what the very next
-    wiring run actually applies.
+    wiring run actually applies. `plex_base_url`/`plex_token` are resolved
+    once per run, only when a Plex task is actually planned - both stay
+    None otherwise, and a plan with no Plex task never reads `plex` at all.
     """
 
     client: ArrClient
@@ -91,6 +98,9 @@ class WiringContext:
     qbit: QbitClient
     vpn: GluetunControl
     answers: Mapping[str, Mapping[str, str]]
+    plex: PlexServer | None = None
+    plex_base_url: str | None = None
+    plex_token: str | None = None
 
 
 class WiringTask(Protocol):
@@ -284,6 +294,79 @@ class DownloadClientTask:
         )
 
 
+def _plex_precheck(ctx: WiringContext) -> StepOutcome | None:
+    """The one check both Plex tasks make before calling their own `ensure_*`
+    function - neither ever gets a real address or token to hand it a bare
+    `None`. Not an outcome from Plex itself, so it's never transient: the
+    engine's own retry budget has nothing to gain from repeating it.
+    """
+    if ctx.plex_base_url is None:
+        return StepOutcome(
+            state="error",
+            note=wiring_failure_unreachable("Plex"),
+            technical="no address for plex",
+            changed=False,
+            transient=False,
+        )
+    if ctx.plex_token is None:
+        return StepOutcome(
+            state="error",
+            note=WIRING_PLEX_SIGN_IN_NEEDED,
+            technical="no plex sign-in saved",
+            changed=False,
+            transient=False,
+        )
+    return None
+
+
+@dataclass(frozen=True)
+class PlexLibrariesTask:
+    """Plex gains its Movies and TV Shows libraries, pointing at the shared
+    data root's own media folders.
+    """
+
+    key: str
+    line: str
+    involved: tuple[str, ...]
+
+    @property
+    def about(self) -> tuple[str, ...]:
+        return self.involved
+
+    async def apply(self, ctx: WiringContext) -> StepOutcome:
+        outcome = _plex_precheck(ctx)
+        if outcome is not None:
+            return outcome
+        assert ctx.plex is not None
+        assert ctx.plex_base_url is not None
+        assert ctx.plex_token is not None
+        return await ensure_plex_libraries(ctx.plex, ctx.plex_base_url, ctx.plex_token)
+
+
+@dataclass(frozen=True)
+class PlexDirectPlayTask:
+    """Plex's server-wide "never transcode video" setting, read back to
+    prove it actually took - the owner's Plex Pass status may gate it.
+    """
+
+    key: str
+    line: str
+    involved: tuple[str, ...]
+
+    @property
+    def about(self) -> tuple[str, ...]:
+        return self.involved
+
+    async def apply(self, ctx: WiringContext) -> StepOutcome:
+        outcome = _plex_precheck(ctx)
+        if outcome is not None:
+            return outcome
+        assert ctx.plex is not None
+        assert ctx.plex_base_url is not None
+        assert ctx.plex_token is not None
+        return await ensure_plex_direct_play(ctx.plex, ctx.plex_base_url, ctx.plex_token)
+
+
 @dataclass(frozen=True)
 class ExplainTask:
     """A step whose outcome is always `skipped`, with a fixed plain-language note.
@@ -395,6 +478,18 @@ def plan_wiring(state: InstallState, *, only_app: str | None = None) -> tuple[Wi
                 )
             )
 
+    if "plex" in state.app_ids:
+        tasks.append(
+            PlexLibrariesTask(
+                key="libraries:plex", line=wiring_line_libraries("Plex"), involved=("plex",)
+            )
+        )
+        tasks.append(
+            PlexDirectPlayTask(
+                key="direct-play:plex", line=WIRING_LINE_PLEX_DIRECT_PLAY, involved=("plex",)
+            )
+        )
+
     if only_app is None:
         return tuple(tasks)
     return tuple(task for task in tasks if only_app in task.about)
@@ -416,6 +511,8 @@ class WiringEngine:
         qbit: QbitClient | None = None,
         vpn: GluetunControl | None = None,
         config_dir: Path | None = None,
+        plex: PlexServer | None = None,
+        plex_address: Callable[[], Awaitable[str | None]] | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         clock: Callable[[], float] = time.monotonic,
         ready_timeout: float = 180.0,
@@ -428,6 +525,8 @@ class WiringEngine:
         self._qbit = qbit if qbit is not None else HttpQbitClient()
         self._vpn = vpn if vpn is not None else NoGluetunControl()
         self._config_dir = config_dir
+        self._plex = plex if plex is not None else HttpPlexServer()
+        self._plex_address = plex_address
         self._sleep = sleep
         self._clock = clock
         self._ready_timeout = ready_timeout
@@ -463,6 +562,21 @@ class WiringEngine:
         # Read fresh at the start of every run, never cached - a "Change
         # seeding" saved a moment ago must be what this very run applies.
         answers = load_answers(self._config_dir) if self._config_dir is not None else {}
+
+        # Resolved once per run, and only when a Plex task is actually
+        # planned - an arr-only run never calls `plex_address()` or reads
+        # plex.json at all.
+        resolved_plex_base_url: str | None = None
+        resolved_plex_token: str | None = None
+        if any("plex" in task.about for task in tasks):
+            address = await self._plex_address() if self._plex_address is not None else None
+            if address is not None:
+                resolved_plex_base_url = plex_base_url(address)
+            if self._config_dir is not None:
+                account = load_plex_account(self._config_dir)
+                if account is not None:
+                    resolved_plex_token = account.token
+
         ctx = WiringContext(
             client=self._client,
             state=state,
@@ -470,6 +584,9 @@ class WiringEngine:
             qbit=self._qbit,
             vpn=self._vpn,
             answers=answers,
+            plex=self._plex,
+            plex_base_url=resolved_plex_base_url,
+            plex_token=resolved_plex_token,
         )
         ready_apps: set[str] = set()
         total = len(tasks)

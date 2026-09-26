@@ -1849,6 +1849,119 @@ _RECYCLARR_WORDS: tuple[str, ...] = (
 # end Recyclarr section
 # =============================================================================
 
+# =============================================================================
+# Plex - a media server linked to the owner's own Plex account, in the
+# owner's own words. The Alignment rule: never call Plex a "media server" on
+# its own - that phrase stays reserved for the whole setup.
+# =============================================================================
+
+PLEX_DESCRIPTION = (
+    "Streams your movies and shows to your TV, phone and browser, signed in "
+    "with your own Plex account."
+)
+PLEX_EXCLUDES_JELLYFIN = (
+    "you already have Jellyfin - you can have Plex or Jellyfin, and for now the choice stays"
+)
+
+PLEX_STEP_TITLE = "Sign in with Plex"
+PLEX_STEP_LEDE = (
+    "Marrquee sets up a new Plex server on this NAS and links it to your Plex "
+    "account: press Sign in with Plex, approve Marrquee on plex.tv, and you "
+    "come straight back here. Plex is set to play your files exactly as they "
+    "are - it never re-encodes video. One setting Marrquee can't reach: each "
+    "Plex app on your TV, phone or computer has its own Quality setting. Set "
+    "it to Original (or Maximum), or that device may not be able to play a "
+    "video Plex won't shrink for it."
+)
+PLEX_ACCOUNT_LABEL = "Your Plex account"
+PLEX_SIGN_IN_BUTTON = "Sign in with Plex"
+PLEX_SIGN_IN_OTHER = "Use a different Plex account"
+
+
+def plex_signed_in_as(name: str) -> str:
+    return f"Signed in to Plex as {name}."
+
+
+PLEX_SIGN_IN_HINT = "Opens plex.tv. Approve Marrquee there and you come straight back."
+PLEX_PROBLEM_SIGN_IN_FIRST = (
+    "Press Sign in with Plex first - Marrquee needs your Plex account to set up your server."
+)
+PLEX_SIGN_IN_DIDNT_FINISH = "Plex didn't confirm the sign-in. Press Sign in with Plex to try again."
+
+PLEX_COMPOSE_COMMENT = (
+    "Plex uses your NAS's own network (host networking) so your TVs and phones find "
+    "it at home. The first time it starts, Marrquee hands it a one-time code that "
+    "links it to your Plex account, then deletes the code."
+)
+MEDIA_LIBRARY_MOUNT_COMMENT = (
+    "Your Movies and TV folders, read-only: Plex can show and play everything, but "
+    "can never change or delete your files."
+)
+PLEX_SECRETS_MOUNT_COMMENT = (
+    "A folder only Marrquee can read. It holds Plex's one-time link code for a few "
+    "minutes during the first start, and is empty the rest of the time."
+)
+
+FAILURE_PLEX_SIGN_IN_NEEDED = (
+    "plex.tv didn't accept Marrquee's sign-in for your account. Press Cancel, add "
+    "Plex again and sign in with Plex."
+)
+FAILURE_PLEX_NOT_CLAIMED = (
+    "Your new Plex server started, but plex.tv didn't link it to your account in "
+    "time. Press Try again - Marrquee asks plex.tv for a fresh link."
+)
+FAILURE_PLEX_PORT_TAKEN = (
+    "Something on your NAS already answers on Plex's port, 32400 - usually a Plex "
+    "you installed before. Stop it from your NAS's app list, then press Try again."
+)
+
+
+def wiring_line_libraries(name: str) -> str:
+    return f"Adding your Movies and TV Shows to {name}"
+
+
+PLEX_LIBRARY_MOVIES = "Movies"
+PLEX_LIBRARY_TV = "TV Shows"
+
+WIRING_LINE_PLEX_DIRECT_PLAY = "Setting Plex to play files as they are"
+PLEX_NOTE_DIRECT_PLAY = (
+    "Plex now never re-encodes video. Set Quality to Original in each Plex app on your devices."
+)
+WIRING_PLEX_SIGN_IN_NEEDED = (
+    "Marrquee has no Plex sign-in saved. Add Plex again and sign in with Plex."
+)
+
+
+_PLEX_WORDS: tuple[str, ...] = (
+    "PLEX_DESCRIPTION",
+    "PLEX_EXCLUDES_JELLYFIN",
+    "PLEX_STEP_TITLE",
+    "PLEX_STEP_LEDE",
+    "PLEX_ACCOUNT_LABEL",
+    "PLEX_SIGN_IN_BUTTON",
+    "PLEX_SIGN_IN_OTHER",
+    "plex_signed_in_as",
+    "PLEX_SIGN_IN_HINT",
+    "PLEX_PROBLEM_SIGN_IN_FIRST",
+    "PLEX_SIGN_IN_DIDNT_FINISH",
+    "PLEX_COMPOSE_COMMENT",
+    "MEDIA_LIBRARY_MOUNT_COMMENT",
+    "PLEX_SECRETS_MOUNT_COMMENT",
+    "FAILURE_PLEX_SIGN_IN_NEEDED",
+    "FAILURE_PLEX_NOT_CLAIMED",
+    "FAILURE_PLEX_PORT_TAKEN",
+    "wiring_line_libraries",
+    "PLEX_LIBRARY_MOVIES",
+    "PLEX_LIBRARY_TV",
+    "WIRING_LINE_PLEX_DIRECT_PLAY",
+    "PLEX_NOTE_DIRECT_PLAY",
+    "WIRING_PLEX_SIGN_IN_NEEDED",
+)
+
+# =============================================================================
+# end Plex section
+# =============================================================================
+
 # The full review surface: every public name above, in one tuple. A later
 # feature area adds its own fenced section above this line, then extends
 # this tuple with its own `_..._WORDS` name - never editing an earlier
@@ -1867,4 +1980,5 @@ WORDS_INVENTORY: tuple[str, ...] = (
     *_VPN_CHANGE_WORDS,
     *_DRIVE_WORDS,
     *_RECYCLARR_WORDS,
+    *_PLEX_WORDS,
 )

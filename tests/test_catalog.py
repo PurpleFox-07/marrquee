@@ -14,6 +14,8 @@ import pytest
 
 from marrquee.catalog import (
     CATALOG,
+    MEDIA_SERVER_APP_IDS,
+    PLEX_APP_ID,
     RECYCLARR_APP_ID,
     AppRule,
     CatalogApp,
@@ -22,11 +24,14 @@ from marrquee.catalog import (
     companions_for,
     description_for,
     get_app,
+    media_server_of,
     require_port,
     riders_of,
     unavailable_reason,
 )
 from marrquee.words import (
+    PLEX_DESCRIPTION,
+    PLEX_EXCLUDES_JELLYFIN,
     PROWLARR_DESCRIPTION,
     QBITTORRENT_DESCRIPTION,
     QBITTORRENT_DESCRIPTION_NO_VPN,
@@ -40,7 +45,15 @@ from marrquee.words import (
 def test_catalog_holds_the_three_arr_apps_gluetun_and_qbittorrent_in_deploy_order() -> None:
     ids = [app.id for app in CATALOG]
 
-    assert ids == ["prowlarr", "sonarr", "radarr", "gluetun", "qbittorrent", "recyclarr"]
+    assert ids == [
+        "prowlarr",
+        "sonarr",
+        "radarr",
+        "gluetun",
+        "qbittorrent",
+        "recyclarr",
+        "plex",
+    ]
     orders = [app.order for app in CATALOG]
     assert orders == sorted(orders)
 
@@ -86,6 +99,7 @@ def test_the_three_arr_apps_take_the_login_gluetun_takes_none_qbittorrent_its_ow
         "gluetun": "none",
         "qbittorrent": "qbittorrent",
         "recyclarr": "none",
+        "plex": "none",
     }
 
 
@@ -176,6 +190,7 @@ def test_every_catalog_description_is_the_mockups_own_wording() -> None:
     assert descriptions_by_id["sonarr"] == SONARR_DESCRIPTION
     assert descriptions_by_id["radarr"] == RADARR_DESCRIPTION
     assert descriptions_by_id["recyclarr"] == RECYCLARR_DESCRIPTION
+    assert descriptions_by_id["plex"] == PLEX_DESCRIPTION
     assert PROWLARR_DESCRIPTION == "Your search sources, managed in one place."
     assert SONARR_DESCRIPTION == "Finds and organizes your TV shows."
     assert RADARR_DESCRIPTION == "Finds and organizes your movies."
@@ -183,7 +198,7 @@ def test_every_catalog_description_is_the_mockups_own_wording() -> None:
 
 def test_unknown_app_id_raises_key_error_not_a_silent_empty_result() -> None:
     with pytest.raises(KeyError):
-        get_app("plex")
+        get_app("not-a-real-app")
 
 
 def test_get_app_returns_the_matching_catalog_entry() -> None:
@@ -337,10 +352,9 @@ def test_recyclarr_is_offered_unticked_and_has_no_port() -> None:
     )
 
 
-def test_recyclarr_sits_last_right_after_qbittorrent() -> None:
+def test_recyclarr_sits_right_after_qbittorrent() -> None:
     ids = [app.id for app in CATALOG]
 
-    assert ids[-1] == "recyclarr"
     assert ids.index("recyclarr") == ids.index("qbittorrent") + 1
 
 
@@ -357,3 +371,63 @@ def test_require_port_raises_for_recyclarr_and_returns_8989_for_sonarr() -> None
 
     with pytest.raises(ValueError, match="recyclarr has no port"):
         require_port(get_app("recyclarr"))
+
+
+# --- Plex: a media-server app with no key of its own, its own library ------
+# folders, and its own web path -----------------------------------------------
+
+
+def test_plex_sits_last_right_after_recyclarr() -> None:
+    ids = [app.id for app in CATALOG]
+
+    assert ids[-1] == "plex"
+    assert ids.index("plex") == ids.index("recyclarr") + 1
+
+
+def test_plex_facts_match_the_verified_image_docs() -> None:
+    plex = get_app(PLEX_APP_ID)
+
+    assert plex.id == "plex"
+    assert plex.name == "Plex"
+    assert plex.description == PLEX_DESCRIPTION
+    assert plex.image == "lscr.io/linuxserver/plex:latest"
+    assert plex.port == 32400
+    assert plex.env_prefix == "PLEX"
+    assert plex.api_base == ""
+    assert plex.media_folders == ()
+    assert plex.needs_data_mount is False
+    assert plex.glyph == "PX"
+    assert plex.order == 6
+    assert plex.default_ticked is False
+    assert plex.web_page is True
+    assert plex.login_kind == "none"
+    assert plex.kind == "media_server"
+    assert plex.offered is True
+    # No `api_key_source` field exists - Plex mints an ordinary, unused
+    # Marrquee key the same way Recyclarr does.
+    assert plex.api_key_style == "hex32"
+    assert plex.web_path == "/web"
+    assert plex.library_folders == ("movies", "tv")
+
+
+def test_plex_is_unavailable_beside_jellyfin() -> None:
+    plex = get_app(PLEX_APP_ID)
+
+    assert unavailable_reason(plex, ("jellyfin",)) == PLEX_EXCLUDES_JELLYFIN
+    assert unavailable_reason(plex, ()) is None
+    assert unavailable_reason(plex, ("sonarr",)) is None
+
+
+def test_media_server_of_picks_plex() -> None:
+    found = media_server_of(("sonarr", "plex", "radarr"))
+    assert found is not None
+    assert found.id == "plex"
+
+
+def test_media_server_of_returns_none_without_one() -> None:
+    assert media_server_of(("sonarr", "radarr")) is None
+    assert media_server_of(()) is None
+
+
+def test_media_server_app_ids_names_plex_and_jellyfin() -> None:
+    assert MEDIA_SERVER_APP_IDS == ("plex", "jellyfin")

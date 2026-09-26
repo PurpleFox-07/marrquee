@@ -60,8 +60,8 @@ line-length = 100
 select = ["E", "F", "I", "UP", "B"]
 
 [tool.ruff.lint.flake8-bugbear]
-# Both are stateless (no mutable fields, no per-call side effects on the
-# instance itself), so sharing one instance across every DeployManager that
+# Each is stateless or frozen (no mutable fields, no per-call side effects
+# on the instance itself), so sharing one instance across every call that
 # doesn't override the parameter is safe - the exact shape B008 exists to
 # rule out for mutable defaults.
 extend-immutable-calls = [
@@ -70,4 +70,5 @@ extend-immutable-calls = [
     "marrquee.login_apply.NoLoginApplier",
     "marrquee.vpn_control.NoGluetunControl",
     "marrquee.wiring.qbit_client.HttpQbitClient",
+    "marrquee.plex.PlexPin",
 ]

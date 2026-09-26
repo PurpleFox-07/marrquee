@@ -13,6 +13,8 @@ from marrquee import questions, vpn, words
 from marrquee.login import LOGIN_STEP
 from marrquee.questions import (
     MOVIE_QUALITY_STEP,
+    PLEX_ACCOUNT_FIELD,
+    PLEX_STEP,
     QUESTION_STEPS,
     SEEDING_STEP,
     TV_QUALITY_STEP,
@@ -47,7 +49,13 @@ def _text_step(app_id: str, step_id: str = "fixture") -> QuestionStep:
 
 
 def test_question_steps_holds_the_registered_vpn_and_seeding_steps() -> None:
-    assert QUESTION_STEPS == (VPN_STEP, SEEDING_STEP, TV_QUALITY_STEP, MOVIE_QUALITY_STEP)
+    assert QUESTION_STEPS == (
+        VPN_STEP,
+        SEEDING_STEP,
+        TV_QUALITY_STEP,
+        MOVIE_QUALITY_STEP,
+        PLEX_STEP,
+    )
 
 
 def test_question_option_and_field_gain_their_new_optional_attributes() -> None:
@@ -460,3 +468,48 @@ def test_save_step_answers_does_not_disturb_a_different_apps_map(tmp_path: Path)
     answers = load_answers(config_dir)
 
     assert answers == {"prowlarr": {"a": "1"}, "radarr": {"b": "2"}}
+
+
+# --- The Plex sign-in step: a `sign_in` field never reads a posted value ----
+
+
+def test_a_posted_sign_in_value_is_ignored() -> None:
+    """FIRST TEST - a browser must never be able to type "signed in"."""
+    refused = check_step(PLEX_STEP, {PLEX_ACCOUNT_FIELD: "x"}, {})
+    assert refused.ok is False
+    assert refused.problem == words.PLEX_PROBLEM_SIGN_IN_FIRST
+    assert refused.field == PLEX_ACCOUNT_FIELD
+
+    accepted = check_step(PLEX_STEP, {PLEX_ACCOUNT_FIELD: "x"}, {PLEX_ACCOUNT_FIELD: "ryan"})
+    assert accepted.ok is True
+    assert accepted.answers[PLEX_ACCOUNT_FIELD] == "ryan"
+
+
+def test_check_step_never_reads_posted_for_any_sign_in_field() -> None:
+    step = QuestionStep(
+        app_id="radarr",
+        step_id="fixture",
+        title="t",
+        lede="l",
+        fields=(QuestionField(name="account", label="Account", kind="sign_in"),),
+        check=_ok,
+    )
+
+    posted_only = check_step(step, {"account": "sneaky"}, {})
+    saved_only = check_step(step, {}, {"account": "ryan"})
+
+    assert posted_only.answers["account"] == ""
+    assert saved_only.answers["account"] == "ryan"
+
+
+def test_plex_step_is_registered_last_and_asks_one_sign_in_field() -> None:
+    assert QUESTION_STEPS[-1] is PLEX_STEP
+    assert PLEX_STEP.app_id == "plex"
+    assert PLEX_STEP.step_id == "sign-in"
+    assert len(PLEX_STEP.fields) == 1
+    field = PLEX_STEP.fields[0]
+    assert field.name == PLEX_ACCOUNT_FIELD
+    assert field.kind == "sign_in"
+    assert field.label == words.PLEX_ACCOUNT_LABEL
+    assert field.hint == words.PLEX_SIGN_IN_HINT
+    assert PLEX_STEP.asked_with is None

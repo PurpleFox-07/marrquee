@@ -39,6 +39,7 @@ from marrquee.docker_client import (
 from marrquee.hardlinks import HardlinkMonitor, HardlinkResult, save_hardlink_result
 from marrquee.login import load_login, save_login
 from marrquee.main import create_app
+from marrquee.plex import FakePlexServer, FakePlexTv
 from marrquee.questions import QuestionCheck, QuestionField, QuestionStep, load_answers
 from marrquee.recyclarr import RecyclarrControl, SyncRecord, SyncStatus
 from marrquee.routes.api import _event_stream
@@ -187,10 +188,13 @@ def test_catalog_route_lists_apps_in_deploy_order_with_port_only(tmp_path: Path)
         "radarr",
         "qbittorrent",
         "recyclarr",
+        "plex",
     ]
     assert apps[0].keys() == {"id", "name", "description", "port"}
     assert apps[0]["port"] == 9696
-    assert apps[-1]["port"] is None
+    apps_by_id = {app["id"]: app for app in apps}
+    assert apps_by_id["recyclarr"]["port"] is None
+    assert apps_by_id["plex"]["port"] == 32400
 
 
 # --- The resting state: honest before any deploy has run ---------------------
@@ -392,7 +396,8 @@ def test_install_refuses_an_unknown_app_id_with_400(tmp_path: Path) -> None:
     client = _client(settings, _idle_manager(settings))
 
     response = client.post(
-        "/api/install", json={"path": str(root), "app_ids": ["plex"], "login": _LOGIN_BODY}
+        "/api/install",
+        json={"path": str(root), "app_ids": ["not-a-real-app"], "login": _LOGIN_BODY},
     )
 
     assert response.status_code == 400
@@ -1397,6 +1402,29 @@ def test_create_app_builds_one_qbit_client_and_shares_it(tmp_path: Path) -> None
     assert app.state.deploy._qbit is fake
     assert app.state.deploy._login._qbit is fake
     assert app.state.qbit_client is fake
+
+
+def test_create_app_builds_one_plex_door_pair_and_shares_it(tmp_path: Path) -> None:
+    """`create_app` builds exactly one plex.tv door and one local-server
+    door, and hands the SAME pair to the deploy manager AND `app.state` -
+    the sign-in routes (a later chunk) and the manager must never be able
+    to see two different fakes for the same running process.
+    """
+    settings = _settings(tmp_path)
+    fake_tv = FakePlexTv()
+    fake_server = FakePlexServer()
+
+    app = create_app(
+        settings=settings,
+        engine=FakeDockerEngine(DockerStatus(connected=True)),
+        plex_tv=fake_tv,
+        plex_server=fake_server,
+    )
+
+    assert app.state.deploy._plex_tv is fake_tv
+    assert app.state.deploy._plex_server is fake_server
+    assert app.state.plex_tv is fake_tv
+    assert app.state.plex_server is fake_server
 
 
 class _PausingWiringRunner:

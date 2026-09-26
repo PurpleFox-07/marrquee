@@ -51,6 +51,7 @@ from marrquee.login import LOGIN_STEP, load_login, save_login
 from marrquee.login_apply import FakeLoginApplier
 from marrquee.main import create_app
 from marrquee.questions import (
+    PLEX_STEP,
     SEEDING_STEP,
     VPN_STEP,
     QuestionCheck,
@@ -1140,7 +1141,7 @@ def test_panel_nonsense_and_edit_unknown_link_draw_it_closed(tmp_path: Path) -> 
 
 def test_install_pane_is_truthful(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
-    all_offered = ("prowlarr", "sonarr", "radarr", "qbittorrent", "recyclarr")
+    all_offered = ("prowlarr", "sonarr", "radarr", "qbittorrent", "recyclarr", "plex")
     save_state(settings.config_dir, _install_state(all_offered))
     _write_snapshot(settings, _finale_snapshot(all_offered))
     save_login(settings.config_dir, "owner", "s3cret-password-1", honor_reset=None)
@@ -1161,6 +1162,63 @@ def test_install_pane_is_truthful(tmp_path: Path) -> None:
     assert words.HUB_INSTALL_ALL_DONE not in partial.text
     assert "Prowlarr" in partial.text
     assert "Radarr" in partial.text
+
+
+def _install_row_html(page_html: str, app_id: str) -> str:
+    match = re.search(
+        rf'<li\s+class="install-row"\s+data-install-row="{app_id}".*?</li>',
+        page_html,
+        re.DOTALL,
+    )
+    assert match is not None, f"no install row rendered for {app_id!r}"
+    return match.group(0)
+
+
+def test_the_needs_sign_in_row_renders_a_no_js_form_a_signed_in_row_renders_add(
+    tmp_path: Path,
+) -> None:
+    """Before a sign-in, Plex's own row is a plain, un-hidden form post - it
+    has to work with JavaScript off. Once `plex_account` is saved, the row
+    switches to the ordinary (JS-only) Add button every other app gets.
+    """
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(()))
+    _write_snapshot(settings, _finale_snapshot(()))
+    save_login(settings.config_dir, "owner", "s3cret-password-1", honor_reset=None)
+    client = _client(settings)
+
+    unsigned_row = _install_row_html(client.get("/?panel=install").text, "plex")
+    assert 'action="/plex/sign-in"' in unsigned_row
+    assert 'data-sign-in="plex"' in unsigned_row
+    # A bare `hidden` attribute (not `type="hidden"`, the pin-forwarding
+    # field) would make the control a dead one until `hub.js` un-hides it -
+    # this row has to work with no script at all.
+    assert re.search(r"\shidden[\s>]", unsigned_row) is None
+    assert "data-install-app" not in unsigned_row
+    assert words.PLEX_SIGN_IN_BUTTON in html.unescape(unsigned_row)
+
+    save_step_answers(settings.config_dir, "plex", {"plex_account": "ryan"})
+
+    signed_in_row = _install_row_html(client.get("/?panel=install").text, "plex")
+    assert 'data-install-app="plex"' in signed_in_row
+    assert 'action="/plex/sign-in"' not in signed_in_row
+
+
+def test_the_sign_in_refusal_banner_shows_only_when_the_query_says_failed(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(()))
+    _write_snapshot(settings, _finale_snapshot(()))
+    save_login(settings.config_dir, "owner", "s3cret-password-1", honor_reset=None)
+    client = _client(settings)
+
+    quiet = client.get("/?panel=install")
+    assert 'data-role="sign-in-refusal"' not in quiet.text
+
+    failed = client.get("/?panel=install&sign_in=failed")
+    assert 'data-role="sign-in-refusal"' in failed.text
+    assert words.PLEX_SIGN_IN_DIDNT_FINISH in html.unescape(failed.text)
 
 
 def test_plus_is_the_last_li_with_zero_links(tmp_path: Path) -> None:
@@ -1653,7 +1711,11 @@ def _render_question_step(
     env = Environment(loader=FileSystemLoader(str(_TEMPLATES_DIR)), autoescape=True)
     template = env.get_template("partials/app_questions.html")
     return template.render(
-        step=step, answers=answers or {}, problem=problem, problem_field=problem_field
+        step=step,
+        answers=answers or {},
+        problem=problem,
+        problem_field=problem_field,
+        words=words,
     )
 
 
@@ -1672,6 +1734,23 @@ def test_a_password_field_never_carries_a_value_attribute_even_with_a_saved_answ
     assert "value=" not in html
     assert "super-secret-value" not in html
     assert 'type="password"' in html
+
+
+def test_the_sign_in_partial_never_renders_the_account_in_an_input() -> None:
+    """`plex_account` never becomes a text box a browser could resubmit -
+    the only way it's ever written is through `/plex/signed-in`."""
+    unsigned = _render_question_step(PLEX_STEP)
+    assert "<input" not in unsigned
+    assert words.PLEX_SIGN_IN_BUTTON in html.unescape(unsigned)
+
+    signed_in = _render_question_step(PLEX_STEP, answers={"plex_account": "ryan"})
+    assert "<input" not in signed_in
+    assert 'data-role="signed-in"' in signed_in
+    assert words.plex_signed_in_as("ryan") in html.unescape(signed_in)
+    assert words.PLEX_SIGN_IN_OTHER in html.unescape(signed_in)
+    # The account name is only ever text content, never an attribute value
+    # a script could read back as though it were a form field.
+    assert 'value="ryan"' not in signed_in
 
 
 def test_reconnect_re_runs_wiring_for_an_installed_app(tmp_path: Path) -> None:

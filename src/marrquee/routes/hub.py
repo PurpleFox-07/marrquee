@@ -190,6 +190,7 @@ async def read_hub_view(request: Request) -> HubView:
         without_vpn=without_vpn_confirmed(settings.config_dir),
         drive=monitor.latest(),
         recyclarr=recyclarr_status,
+        answers=load_answers(settings.config_dir),
     )
 
 
@@ -262,6 +263,7 @@ def _hub_response(
         "poll_ms": HUB_POLL_MS,
         "add_poll_ms": HUB_ADD_POLL_MS,
         "panel": panel,
+        "plex_sign_in_failed": request.query_params.get("sign_in") == "failed",
         "login_form": login_form,
         "change_form": change_form,
         "login_step": login_step,

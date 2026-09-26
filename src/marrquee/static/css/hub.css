@@ -485,6 +485,18 @@
   margin-top: var(--space-2);
 }
 
+/* Plex's own row before sign-in: a plain form post (works with JavaScript
+ * off), plus the hint underneath it explaining where the button goes. */
+.install-row__sign-in {
+  margin-top: var(--space-3);
+}
+
+.install-row__hint {
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  margin-top: var(--space-2);
+}
+
 /* --- The amber "Running without VPN" badge, right under the lede -----------
  * The tap target comes from the padding, not a fixed height (12 + 20 + 12
  * is already past the 44px minimum), matching wizard.css's own

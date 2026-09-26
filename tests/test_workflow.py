@@ -11,6 +11,7 @@ exercises the port and mount the rest of the project agreed on.
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 from typing import Any
@@ -72,6 +73,21 @@ def _text_between(text: str, start: str, end: str) -> str:
     start_index = text.index(start) + len(start)
     end_index = text.index(end, start_index)
     return text[start_index:end_index]
+
+
+def _heredoc_body(run: str, filename: str) -> str:
+    """The body of one `cat > ".../<filename>" <<'PY'` heredoc inside a
+    step's own `run` text, up to the next bare `PY` line - real, parseable
+    Python source. Scoped to one named heredoc rather than the step's whole
+    text, so a line that happens to read identically inside a DIFFERENT
+    step's own heredoc elsewhere in this same file (there is another
+    `if not result.ok:` in the qBittorrent bring-up) can never make a
+    mutation inside THIS heredoc look caught when it wasn't.
+    """
+    marker = f"cat > \"$RUNNER_TEMP/{filename}\" <<'PY'\n"
+    start = run.index(marker) + len(marker)
+    end = run.index("\nPY\n", start)
+    return run[start:end]
 
 
 def _shell_case_arms(case_block: str) -> dict[str, str]:
@@ -627,6 +643,7 @@ def test_stack_smoke_dumps_diagnostics_and_logs_only_on_failure() -> None:
     assert "/api/deploy/diagnostics" in step["run"]
     assert "docker logs marrquee-stack-smoke" in step["run"]
     assert "docker logs recyclarr" in step["run"]
+    assert "docker logs plex" in step["run"]
 
 
 def test_stack_smoke_also_puts_diagnostics_in_a_public_annotation_truncated_and_escaped() -> None:
@@ -970,6 +987,7 @@ def test_stack_smoke_always_cleans_up_containers_network_and_temp_files() -> Non
         "gluetun",
         "qbittorrent",
         "recyclarr",
+        "plex",
         "marrquee-stack-smoke",
     ):
         assert name in run
@@ -1695,6 +1713,8 @@ def test_stack_smoke_no_vpn_steps_run_after_cancel_in_order_choose_add_hand_over
     drive_index = names.index(_step_named(job, "drive check agrees")["name"])
     syncs_index = names.index(_step_named(job, "recyclarr syncs quality")["name"])
     amber_index = names.index(_step_named(job, "sync turns amber")["name"])
+    plex_host_index = names.index(_step_named(job, "plex runs on the host network")["name"])
+    plex_secret_index = names.index(_step_named(job, "link code stays root-only")["name"])
     dump_index = names.index(_step_named(job, "dump diagnostics")["name"])
 
     assert (
@@ -1711,6 +1731,8 @@ def test_stack_smoke_no_vpn_steps_run_after_cancel_in_order_choose_add_hand_over
         < drive_index
         < syncs_index
         < amber_index
+        < plex_host_index
+        < plex_secret_index
         < dump_index
     )
 
@@ -1730,6 +1752,8 @@ def test_stack_smoke_every_no_vpn_step_emits_error_on_failure() -> None:
         ("drive check agrees",),
         ("recyclarr syncs quality",),
         ("sync turns amber",),
+        ("plex runs on the host network",),
+        ("link code stays root-only",),
     ]
     for needles in needle_sets:
         step = _step_named(job, *needles)
@@ -1876,6 +1900,7 @@ def test_stack_smoke_cleanup_list_already_covers_qbittorrent_and_gluetun() -> No
     assert "qbittorrent" in run
     assert "gluetun" in run
     assert "recyclarr" in run
+    assert "plex" in run
 
 
 # --- stack-smoke: Recyclarr on a real daemon - the guide-backed profiles
@@ -2107,3 +2132,325 @@ def test_stack_smoke_recyclarr_step_names_avoid_forbidden_needles() -> None:
         name = str(_step_named(job, *needles)["name"]).lower()
         for phrase in forbidden:
             assert phrase not in name, f"step {name!r} contains the forbidden phrase {phrase!r}"
+
+
+# --- stack-smoke: Plex on a real daemon - host networking, the gateway
+# address, the FILE__ claim read and root-only secrets. The account link
+# itself stays PENDING the owner's own NAS run. ----------------------------
+
+
+def test_stack_smoke_plex_step_names_avoid_forbidden_needles() -> None:
+    """Same reasoning as the Recyclarr steps: a name that collides with an
+    earlier step's own name (or the "developer test" phrase this chunk was
+    told never to use) would silently resolve `_step_named` to that earlier
+    step instead of Plex's own.
+    """
+    job = _stack_smoke_job()
+    forbidden = (
+        "developer test",
+        "recyclarr",
+        "sync turns amber",
+        "stop radarr",
+        "start radarr again",
+        "cancel",
+        "clean up",
+        "dump diagnostics",
+    )
+    for needles in [
+        ("plex runs on the host network",),
+        ("link code stays root-only",),
+    ]:
+        name = str(_step_named(job, *needles)["name"]).lower()
+        for phrase in forbidden:
+            assert phrase not in name, f"step {name!r} contains the forbidden phrase {phrase!r}"
+
+
+def test_stack_smoke_plex_host_step_grows_the_plan_in_memory_and_writes_the_fake_claim() -> None:
+    """Plex is added to the compose plan the same way `DeployManager._stack_plan`
+    does it for real - `without_vpn_confirmed` included, since qBittorrent is
+    already running without Gluetun by this point in the job - but entirely
+    in memory: install.json is only ever read, never re-saved, and the
+    rendered file lands beside the real install rather than on top of it.
+    """
+    step = _step_named(_stack_smoke_job(), "plex runs on the host network")
+    run = step["run"]
+
+    assert "set -euo pipefail" in run
+    assert "from marrquee.install import with_app_added" in run
+    assert 'with_app_added(state, "plex")' in run
+    assert "from marrquee.without_vpn import without_vpn_confirmed" in run
+    assert "without_vpn=without_vpn_confirmed(settings.config_dir)" in run
+    assert 'write_plex_claim(settings, root, "claim-marrquee-ci-not-real")' in run
+    assert "f\"/host{os.environ['RUNNER_TEMP']}/marrquee-smoke/ci-plex-compose.yaml\"" in run
+    # The real install's own compose.yaml is never named as a write target
+    # anywhere in this step - only ever read from, in the secrets step below.
+    assert "write_text" in run
+    assert "compose_path.write_text(render_compose(plan))" in run
+
+
+def test_stack_smoke_plex_host_step_starts_it_through_socket_docker_engine_and_checks_ok() -> None:
+    """The decisive comparison is pinned two ways, both scoped to THIS
+    heredoc only (`_heredoc_body`), never a bare substring search over the
+    whole step: line-adjacency (the guard and its `raise` sit immediately
+    after the `compose_up` call, verbatim) and a real `ast.parse` of the
+    body, so `if not result.ok:` swapped for `if False:` - or any other
+    hollowed guard - is caught even though an identical-looking line
+    already exists, for real, in an unrelated step's own heredoc elsewhere
+    in this same file.
+    """
+    run = _step_named(_stack_smoke_job(), "plex runs on the host network")["run"]
+    body = _heredoc_body(run, "ci_plex_bring_up.py")
+
+    assert "from marrquee.docker_client import SocketDockerEngine" in run
+    assert (
+        "engine = SocketDockerEngine(\n"
+        "        settings.docker_socket, compose_binary=settings.compose_binary\n"
+        "    )" in body
+    )
+
+    lines = body.splitlines()
+    compose_up_line = 'result = await engine.compose_up("marrquee-apps", compose_path, "plex")'
+    compose_up_index = next(
+        index for index, line in enumerate(lines) if line.strip() == compose_up_line
+    )
+    guard_line = lines[compose_up_index + 1].strip()
+    raise_line = lines[compose_up_index + 2].strip()
+    assert guard_line == "if not result.ok:"
+    assert raise_line == 'raise SystemExit(f"compose up for plex failed: {result.output}")'
+
+    # Belt and suspenders: real Python, not just adjacent lines - a stray
+    # `pass` or a re-indented guard that broke the block would show up here
+    # even if the line-by-line check above were somehow fooled.
+    tree = ast.parse(body)
+
+    def _is_not_result_ok(test: ast.expr) -> bool:
+        return (
+            isinstance(test, ast.UnaryOp)
+            and isinstance(test.op, ast.Not)
+            and isinstance(test.operand, ast.Attribute)
+            and test.operand.attr == "ok"
+            and isinstance(test.operand.value, ast.Name)
+            and test.operand.value.id == "result"
+        )
+
+    def _raises_system_exit(stmt: ast.stmt) -> bool:
+        return (
+            isinstance(stmt, ast.Raise)
+            and isinstance(stmt.exc, ast.Call)
+            and isinstance(stmt.exc.func, ast.Name)
+            and stmt.exc.func.id == "SystemExit"
+        )
+
+    guards = [
+        node for node in ast.walk(tree) if isinstance(node, ast.If) and _is_not_result_ok(node.test)
+    ]
+    assert guards, "no `if not result.ok:` guard found in the bring-up script"
+    assert guards[0].body and _raises_system_exit(guards[0].body[0]), (
+        "the if-not-result.ok guard's body doesn't raise SystemExit"
+    )
+
+    assert (
+        'if ! bring_up_output=$(docker exec -e RUNNER_TEMP="$RUNNER_TEMP" marrquee-stack-smoke '
+        'python3 /tmp/ci_plex_bring_up.py 2>&1) || [ -z "$bring_up_output" ]; then' in run
+    )
+    assert "::error::Plex's in-memory compose bring-up failed" in run
+    assert "::notice::" in run
+
+
+def test_stack_smoke_plex_host_step_pins_the_network_mode_verdict() -> None:
+    """A failed `docker inspect` must itself be caught with its own
+    `::error::` (bare under `set -euo pipefail`, it would otherwise abort
+    the step silently) before the real "is it host mode" verdict is even
+    reached.
+    """
+    run = _step_named(_stack_smoke_job(), "plex runs on the host network")["run"]
+
+    assert "docker inspect -f '{{.HostConfig.NetworkMode}}' plex" in run
+    _assert_post_loop_verdict(
+        run,
+        "if ! network_mode=$(docker inspect -f '{{.HostConfig.NetworkMode}}' plex) "
+        '|| [ -z "$network_mode" ]; then',
+        "couldn't inspect the plex container's network mode",
+    )
+    _assert_post_loop_verdict(
+        run,
+        'if [ "$network_mode" != "host" ]; then',
+        "Plex is not on the host network",
+    )
+
+
+def test_stack_smoke_plex_host_step_reaches_plex_through_its_own_gateway_address() -> None:
+    """Marrquee resolves its own reachable address the same way production
+    code does - `plex_host_address` off `self_container_id()` - never a
+    hardcoded `127.0.0.1` or the bridge-only `http://plex:32400` a
+    Plex-only stack could never create.
+    """
+    run = _step_named(_stack_smoke_job(), "plex runs on the host network")["run"]
+
+    assert "from marrquee.plex import plex_host_address" in run
+    assert "await engine.self_container_id()" in run
+    assert "address = await plex_host_address(engine, self_id)" in run
+    assert (
+        "if ! address=$(docker exec marrquee-stack-smoke python3 /tmp/ci_plex_address.py) "
+        '|| [ -z "$address" ]; then' in run
+    )
+
+
+def test_stack_smoke_plex_host_step_polls_identity_bounded_and_pins_both_verdicts() -> None:
+    """The identity poll is a bounded loop (never `while true`), and both of
+    its own post-loop verdicts are pinned verbatim: reachability first
+    (a None/empty result), then the claimed check second - a fake claim
+    code must never be reported as linked.
+    """
+    run = _step_named(_stack_smoke_job(), "plex runs on the host network")["run"]
+
+    assert "from marrquee.plex import HttpPlexServer, plex_base_url" in run
+    assert "for _ in $(seq 1 60); do" in run
+    assert "while true" not in run
+    assert (
+        'identity_state=$(docker exec -e PLEX_ADDRESS="$address" marrquee-stack-smoke '
+        'python3 /tmp/ci_plex_identity.py) || identity_state=""' in run
+    )
+
+    _assert_post_loop_verdict(
+        run,
+        'if [ "$identity_state" = "none" ] || [ -z "$identity_state" ]; then',
+        "Marrquee couldn't reach Plex through the host address",
+    )
+    _assert_post_loop_verdict(
+        run,
+        'if [ "$identity_state" != "unclaimed" ]; then',
+        "A fake claim code was reported as linked",
+    )
+
+
+def test_stack_smoke_plex_host_step_checks_the_logs_with_a_tool_check_and_whitelist() -> None:
+    """Both linuxserver init lines are checked with `grep -F` (never a regex
+    that could partially match something else), gated by a `command -v
+    grep` tool check, and the grep's own exit code is whitelisted rather
+    than trusted blindly - the same shape the Recyclarr key-leak check
+    already uses.
+    """
+    run = _step_named(_stack_smoke_job(), "plex runs on the host network")["run"]
+
+    assert "command -v grep" in run
+    assert "plex_logs=$(docker logs plex 2>&1 || true)" in run
+    assert '"PLEX_CLAIM set from FILE__PLEX_CLAIM"' in run
+    assert '"Unable to claim Plex server"' in run
+    assert 'grep -qF "$phrase"' in run
+
+    case_block = _text_between(run, 'case "$found" in', "esac")
+    arms = _shell_case_arms(case_block)
+    assert arms == {
+        "0": "",
+        "1": 'echo "::error::Plex\'s own log never said: ${phrase}"; exit 1',
+        "*": (
+            "echo \"::error::couldn't check Plex's own logs for its claim code "
+            '(grep exit ${found})"; exit 1'
+        ),
+    }
+
+
+def test_stack_smoke_plex_host_step_polls_web_index_bounded_and_pins_the_verdict() -> None:
+    """The web UI can lag `/identity`, so this polls rather than asserting a
+    single request - and a connection refused (curl's own non-zero exit)
+    must never abort the step silently under `set -euo pipefail`.
+    """
+    run = _step_named(_stack_smoke_job(), "plex runs on the host network")["run"]
+
+    assert (
+        "web_code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:32400/web/index.html) "
+        '|| web_code=""' in run
+    )
+    assert "for _ in $(seq 1 12); do" in run
+    assert "while true" not in run
+    _assert_post_loop_verdict(
+        run,
+        'if [ "$web_code" != "200" ]; then',
+        "Plex's /web/index.html did not answer 200",
+    )
+
+
+def test_stack_smoke_plex_secrets_step_checks_folder_and_file_permissions() -> None:
+    """0700 for the folder, 0600 for the file, both owned by root (uid 0) -
+    Marrquee's own container runs as root, and only it is ever meant to
+    read this folder.
+    """
+    run = _step_named(_stack_smoke_job(), "link code stays root-only")["run"]
+
+    assert "command -v stat" in run
+    assert "stat -c '%a %u'" in run
+
+    _assert_post_loop_verdict(
+        run,
+        'if [ "$dir_perms" != "700 0" ]; then',
+        "Plex's secrets folder was not 0700 owned by root",
+    )
+    _assert_post_loop_verdict(
+        run,
+        'if [ "$file_perms" != "600 0" ]; then',
+        "Plex's claim file was not 0600 owned by root",
+    )
+
+
+def test_stack_smoke_plex_secrets_step_never_echoes_the_claim_or_a_token() -> None:
+    step = _step_named(_stack_smoke_job(), "link code stays root-only")
+    for line in step["run"].splitlines():
+        stripped = line.strip()
+        if stripped.startswith("echo"):
+            assert "claim-marrquee-ci-not-real" not in stripped, (
+                f"the fake claim code appears in an echoed line: {line!r}"
+            )
+
+
+def test_stack_smoke_plex_secrets_step_proves_the_positive_control_before_the_real_check() -> None:
+    """A grep that could never find anything must fail loudly (the positive
+    control) rather than let the real negative check below it pass by
+    accident - the same shape the Recyclarr key-leak check already uses.
+    """
+    run = _step_named(_stack_smoke_job(), "link code stays root-only")["run"]
+
+    assert (
+        'if ! docker exec marrquee-stack-smoke grep -qF "claim-marrquee-ci-not-real" '
+        '"$claim_path"; then' in run
+    )
+    assert "the positive control failed" in run
+
+    positive_control_index = run.index("the positive control failed")
+    negative_check_index = run.index(
+        'docker exec marrquee-stack-smoke grep -qF "claim-marrquee-ci-not-real" "$compose_path"'
+    )
+    assert positive_control_index < negative_check_index
+
+    case_block = _text_between(run, 'case "$leaked" in', "esac")
+    arms = _shell_case_arms(case_block)
+    assert arms == {
+        "1": "",
+        "0": 'echo "::error::the fake Plex claim code leaked into the real compose.yaml"; exit 1',
+        "*": (
+            "echo \"::error::couldn't check compose.yaml for a leaked Plex claim code "
+            '(grep exit ${leaked})"; exit 1'
+        ),
+    }
+
+
+def test_stack_smoke_plex_secrets_step_clears_the_claim_and_confirms_the_folder_is_empty() -> None:
+    run = _step_named(_stack_smoke_job(), "link code stays root-only")["run"]
+
+    assert "from marrquee.plex import clear_plex_claim" in run
+    assert "clear_plex_claim(settings, PurePosixPath(state.storage_root))" in run
+
+    _assert_post_loop_verdict(
+        run,
+        "if ! docker exec marrquee-stack-smoke python3 /tmp/ci_plex_clear_claim.py; then",
+        "clear_plex_claim failed to run",
+    )
+    assert (
+        "if ! remaining=$(docker exec marrquee-stack-smoke sh -c \"ls -A '${secrets_dir}'\"); then"
+        in run
+    )
+    _assert_post_loop_verdict(
+        run,
+        'if [ -n "$remaining" ]; then',
+        "Plex's secrets folder was not empty after clear_plex_claim",
+    )

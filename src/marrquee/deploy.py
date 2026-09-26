@@ -22,6 +22,7 @@ import asyncio
 import dataclasses
 import json
 import logging
+import re
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
@@ -56,6 +57,17 @@ from marrquee.hardlinks import HardlinkTrigger
 from marrquee.install import with_app_added, with_app_removed
 from marrquee.login import SavedLogin, load_login, pending_app_ids, record_applied
 from marrquee.login_apply import LoginApplier, NoLoginApplier
+from marrquee.plex import (
+    HttpPlexServer,
+    HttpPlexTv,
+    PlexServer,
+    PlexTv,
+    clear_plex_claim,
+    load_plex_account,
+    plex_base_url,
+    plex_host_address,
+    write_plex_claim,
+)
 from marrquee.qbittorrent import write_qbit_conf
 from marrquee.questions import load_answers
 from marrquee.recyclarr import (
@@ -94,6 +106,9 @@ from marrquee.wiring.steps import app_base_url
 from marrquee.without_vpn import clear_without_vpn, without_vpn_confirmed
 from marrquee.words import (
     FAILURE_DOCKER_UNREACHABLE,
+    FAILURE_PLEX_NOT_CLAIMED,
+    FAILURE_PLEX_PORT_TAKEN,
+    FAILURE_PLEX_SIGN_IN_NEEDED,
     FAILURE_VPN_NO_TUN,
     PHASE_HEADLINE_FINALE,
     PHASE_HEADLINE_READY,
@@ -150,6 +165,9 @@ FailureCode = Literal[
     "vpn_settings_refused",
     "vpn_not_connected",
     "vpn_no_tun",
+    "plex_sign_in_needed",
+    "plex_not_claimed",
+    "plex_port_taken",
 ]
 
 # An add's own tiny state machine - never "done": once wiring finishes, the
@@ -178,6 +196,13 @@ _DIAGNOSTICS_FILE_NAME = "last-failure.txt"
 _REDACTED_PLACEHOLDER = "<redacted-api-key>"
 _REDACTED_PASSWORD_PLACEHOLDER = "<redacted-password>"
 _REDACTED_VPN_PLACEHOLDER = "<redacted-vpn-login>"
+_REDACTED_PLEX_TOKEN_PLACEHOLDER = "<redacted-plex-token>"
+_REDACTED_PLEX_CLAIM_PLACEHOLDER = "<redacted-plex-claim>"
+# A claim code's own shape (see `plex.write_plex_claim`) - matched by value
+# would miss a code this process never wrote itself (an earlier, unrelated
+# run's leftover in an old log line), so every diagnostics write is swept
+# for the shape too, not only the current claim.
+_PLEX_CLAIM_PATTERN = re.compile(r"claim-[A-Za-z0-9_-]+")
 
 
 @dataclass(frozen=True)
@@ -366,6 +391,11 @@ class DeployManager:
     # provider that answers `/v1/publicip/ip` slowly, say).
     TUNNEL_NEVER_UP_AFTER_SECONDS: ClassVar[float] = 120.0
     TUNNEL_PLACE_GRACE_SECONDS: ClassVar[float] = 20.0
+    # `init-plex-claim` briefly starts PMS before it ever claims, so a lone
+    # unclaimed `/identity` reply is normal on a healthy first start, not a
+    # verdict - only a logged claim failure or this many continuous seconds
+    # of it means the code genuinely didn't take.
+    PLEX_UNCLAIMED_GRACE_SECONDS: ClassVar[float] = 90.0
 
     def __init__(
         self,
@@ -381,6 +411,8 @@ class DeployManager:
         qbit: QbitClient = HttpQbitClient(),
         hardlinks: HardlinkTrigger | None = None,
         recyclarr: RecyclarrTrigger | None = None,
+        plex_tv: PlexTv | None = None,
+        plex_server: PlexServer | None = None,
     ) -> None:
         self._settings = settings
         self._engine = engine
@@ -393,6 +425,8 @@ class DeployManager:
         self._qbit = qbit
         self._hardlinks = hardlinks
         self._recyclarr = recyclarr
+        self._plex_tv = plex_tv if plex_tv is not None else HttpPlexTv()
+        self._plex_server = plex_server if plex_server is not None else HttpPlexServer()
         self._task: asyncio.Task[None] | None = None
         # The login run's own in-memory progress line - never persisted and
         # never resumed after a restart (the pending names plus Try again
@@ -739,6 +773,8 @@ class DeployManager:
                     clear_vpn_secrets(self._settings, root)
                 if any(removed_app.kind == "sync" for removed_app in brought):
                     remove_recyclarr_config(self._settings, root)
+                if any(removed_app.kind == "media_server" for removed_app in brought):
+                    clear_plex_claim(self._settings, root)
 
         if current.moves:
             first_mover = get_app(current.moves[0])
@@ -1262,6 +1298,11 @@ class DeployManager:
                 technical=f"no API key was recorded for {app.id!r}",
             )
 
+        if app.kind == "media_server":
+            return await self._bring_up_plex(
+                app, install, root, compose_path, self_id, report, recreate=recreate
+            )
+
         if app.kind == "vpn":
             secrets_failure = self._write_vpn_secrets(app, install, root)
             if secrets_failure is not None:
@@ -1533,6 +1574,225 @@ class DeployManager:
                 await report("starting", VPN_LINE_CONNECTING, note)
 
             await self._sleep(self.POLL_INTERVAL_SECONDS)
+
+    # --- Plex's own bring-up: a claim, not a key, proves it's ours ---------
+
+    async def _bring_up_plex(
+        self,
+        app: CatalogApp,
+        install: InstallState,
+        root: PurePosixPath,
+        compose_path: Path,
+        self_id: str,
+        report: Callable[[AppState, str, str | None], Awaitable[None]],
+        *,
+        recreate: bool = False,
+    ) -> Failure | None:
+        """Plex's own branch of `_bring_up_app`: no shared Docker network to
+        join (host networking has none), and "ready" means plex.tv's own
+        claim took, not merely that a probe answered.
+
+        Kept apart from the arr/vpn/downloader/sync branches above so those
+        stay readable. The `finally` is what keeps a claim code - good for a
+        few minutes at most - from ever surviving past the one bring-up
+        that used it, win or lose.
+        """
+        try:
+            return await self._run_plex_bring_up(
+                app, install, root, compose_path, self_id, report, recreate=recreate
+            )
+        finally:
+            clear_plex_claim(self._settings, root)
+
+    async def _run_plex_bring_up(
+        self,
+        app: CatalogApp,
+        install: InstallState,
+        root: PurePosixPath,
+        compose_path: Path,
+        self_id: str,
+        report: Callable[[AppState, str, str | None], Awaitable[None]],
+        *,
+        recreate: bool,
+    ) -> Failure | None:
+        account = load_plex_account(self._settings.config_dir)
+        if account is None or account.token is None:
+            return self._plex_failure(
+                "plex_sign_in_needed",
+                FAILURE_PLEX_SIGN_IN_NEEDED,
+                technical="no Plex sign-in is saved",
+            )
+
+        address = await plex_host_address(self._engine, self_id)
+        if address is None:
+            headline, what_to_do = _split_failure_text(failure_compose_failed(app.name))
+            return Failure(
+                code="compose_failed",
+                headline=headline,
+                what_to_do=what_to_do,
+                technical="could not work out this machine's address from Marrquee's own networks",
+            )
+        base_url = plex_base_url(address)
+
+        existing = await self._engine.inspect(app.id)
+        if not existing.exists:
+            pre_flight = await self._plex_server.identity(base_url)
+            if pre_flight is not None:
+                return self._plex_failure(
+                    "plex_port_taken",
+                    FAILURE_PLEX_PORT_TAKEN,
+                    technical=f"something already answers on port {require_port(app)}",
+                )
+            claim_failure = await self._claim_plex(app, root, account.client_id, account.token)
+            if claim_failure is not None:
+                return claim_failure
+
+        fetching_image = not await self._engine.image_present(app.image)
+        line = app_line_getting(app.name) if fetching_image else app_line_starting(app.name)
+        await report("starting", line, None)
+
+        result = await self._engine.compose_up(
+            self._settings.stack_project, compose_path, app.id, recreate=recreate
+        )
+        if not result.ok:
+            return _compose_failure(app, fetching_image, result)
+
+        return await self._await_plex_claimed(
+            app, root, compose_path, account.client_id, account.token, base_url, report
+        )
+
+    def _plex_failure(self, code: FailureCode, message: str, *, technical: str) -> Failure:
+        headline, what_to_do = _split_failure_text(message)
+        return Failure(code=code, headline=headline, what_to_do=what_to_do, technical=technical)
+
+    async def _claim_plex(
+        self, app: CatalogApp, root: PurePosixPath, client_id: str, token: str
+    ) -> Failure | None:
+        claim = await self._plex_tv.claim_token(client_id, token)
+        if claim is None:
+            return self._plex_failure(
+                "plex_sign_in_needed",
+                FAILURE_PLEX_SIGN_IN_NEEDED,
+                technical="no claim code was issued for Plex",
+            )
+        try:
+            write_plex_claim(self._settings, root, claim)
+        except (OSError, PathEscapesRoot) as error:
+            headline, what_to_do = _split_failure_text(failure_compose_failed(app.name))
+            return Failure(
+                code="compose_failed",
+                headline=headline,
+                what_to_do=what_to_do,
+                technical=str(error),
+            )
+        return None
+
+    async def _await_plex_claimed(
+        self,
+        app: CatalogApp,
+        root: PurePosixPath,
+        compose_path: Path,
+        client_id: str,
+        token: str,
+        base_url: str,
+        report: Callable[[AppState, str, str | None], Awaitable[None]],
+    ) -> Failure | None:
+        """Wait for Docker to report the container running AND plex.tv's own
+        claim to have taken - modelled on `_await_tunnel`'s own loop.
+
+        `init-plex-claim` briefly starts PMS before it ever claims, so one
+        unclaimed `/identity` reply proves nothing by itself (the design
+        correction this loop exists to honour): it only means "claim
+        failed" once the container's own logs say so, or once unclaimed
+        answers persist continuously for `PLEX_UNCLAIMED_GRACE_SECONDS`.
+        The first such verdict gets exactly one fresh code and one
+        recreate (`retried`, local to this one bring-up); a second verdict
+        is `plex_not_claimed`.
+        """
+        start = self._clock()
+        reassured = False
+        retried = False
+        unclaimed_since: float | None = None
+        line = app_line_starting(app.name)
+        note: str | None = None
+        await report("starting", line, note)
+
+        while True:
+            elapsed = self._clock() - start
+            if elapsed >= self.NEVER_READY_AFTER_SECONDS:
+                logs = await self._engine.logs(app.id, tail=50)
+                headline, what_to_do = _split_failure_text(failure_never_became_ready(app.name))
+                return Failure(
+                    code="never_became_ready",
+                    headline=headline,
+                    what_to_do=what_to_do,
+                    technical=logs,
+                )
+
+            container = await self._engine.inspect(app.id)
+            identity = (
+                await self._plex_server.identity(base_url) if container.state == "running" else None
+            )
+
+            if identity is not None:
+                if identity.claimed:
+                    await report("done", app_line_done(app.name), None)
+                    return None
+
+                if unclaimed_since is None:
+                    unclaimed_since = elapsed
+                claim_failed_log = "Unable to claim Plex server" in await self._engine.logs(
+                    app.id, tail=200
+                )
+                grace_expired = (elapsed - unclaimed_since) >= self.PLEX_UNCLAIMED_GRACE_SECONDS
+                if claim_failed_log or grace_expired:
+                    if retried:
+                        logs = await self._engine.logs(app.id, tail=50)
+                        return self._plex_failure(
+                            "plex_not_claimed", FAILURE_PLEX_NOT_CLAIMED, technical=logs
+                        )
+                    retry_failure = await self._retry_plex_claim(
+                        app, root, compose_path, client_id, token
+                    )
+                    if retry_failure is not None:
+                        return retry_failure
+                    retried = True
+                    unclaimed_since = None
+                    await self._sleep(self.POLL_INTERVAL_SECONDS)
+                    continue
+            else:
+                unclaimed_since = None
+
+            candidate_note = note
+            if not reassured and elapsed >= self.REASSURANCE_AFTER_SECONDS:
+                reassured = True
+                candidate_note = app_note_slow_start(app.name)
+            if candidate_note != note:
+                note = candidate_note
+                await report("starting", line, note)
+
+            await self._sleep(self.POLL_INTERVAL_SECONDS)
+
+    async def _retry_plex_claim(
+        self, app: CatalogApp, root: PurePosixPath, compose_path: Path, client_id: str, token: str
+    ) -> Failure | None:
+        """One recovery attempt: a fresh claim code, written fresh, behind a
+        removed-and-recreated container - `init-plex-claim` only reads the
+        secret again on a genuinely new start, never on an already-running
+        one.
+        """
+        claim_failure = await self._claim_plex(app, root, client_id, token)
+        if claim_failure is not None:
+            return claim_failure
+        remove_result = await self._engine.remove_container(app.id)
+        if not remove_result.ok:
+            return _docker_unreachable_failure(
+                remove_result.detail or f"could not remove {app.id!r}"
+            )
+        result = await self._engine.compose_up(self._settings.stack_project, compose_path, app.id)
+        if not result.ok:
+            return _compose_failure(app, False, result)
+        return None
 
     # --- Running an add or a retry -----------------------------------------
 
@@ -2196,14 +2456,23 @@ class DeployManager:
     def _redact(self, text: str, install: InstallState) -> str:
         """The one place every diagnostics write, snapshot failure and log
         line in this class goes through - keys first, then the saved login
-        password, then the saved VPN login (all read fresh, never cached,
-        and never passed in by a caller that might get them stale).
+        password, then the saved VPN login, then the owner's Plex account
+        token (all read fresh, never cached, and never passed in by a
+        caller that might get them stale).
         """
         saved = load_login(self._settings.config_dir).login
         passwords = (saved.password,) if saved is not None else ()
         vpn_answers = load_answers(self._settings.config_dir).get(VPN_APP_ID, {})
+        plex_account = load_plex_account(self._settings.config_dir)
+        plex_values = (
+            (plex_account.token,) if plex_account is not None and plex_account.token else ()
+        )
         return _redact_secrets(
-            text, install.api_keys, passwords=passwords, vpn_values=secret_values(vpn_answers)
+            text,
+            install.api_keys,
+            passwords=passwords,
+            vpn_values=secret_values(vpn_answers),
+            plex_values=plex_values,
         )
 
     # --- Putting the saved login on one app --------------------------------
@@ -2565,10 +2834,14 @@ def _redact_secrets(
     api_keys: Mapping[str, str],
     passwords: Iterable[str] = (),
     vpn_values: Iterable[str] = (),
+    plex_values: Iterable[str] = (),
 ) -> str:
     """Replace every known API key, then every known password, then every
-    known VPN credential, with a placeholder before text reaches a log
-    line, a diagnostics file or a snapshot's failure detail.
+    known VPN credential, then the owner's Plex account token, with a
+    placeholder before text reaches a log line, a diagnostics file or a
+    snapshot's failure detail - and, last of all, sweep for a claim code's
+    own shape, which this process may never have loaded as a value at all
+    (an already-expired one, echoed back in a container's own logs).
 
     Docker or an app's own error output could echo back an environment
     value we set ourselves - redacting by value here is what keeps "a secret
@@ -2587,7 +2860,10 @@ def _redact_secrets(
     for value in vpn_values:
         if value:
             redacted = redacted.replace(value, _REDACTED_VPN_PLACEHOLDER)
-    return redacted
+    for value in plex_values:
+        if value:
+            redacted = redacted.replace(value, _REDACTED_PLEX_TOKEN_PLACEHOLDER)
+    return _PLEX_CLAIM_PATTERN.sub(_REDACTED_PLEX_CLAIM_PLACEHOLDER, redacted)
 
 
 def _wiring_finale_detail(steps: tuple[WiringStep, ...]) -> str | None:
@@ -2673,6 +2949,9 @@ def _failure_from_payload(payload: dict[str, object]) -> Failure:
                     "vpn_settings_refused",
                     "vpn_not_connected",
                     "vpn_no_tun",
+                    "plex_sign_in_needed",
+                    "plex_not_claimed",
+                    "plex_port_taken",
                 ),
             ),
         ),

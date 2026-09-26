@@ -295,6 +295,12 @@ class _StatefulEngine:
             detail=None,
         )
 
+    async def host_gateway(self, container: str) -> str | None:
+        self.calls.append(("host_gateway", (container,)))
+        if container == self._self_container_id:
+            return "172.18.0.1"
+        return None
+
 
 def _happy_engine(app_ids: tuple[str, ...]) -> _StatefulEngine:
     """A Docker daemon that has never heard of any of our containers, has

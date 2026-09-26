@@ -19,7 +19,7 @@ the whole page be proven with no HTML and no Docker.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from typing import Final, Literal
 
@@ -232,12 +232,22 @@ class InstallRow:
     has confirmed the break-glass phrase - the row then shows the
     "no VPN" description and an undo, instead of Gluetun's own question
     step (already dropped from `steps` by the same confirmation).
+
+    `needs_sign_in` is true only while `steps` carries a `sign_in` field
+    still unanswered - Plex's own row, before the owner has pressed Sign in
+    with Plex. `sign_in_answers` holds ONLY that field's saved value(s),
+    never any other step's answer (a VPN password among them): the row's
+    own hidden multi-step form re-renders through the same shared partial
+    every other row uses, and that partial must never be handed a secret it
+    could echo into the page.
     """
 
     app: CatalogApp
     unavailable: str | None
     steps: tuple[QuestionStep, ...]
     without_vpn: bool = False
+    needs_sign_in: bool = False
+    sign_in_answers: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -439,6 +449,28 @@ class WithoutVpnState:
     problem: str | None
 
 
+def _sign_in_status(
+    steps: Sequence[QuestionStep], answers: Mapping[str, Mapping[str, str]]
+) -> tuple[bool, dict[str, str]]:
+    """Whether `steps` still has an unanswered `sign_in` field, and the map
+    of just those fields' saved values - never any other saved answer, so a
+    VPN password can never reach a row's re-rendered markup through this
+    door.
+    """
+    needs_sign_in = False
+    sign_in_answers: dict[str, str] = {}
+    for step in steps:
+        saved = answers.get(step.app_id, {})
+        for question_field in step.fields:
+            if question_field.kind != "sign_in":
+                continue
+            if question_field.name in saved:
+                sign_in_answers[question_field.name] = saved[question_field.name]
+            else:
+                needs_sign_in = True
+    return needs_sign_in, sign_in_answers
+
+
 def hub_view(
     app_ids: Sequence[str],
     healths: Sequence[AppHealth],
@@ -457,6 +489,7 @@ def hub_view(
     drive: HardlinkResult | None = None,
     recyclarr: SyncStatus | None = None,
     sync_late_after: timedelta = SYNC_LATE_AFTER,
+    answers: Mapping[str, Mapping[str, str]] = {},
 ) -> HubView:
     healths_by_id = {health.app_id: health for health in healths}
     gaps_by_id = {gap.app_id: gap for gap in wiring_gaps}
@@ -519,19 +552,23 @@ def hub_view(
 
     installable = tuple(app for app in CATALOG if app.offered and app.id not in deployed_ids)
     excluded_id = adding.app_id if adding is not None else None
-    install_rows = tuple(
-        InstallRow(
+
+    def _install_row(app: CatalogApp) -> InstallRow:
+        steps = question_steps_for(
+            (*companions_for(app.id, deployed_ids, without_vpn=without_vpn), app.id),
+            present=deployed_ids,
+        )
+        needs_sign_in, sign_in_answers = _sign_in_status(steps, answers)
+        return InstallRow(
             app=app,
             unavailable=unavailable_reason(app, deployed_ids),
-            steps=question_steps_for(
-                (*companions_for(app.id, deployed_ids, without_vpn=without_vpn), app.id),
-                present=deployed_ids,
-            ),
+            steps=steps,
             without_vpn=without_vpn and app.network_via is not None,
+            needs_sign_in=needs_sign_in,
+            sign_in_answers=sign_in_answers,
         )
-        for app in installable
-        if app.id != excluded_id
-    )
+
+    install_rows = tuple(_install_row(app) for app in installable if app.id != excluded_id)
 
     install_block: str | None = None
     if login is not None and login.status == "none":
@@ -903,7 +940,11 @@ def _tile(
     chip = _CHIP_BY_STATE[state]
     # An app with no web page of its own never gets a link, whatever Docker
     # says about it.
-    url = app_url(authority, app.port) if state in _LINKED_STATES and app.web_page else None
+    url = (
+        app_url(authority, app.port, path=app.web_path)
+        if state in _LINKED_STATES and app.web_page
+        else None
+    )
     aria = hub_open_app_aria(app.name, chip) if url is not None else None
     tile = HubTile(
         app_id=app.id,

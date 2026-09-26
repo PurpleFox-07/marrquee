@@ -69,23 +69,26 @@ def host_only(authority: str) -> str | None:
     return host
 
 
-def app_url(authority: str | None, port: int | None) -> str | None:
-    """`http://<host>:<port>/` built from the address the browser used, or
-    `None` when no trustworthy host can be worked out - or when `port` is
+def app_url(authority: str | None, port: int | None, *, path: str = "/") -> str | None:
+    """`http://<host>:<port><path>` built from the address the browser used,
+    or `None` when no trustworthy host can be worked out - or when `port` is
     `None`, a `kind="sync"` app (Recyclarr) having no web page of its own.
 
     Always `http` - the arr apps only ever publish plain HTTP on their own
     ports, so inheriting `https` from a proxied Marrquee would produce a
     link guaranteed to fail. Never invents a host: there is no `localhost`
     fallback and no configured address, because a fabricated link is worse
-    than the page's own "couldn't work out an address" wording.
+    than the page's own "couldn't work out an address" wording. `path`
+    defaults to `"/"`, so every arr app's link is unchanged - Plex's own
+    `/web` is what a caller passes for a catalog entry whose UI doesn't
+    live at the bare root.
     """
     if authority is None or port is None:
         return None
     host = host_only(authority)
     if host is None:
         return None
-    return f"http://{host}:{port}/"
+    return f"http://{host}:{port}{path}"
 
 
 def proxy_suspected(headers: Mapping[str, str]) -> bool:

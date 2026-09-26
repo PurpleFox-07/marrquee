@@ -37,6 +37,7 @@ from marrquee.docker_client import DockerEngine, detect_host_kind
 from marrquee.install import install_apps
 from marrquee.login import LOGIN_STEP, LoginRecord, load_login, save_login
 from marrquee.questions import (
+    PLEX_ACCOUNT_FIELD,
     QuestionStep,
     check_step,
     find_step,
@@ -386,8 +387,25 @@ async def get_setup_question(app_id: str, step_id: str, request: Request) -> Res
         return RedirectResponse("/setup/apps", status_code=303)
 
     saved = load_answers(settings.config_dir).get(app_id, {})
+    problem: str | None = None
+    problem_field: str | None = None
+    # The only refusal ever driven off the query string rather than a post -
+    # an abandoned or declined round trip on plex.tv comes back here as a
+    # GET, so there's no posted form to carry the refusal on.
+    if (
+        step.app_id == "plex"
+        and step.step_id == "sign-in"
+        and request.query_params.get("sign_in") == "failed"
+    ):
+        problem = words.PLEX_SIGN_IN_DIDNT_FINISH
+        problem_field = PLEX_ACCOUNT_FIELD
     context = await _questions_context(
-        request, app_ids=app_ids, step=step, answers=saved, problem=None, problem_field=None
+        request,
+        app_ids=app_ids,
+        step=step,
+        answers=saved,
+        problem=problem,
+        problem_field=problem_field,
     )
     return templates.TemplateResponse(request, "wizard_questions.html", context)
 

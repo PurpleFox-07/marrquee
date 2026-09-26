@@ -355,6 +355,17 @@ def test_links_are_built_from_the_browsers_address_with_each_apps_own_port() -> 
     )
 
 
+def test_a_plex_link_uses_its_own_web_path() -> None:
+    state = _install_state(("plex",), "/volume1/media")
+    snapshot = _snapshot(phase="finale", apps=(_progress("plex", "Plex", "done", port=32400),))
+
+    view = deploy_view(state, snapshot, authority="192.168.1.50:7788")
+
+    assert view.links == (
+        LinkView(label=open_app_label("Plex"), url="http://192.168.1.50:32400/web"),
+    )
+
+
 def test_an_unusable_address_produces_no_links_never_a_guessed_one() -> None:
     state = _install_state(("prowlarr",), "/volume1/media")
     snapshot = _snapshot(

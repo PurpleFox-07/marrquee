@@ -19,6 +19,7 @@
 
   <form method="post" action="/setup/questions/{{ step.app_id }}/{{ step.step_id }}">
     <input type="hidden" name="apps" value="{{ apps_csv }}">
+    {% set sign_in_then = "wizard" %}
     {% include "partials/app_questions.html" %}
 
     <div class="actions">

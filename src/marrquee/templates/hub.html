@@ -268,6 +268,11 @@
 
     <div data-panel-pane="install">
       <a class="btn-ghost" href="/?panel=choose#hub-panel" data-panel-choice="choose">{{ words.HUB_PANEL_BACK }}</a>
+      {% if plex_sign_in_failed %}
+      <div class="refusal-banner" role="alert" data-role="sign-in-refusal">
+        <p>{{ words.PLEX_SIGN_IN_DIDNT_FINISH }}</p>
+      </div>
+      {% endif %}
       {% if view.install_block %}
       <p data-role="install-block">{{ view.install_block }}</p>
       {% elif not view.install_rows %}
@@ -292,6 +297,12 @@
           {% endif %}
           {% if row.unavailable %}
           <p class="install-row__reason">{{ words.hub_install_unavailable(row.unavailable) }}</p>
+          {% elif row.needs_sign_in %}
+          <form method="post" action="/plex/sign-in" class="install-row__sign-in">
+            <input type="hidden" name="then" value="hub">
+            <button type="submit" class="btn-primary" data-sign-in="plex">{{ words.PLEX_SIGN_IN_BUTTON }}</button>
+          </form>
+          <p class="install-row__hint">{{ words.PLEX_SIGN_IN_HINT }}</p>
           {% else %}
           <button
             type="button"
@@ -305,9 +316,10 @@
       </ul>
       {% for row in view.install_rows if row.steps and not row.unavailable %}
       <form data-install-form="{{ row.app.id }}" hidden>
-        {% set answers = {} %}
+        {% set answers = row.sign_in_answers %}
         {% set problem = none %}
         {% set problem_field = none %}
+        {% set sign_in_then = "hub" %}
         {% for step in row.steps %}
         {% set escape_url = "/?panel=without-vpn#hub-panel" if row.app.id == "qbittorrent" else none %}
         {% set escape_panel = "without-vpn" if row.app.id == "qbittorrent" else none %}

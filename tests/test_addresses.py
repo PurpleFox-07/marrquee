@@ -68,6 +68,17 @@ def test_app_url_with_no_port_is_none() -> None:
     assert app_url("192.168.1.50:7788", None) is None
 
 
+def test_app_url_appends_the_web_path() -> None:
+    """Plex's own web UI lives at `/web` - a bare `:32400/` answers an
+    unauthenticated 401 instead of the player.
+    """
+    assert app_url("nas:7788", 32400, path="/web") == "http://nas:32400/web"
+
+
+def test_app_url_default_path_keeps_every_arr_link_byte_identical() -> None:
+    assert app_url("192.168.1.50:7788", 8989) == app_url("192.168.1.50:7788", 8989, path="/")
+
+
 # --- proxy_suspected -----------------------------------------------------------
 
 

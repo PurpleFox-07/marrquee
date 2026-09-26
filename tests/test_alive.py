@@ -86,6 +86,9 @@ class _CountingDockerEngine:
     async def exec_inspect(self, exec_id: str) -> ExecState:
         raise NotImplementedError("the alive page never execs into a container")
 
+    async def host_gateway(self, container: str) -> str | None:
+        raise NotImplementedError("the alive page never looks up a host gateway")
+
 
 class _ExplodingDockerEngine:
     """A DockerEngine whose every method always raises.
@@ -126,6 +129,9 @@ class _ExplodingDockerEngine:
         raise RuntimeError("healthz must never call the Docker engine")
 
     async def exec_inspect(self, exec_id: str) -> ExecState:
+        raise RuntimeError("healthz must never call the Docker engine")
+
+    async def host_gateway(self, container: str) -> str | None:
         raise RuntimeError("healthz must never call the Docker engine")
 
 

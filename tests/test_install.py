@@ -49,6 +49,26 @@ def test_install_apps_saves_state_with_one_generated_key_per_app(tmp_path: Path)
     assert saved == result.state
 
 
+def test_plex_gets_an_ordinary_unused_key_like_every_other_app(tmp_path: Path) -> None:
+    """Plex has no `api_key_source` field - it mints an ordinary, unused
+    hex32 key the same way Recyclarr does. Nothing about install.py's
+    minting has to know or care that Plex never reads it back.
+    """
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+
+    result = install_apps(settings, str(root), ["sonarr", "plex"])
+
+    assert result.ok
+    assert result.state is not None
+    assert set(result.state.api_keys) == {"sonarr", "plex"}
+    assert len(result.state.api_keys["plex"]) == 32
+    assert result.state.api_keys["plex"] != result.state.api_keys["sonarr"]
+
+    grown = with_app_added(_state((), {}), "plex")
+    assert len(grown.api_keys["plex"]) == 32
+
+
 def test_install_apps_keeps_an_existing_key_on_a_repost(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     root = _fresh_root(settings)
@@ -120,7 +140,7 @@ def test_install_apps_refuses_an_unknown_app_id_and_saves_nothing(tmp_path: Path
     settings = _settings(tmp_path)
     root = _fresh_root(settings)
 
-    result = install_apps(settings, str(root), ["plex"])
+    result = install_apps(settings, str(root), ["not-a-real-app"])
 
     assert not result.ok
     assert result.kind == "invalid_input"
@@ -317,7 +337,7 @@ def test_with_app_added_raises_key_error_for_an_unknown_app() -> None:
     state = _state((), {})
 
     with pytest.raises(KeyError):
-        with_app_added(state, "plex")
+        with_app_added(state, "not-a-real-app")
 
 
 def test_with_app_removed_keeps_the_removed_apps_key() -> None:
@@ -345,4 +365,4 @@ def test_with_app_removed_raises_key_error_for_an_unknown_app() -> None:
     state = _state(("sonarr",), {"sonarr": "sonarr-key"})
 
     with pytest.raises(KeyError):
-        with_app_removed(state, "plex")
+        with_app_removed(state, "not-a-real-app")
