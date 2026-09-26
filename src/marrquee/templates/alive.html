@@ -25,6 +25,31 @@
     {% endfor %}
   </div>
 
+  <section
+    id="your-drive"
+    class="card your-drive"
+    data-drive-state="{{ drive.state }}"
+    aria-labelledby="your-drive-title"
+  >
+    <h2 id="your-drive-title" class="status-title">{{ words.DRIVE_SECTION_TITLE }}</h2>
+    <div class="status-row">
+      <span
+        class="status-icon status-icon--{{ drive.state }}"
+        aria-hidden="true"
+      >{% if drive.state == "ok" %}✓{% elif drive.state == "warn" %}!{% else %}–{% endif %}</span>
+      <div class="status-text">
+        <p class="status-title" data-role="drive-title">{{ drive.title }}</p>
+        <p class="status-detail" data-role="drive-detail">{{ drive.detail }}</p>
+        {% if drive.what_to_do %}
+        <p class="status-detail" data-role="drive-what-to-do">{{ drive.what_to_do }}</p>
+        {% endif %}
+        {% if drive.technical %}
+        <p class="drive-technical" data-role="drive-technical">{{ drive.technical }}</p>
+        {% endif %}
+      </div>
+    </div>
+  </section>
+
   <section id="last-problem" class="card last-problem" aria-labelledby="last-problem-title">
     <h2 id="last-problem-title" class="status-title">{{ words.LAST_PROBLEM_TITLE }}</h2>
     {% if last_problem %}

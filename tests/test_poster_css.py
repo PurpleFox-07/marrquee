@@ -217,3 +217,25 @@ def test_the_no_vpn_badge_gets_its_tap_target_from_padding_not_a_fixed_height() 
 
     assert "padding: var(--space-3) var(--space-4);" in body
     assert "height" not in body
+
+
+def test_the_drive_note_gets_its_tap_target_from_padding_not_a_fixed_height() -> None:
+    body = _block_for(_HUB_CSS.read_text(), ".hub-drive-note")
+
+    assert "padding: var(--space-3) var(--space-4);" in body
+    assert "height" not in body
+
+
+def test_the_drive_note_is_hidden_by_the_root_attribute_not_by_removing_it() -> None:
+    """The poll needs the note ON the page to toggle it live - unlike the
+    down-note and docker-banner rules right above it in hub.css, which the
+    same pattern already covers, this pins the shape specific to the drive
+    note's own hooks.
+    """
+    css = _HUB_CSS.read_text()
+
+    hidden_body = _block_for(css, '[data-role="drive-note"]')
+    assert "display: none;" in hidden_body
+
+    shown_body = _block_for(css, '[data-drive-note="true"] [data-role="drive-note"]')
+    assert "display: inline-flex;" in shown_body

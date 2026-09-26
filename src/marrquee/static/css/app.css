@@ -99,6 +99,16 @@ h1 .accent {
   background: var(--error-light);
 }
 
+.status-icon--warn {
+  color: var(--warning);
+  background: var(--warning-light);
+}
+
+.status-icon--idle {
+  color: var(--text-secondary);
+  background: var(--surface);
+}
+
 .status-title {
   margin: 0;
   font-size: var(--text-base);
@@ -173,6 +183,19 @@ h1 .accent {
 .btn-ghost:focus-visible {
   outline: 2px solid var(--spotlight);
   outline-offset: 2px;
+}
+
+/* --- Diagnostics: the "Your drive" section ------------------------------ */
+
+.your-drive {
+  margin-top: var(--space-8);
+}
+
+.drive-technical {
+  margin: var(--space-1) 0 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
 }
 
 /* --- Diagnostics: the "Last problem" section --------------------------- */

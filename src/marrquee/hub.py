@@ -36,6 +36,7 @@ from marrquee.catalog import (
 )
 from marrquee.deploy import AddState, AppAdd, WiringGap
 from marrquee.docker_client import ContainerHealth
+from marrquee.hardlinks import HardlinkResult
 from marrquee.health import AppHealth, HubState, LinkHealth, LinkState
 from marrquee.links import LinkCard, link_address, link_glyph
 from marrquee.login import LoginRecord, LoginStatus, login_status, pending_app_ids, reset_reminder
@@ -52,6 +53,8 @@ from marrquee.words import (
     HUB_CHIP_UP,
     HUB_CHIP_VPN_CHANGE_FAILED,
     HUB_CHIP_VPN_CHANGING,
+    HUB_DRIVE_NOTE_COPIES,
+    HUB_DRIVE_NOTE_UNCHECKED,
     HUB_INSTALL_BUSY_LOGIN,
     HUB_INSTALL_LOGIN_FIRST,
     HUB_LINE_PAUSED_FOR_VPN,
@@ -225,6 +228,11 @@ class HubView:
     all: only before qBittorrent (or the VPN) exists, and only once, since
     a saved confirmation already answered the question the escape hatch
     asks.
+
+    `drive_note` is the Hub's own amber sentence about the drive check
+    (`None` while it's quiet) - the one place that sentence is computed,
+    read alike by the page and by `GET /api/hub/status`, so the two can
+    never disagree about it.
     """
 
     tiles: tuple[HubTile, ...]
@@ -243,6 +251,7 @@ class HubView:
     running_without_vpn: bool = False
     vpn_pane: Literal["add", "change"] | None = None
     without_vpn_offer: bool = False
+    drive_note: str | None = None
 
 
 LoginBanner = Literal["none", "choose", "reset", "applying", "pending"]
@@ -415,6 +424,7 @@ def hub_view(
     login: LoginView | None = None,
     vpn_place: TunnelPlace | None = None,
     without_vpn: bool = False,
+    drive: HardlinkResult | None = None,
 ) -> HubView:
     healths_by_id = {health.app_id: health for health in healths}
     gaps_by_id = {gap.app_id: gap for gap in wiring_gaps}
@@ -542,7 +552,23 @@ def hub_view(
             and adding is None
             and not without_vpn
         ),
+        drive_note=_drive_note(drive),
     )
+
+
+def _drive_note(drive: HardlinkResult | None) -> str | None:
+    """The Hub's own amber sentence for the latest saved drive check, or
+    `None` while it should stay quiet - a drive that works, isn't needed
+    yet, or has never been checked all say nothing on the Hub (Diagnostics
+    always runs fresh, so a missing result is never the Hub's job to flag).
+    """
+    if drive is None:
+        return None
+    if drive.outcome == "copies":
+        return HUB_DRIVE_NOTE_COPIES
+    if drive.outcome == "couldnt_check":
+        return HUB_DRIVE_NOTE_UNCHECKED
+    return None
 
 
 def running_without_vpn(app_ids: Iterable[str], adding: AppAdd | None) -> bool:

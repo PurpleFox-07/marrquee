@@ -335,6 +335,19 @@ class _CountingWiringRunner:
         self.calls += 1
 
 
+class _RecordingHardlinkTrigger:
+    """Stands in for `HardlinkMonitor` on every deploy/add test: counts how
+    many times it was asked for a check, and never touches a real drive.
+    """
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def request_check(self) -> object:
+        self.calls += 1
+        return None
+
+
 class _OneStepWiringRunner:
     """Emits exactly one step, carrying a technical detail that must never
     reach a snapshot.
@@ -874,6 +887,46 @@ async def test_phases_follow_ready_running_wiring_finale_and_wiring_runs_once(
     assert "wiring" in phases_seen
     assert phases_seen[-1] == "finale"
     assert wiring.calls == 1
+
+
+# --- The drive check is asked for once the finale is published, never before -
+
+
+async def test_a_finished_full_deploy_asks_for_one_check_after_the_finale_is_published(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+    install = _install_state(("prowlarr",), root)
+    save_state(settings.config_dir, install)
+
+    engine = _happy_engine(("prowlarr",))
+    probe = FakeReadinessProbe(default=True)
+    trigger = _RecordingHardlinkTrigger()
+    manager = DeployManager(settings, engine, probe=probe, hardlinks=trigger)
+
+    manager.start()
+    history = await _run_to_terminal(manager)
+
+    assert history[-1].phase == "finale"
+    assert trigger.calls == 1
+
+
+async def test_a_failed_deploy_asks_for_no_check(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+    install = _install_state(("sonarr",), root)
+    save_state(settings.config_dir, install)
+
+    engine = FakeDockerEngine(DockerStatus(connected=False, detail="no socket"))
+    trigger = _RecordingHardlinkTrigger()
+    manager = DeployManager(settings, engine, hardlinks=trigger)
+
+    manager.start()
+    history = await _run_to_terminal(manager)
+
+    assert history[-1].phase == "error"
+    assert trigger.calls == 0
 
 
 async def test_a_wiring_failure_never_fails_the_deploy_and_its_detail_is_diagnostics_only(

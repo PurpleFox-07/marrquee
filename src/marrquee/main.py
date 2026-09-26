@@ -18,6 +18,7 @@ from fastapi.templating import Jinja2Templates
 from marrquee.config import Settings
 from marrquee.deploy import DeployManager, HttpReadinessProbe, ReadinessProbe
 from marrquee.docker_client import DockerEngine, SocketDockerEngine
+from marrquee.hardlinks import HardlinkMonitor
 from marrquee.health import HttpLinkProbe, LinkProbe
 from marrquee.login_apply import HttpLoginApplier, LoginApplier
 from marrquee.routes.alive import router as alive_router
@@ -50,6 +51,7 @@ def create_app(
     login_applier: LoginApplier | None = None,
     vpn_control: GluetunControl | None = None,
     qbit_client: QbitClient | None = None,
+    hardlinks: HardlinkMonitor | None = None,
 ) -> FastAPI:
     """Build the Marrquee app.
 
@@ -76,7 +78,12 @@ def create_app(
     qBittorrent call goes through, shared by the deploy manager's own
     bring-up/readiness check and its `HttpLoginApplier`, and kept on
     `app.state.qbit_client` so a later chunk's `WiringEngine` can be handed
-    that same instance without re-plumbing this seam.
+    that same instance without re-plumbing this seam. `hardlinks=None`
+    builds one real `HardlinkMonitor(settings)`, handed to a freshly-built
+    `DeployManager` as `hardlinks=` AND kept on `app.state.hardlinks` for
+    the Hub and Diagnostics to read - the same single instance either way,
+    so a test that passes its own `manager=` still needs to pass
+    `hardlinks=` too if that manager should ask for the same checks.
     """
     if settings is None:
         settings = Settings.from_env()
@@ -86,6 +93,8 @@ def create_app(
         vpn_control = HttpGluetunControl()
     if qbit_client is None:
         qbit_client = HttpQbitClient()
+    if hardlinks is None:
+        hardlinks = HardlinkMonitor(settings)
     if manager is None:
         manager = DeployManager(
             settings,
@@ -101,6 +110,7 @@ def create_app(
             ),
             vpn=vpn_control,
             qbit=qbit_client,
+            hardlinks=hardlinks,
         )
     if link_probe is None:
         link_probe = HttpLinkProbe()
@@ -118,6 +128,7 @@ def create_app(
     app.state.link_probe = link_probe
     app.state.vpn_control = vpn_control
     app.state.qbit_client = qbit_client
+    app.state.hardlinks = hardlinks
     app.state.templates = Jinja2Templates(directory=_TEMPLATES_DIR)
 
     app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")

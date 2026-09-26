@@ -42,6 +42,7 @@ from marrquee.deploy import (
     WiringGap,
 )
 from marrquee.docker_client import ContainerSnapshot, DockerStatus, FakeDockerEngine
+from marrquee.hardlinks import HardlinkMonitor, HardlinkResult, save_hardlink_result
 from marrquee.health import FakeLinkProbe
 from marrquee.hub import LOGIN_HELP_URL
 from marrquee.links import LINK_COUNT_MAX, LinkCard, load_links, save_links
@@ -70,7 +71,30 @@ _TEMPLATES_DIR = Path(__file__).resolve().parents[1] / "src" / "marrquee" / "tem
 
 
 def _settings(tmp_path: Path) -> Settings:
-    return Settings(host_mount=tmp_path / "host", config_dir=tmp_path / "config")
+    settings = Settings(host_mount=tmp_path / "host", config_dir=tmp_path / "config")
+    _seed_fresh_drive_check(settings)
+    return settings
+
+
+def _seed_fresh_drive_check(settings: Settings) -> None:
+    """A drive-check result saved just now, so `create_app`'s own default
+    `HardlinkMonitor` (built whenever a test's own `create_app(...)` call
+    passes no `hardlinks=`) never starts a real filesystem probe in the
+    background - `refresh_if_due` only starts one for a missing or day-old
+    result, and most of this file's tests have no opinion about the drive
+    check at all. A test that DOES care injects its own `hardlinks=` with a
+    saved result and clock it controls, which simply overwrites this one.
+    """
+    save_hardlink_result(
+        settings.config_dir,
+        HardlinkResult(
+            outcome="works",
+            reason=None,
+            folder=None,
+            technical=None,
+            checked_at=datetime.now(UTC).isoformat(),
+        ),
+    )
 
 
 def _install_state(app_ids: tuple[str, ...]) -> InstallState:
@@ -158,13 +182,18 @@ def _client(
     *,
     link_probe: FakeLinkProbe | None = None,
     vpn_control: FakeGluetunControl | None = None,
+    hardlinks: HardlinkMonitor | None = None,
 ) -> TestClient:
     if engine is None:
         engine = FakeDockerEngine(DockerStatus(connected=True, version="27.3.1"))
     if link_probe is None:
         link_probe = FakeLinkProbe()
     app = create_app(
-        settings=settings, engine=engine, link_probe=link_probe, vpn_control=vpn_control
+        settings=settings,
+        engine=engine,
+        link_probe=link_probe,
+        vpn_control=vpn_control,
+        hardlinks=hardlinks,
     )
     return TestClient(app)
 
@@ -2668,3 +2697,208 @@ def test_the_seeding_pane_preselects_the_saved_preset(tmp_path: Path) -> None:
     pane = _seeding_pane_html(client.get("/?panel=seeding").text)
 
     assert re.search(r'value="private"\s+checked', pane) is not None
+
+
+# --- The drive check's own amber note: one builder, read alike by the page
+# and the poll ----------------------------------------------------------------
+
+
+class _DriveNoteCollector(HTMLParser):
+    """Collects the drive note's own text - `None` if the tag is never
+    reached at all (it's ALWAYS in the markup per the contract, so a
+    missing tag would itself be worth surfacing rather than reading as "").
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.text: str | None = None
+        self._capturing = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "span" and dict(attrs).get("data-role") == "drive-note-text":
+            self._capturing = True
+            self.text = ""
+
+    def handle_data(self, data: str) -> None:
+        if self._capturing:
+            self.text = (self.text or "") + data
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "span":
+            self._capturing = False
+
+
+def _drive_note_text(page_html: str) -> str | None:
+    collector = _DriveNoteCollector()
+    collector.feed(page_html)
+    return collector.text
+
+
+def _drive_result(
+    outcome: str, *, reason: str | None = None, checked_at: datetime | None = None
+) -> HardlinkResult:
+    return HardlinkResult(
+        outcome=outcome,  # type: ignore[arg-type]
+        reason=reason,  # type: ignore[arg-type]
+        folder="/volume1/media/data/media/tv" if reason is not None else None,
+        technical=None,
+        checked_at=(checked_at or datetime.now(UTC)).isoformat(),
+    )
+
+
+def test_page_note_and_poll_note_are_the_same_words_from_one_builder(tmp_path: Path) -> None:
+    """FIRST TEST (has-data-pipeline) - `GET /` and `GET /api/hub/status`
+    both draw the amber note through `read_hub_view`, so the two can never
+    word it differently.
+    """
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    _write_snapshot(settings, _finale_snapshot(("sonarr",)))
+    save_hardlink_result(settings.config_dir, _drive_result("copies", reason="different_drives"))
+    monitor = HardlinkMonitor(settings, clock=lambda: datetime.now(UTC))
+    client = _client(settings, hardlinks=monitor)
+
+    page = client.get("/")
+    status = client.get("/api/hub/status")
+
+    page_note = _drive_note_text(page.text)
+    assert page_note == status.json()["drive_note"] == words.HUB_DRIVE_NOTE_COPIES
+    assert _root(page.text)["data-drive-note"] == "true"
+
+
+def test_a_works_result_shows_no_note_on_the_page_or_the_poll(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    _write_snapshot(settings, _finale_snapshot(("sonarr",)))
+    save_hardlink_result(settings.config_dir, _drive_result("works"))
+    monitor = HardlinkMonitor(settings, clock=lambda: datetime.now(UTC))
+    client = _client(settings, hardlinks=monitor)
+
+    page = client.get("/")
+    status = client.get("/api/hub/status")
+
+    assert _drive_note_text(page.text) == ""
+    assert _root(page.text)["data-drive-note"] == "false"
+    assert status.json()["drive_note"] is None
+
+
+def test_couldnt_check_shows_its_own_sentence(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    _write_snapshot(settings, _finale_snapshot(("sonarr",)))
+    save_hardlink_result(
+        settings.config_dir, _drive_result("couldnt_check", reason="folder_missing")
+    )
+    monitor = HardlinkMonitor(settings, clock=lambda: datetime.now(UTC))
+    client = _client(settings, hardlinks=monitor)
+
+    page = client.get("/")
+
+    assert _drive_note_text(page.text) == words.HUB_DRIVE_NOTE_UNCHECKED
+    assert _root(page.text)["data-drive-note"] == "true"
+
+
+def test_not_needed_and_no_saved_file_show_no_note(tmp_path: Path) -> None:
+    # A raw Settings, never seeded with a saved result - the same "nothing
+    # usable yet" shape an upgrading owner's config folder starts in.
+    settings = Settings(host_mount=tmp_path / "host", config_dir=tmp_path / "config")
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    _write_snapshot(settings, _finale_snapshot(("sonarr",)))
+    monitor = HardlinkMonitor(settings, clock=lambda: datetime.now(UTC))
+    client = _client(settings, hardlinks=monitor)
+
+    page = client.get("/")
+
+    assert _drive_note_text(page.text) == ""
+    assert _root(page.text)["data-drive-note"] == "false"
+
+
+def test_the_note_links_to_diagnostics_your_drive_section(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    _write_snapshot(settings, _finale_snapshot(("sonarr",)))
+    save_hardlink_result(settings.config_dir, _drive_result("copies", reason="different_drives"))
+    monitor = HardlinkMonitor(settings, clock=lambda: datetime.now(UTC))
+    client = _client(settings, hardlinks=monitor)
+
+    page = client.get("/").text
+
+    note = re.search(r'<a[^>]*data-role="drive-note"[^>]*>', page)
+    assert note is not None
+    assert 'href="/diagnostics#your-drive"' in note.group(0)
+    _assert_unique_ids(page)
+
+
+def test_the_note_sits_after_the_no_vpn_badge_when_both_apply(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("qbittorrent",)))
+    _write_snapshot(settings, _finale_snapshot(("qbittorrent",)))
+    save_hardlink_result(settings.config_dir, _drive_result("copies", reason="different_drives"))
+    monitor = HardlinkMonitor(settings, clock=lambda: datetime.now(UTC))
+    client = _client(settings, hardlinks=monitor)
+
+    page = client.get("/").text
+
+    badge_index = page.index('data-role="no-vpn-badge"')
+    note_index = page.index('data-role="drive-note"')
+    assert badge_index < note_index
+
+
+def test_read_hub_view_asks_the_monitor_to_refresh_exactly_once_per_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`read_hub_view` has several callers (the page, the poll, every write
+    route's own re-render), so its own job is asking the monitor exactly
+    once each time it's called - the monitor's own dedupe is what then
+    keeps that to at most one check actually in flight, however many
+    callers ask on the same tick.
+    """
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    _write_snapshot(settings, _finale_snapshot(("sonarr",)))
+    monitor = HardlinkMonitor(settings, clock=lambda: datetime.now(UTC))
+    calls: list[None] = []
+    original_refresh = monitor.refresh_if_due
+
+    def counting_refresh() -> None:
+        calls.append(None)
+        original_refresh()
+
+    monkeypatch.setattr(monitor, "refresh_if_due", counting_refresh)
+    client = _client(settings, hardlinks=monitor)
+
+    client.get("/")
+    assert len(calls) == 1
+
+    client.get("/api/hub/status")
+    assert len(calls) == 2
+
+
+def test_the_poll_starts_the_daily_check_when_the_saved_result_is_a_day_old(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    _write_snapshot(settings, _finale_snapshot(("sonarr",)))
+    stale_at = datetime(2026, 9, 24, 0, 0, 0, tzinfo=UTC)
+    save_hardlink_result(settings.config_dir, _drive_result("works", checked_at=stale_at))
+    monitor = HardlinkMonitor(settings, clock=lambda: stale_at + timedelta(hours=25))
+    client = _client(settings, hardlinks=monitor)
+
+    client.get("/api/hub/status")
+
+    assert monitor._task is not None  # type: ignore[attr-defined]
+
+
+def test_a_fresh_saved_result_or_one_still_in_flight_starts_no_check(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    _write_snapshot(settings, _finale_snapshot(("sonarr",)))
+    fresh_at = datetime(2026, 9, 24, 0, 0, 0, tzinfo=UTC)
+    save_hardlink_result(settings.config_dir, _drive_result("works", checked_at=fresh_at))
+    monitor = HardlinkMonitor(settings, clock=lambda: fresh_at + timedelta(hours=1))
+    client = _client(settings, hardlinks=monitor)
+
+    client.get("/api/hub/status")
+
+    assert monitor._task is None  # type: ignore[attr-defined]

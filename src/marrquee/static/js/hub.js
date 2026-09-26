@@ -38,6 +38,7 @@
     "busy",
     "login_banner",
     "running_without_vpn",
+    "drive_note",
   ];
   var APP_FIELDS = [
     "app_id",
@@ -153,6 +154,8 @@
     }
     root.dataset.anyDown = payload.any_down ? "true" : "false";
     root.dataset.dockerUnreachable = payload.docker_unreachable ? "true" : "false";
+    root.dataset.driveNote = payload.drive_note ? "true" : "false";
+    setText("drive-note-text", payload.drive_note || "");
     announce(payload.announce);
   }
 

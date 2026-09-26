@@ -251,6 +251,7 @@ class HubStatusOut(BaseModel):
     login_banner: LoginBanner | None
     vpn_tunnel: TunnelState | None
     running_without_vpn: bool
+    drive_note: str | None
 
 
 class HubInstallRequest(BaseModel):
@@ -533,6 +534,7 @@ async def get_hub_status(request: Request) -> HubStatusOut:
         login_banner=view.login.banner if view.login is not None else None,
         vpn_tunnel=view.vpn_tunnel,
         running_without_vpn=view.running_without_vpn,
+        drive_note=view.drive_note,
     )
 
 

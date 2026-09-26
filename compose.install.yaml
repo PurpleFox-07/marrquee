@@ -28,9 +28,9 @@ services:
       # under /volume1 - if a second drive pool shows up as /volume2 on
       # yours, add a second line here: "/volume2:/host/volume2". Marrquee
       # can only see and build inside what is mounted here, and only ever
-      # writes inside the one folder you type. (The NAS's Docker app no
-      # longer accepts mounting the whole NAS as one line, so this is
-      # mounted folder by folder instead.)
+      # writes inside the one folder you type - it never moves, changes or deletes anything you put there.
+      # (The NAS's Docker app no longer accepts mounting the whole NAS as
+      # one line, so this is mounted folder by folder instead.)
       - /volume1:/host/volume1
     environment:
       # Forgot the login for your apps? Type any word between the quotes

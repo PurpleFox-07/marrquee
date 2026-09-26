@@ -1,13 +1,16 @@
-"""The only module allowed to touch the host filesystem the owner mounted in.
+"""The module that builds and checks the host filesystem the owner mounted in.
 
 The owner gave Marrquee a read-write view of their NAS's shared-folder
 root(s) (for example `/volume1` mounted at `/host/volume1`) so that a typed
 path can be checked and its folders built without spawning a helper
 container per keystroke. That capability is only safe because this
-one module enforces the promise the rest of the product makes: Marrquee
-only ever `mkdir`s and `chown`s folders it created itself, and it is
+module enforces the promise the rest of the product makes: Marrquee only
+ever `mkdir`s and `chown`s folders it created itself, and it is
 structurally incapable of deleting, moving or renaming anything - proven by
 `test_storage_py_has_no_deletion_calls` scanning this file's own source.
+The one other module that touches this filesystem is `hardlinks.py`, which
+carries the same proof for the one thing it is ever allowed to create and
+remove: its own named hard-link test file, nothing else.
 
 Every function here that touches the filesystem resolves the path it is
 about to use and checks it really lands inside the folder the owner chose,

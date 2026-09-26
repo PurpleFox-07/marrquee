@@ -50,6 +50,7 @@ from marrquee.compose import (
 )
 from marrquee.config import Settings
 from marrquee.docker_client import ComposeResult, DockerEngine
+from marrquee.hardlinks import HardlinkTrigger
 from marrquee.install import with_app_added, with_app_removed
 from marrquee.login import SavedLogin, load_login, pending_app_ids, record_applied
 from marrquee.login_apply import LoginApplier, NoLoginApplier
@@ -370,6 +371,7 @@ class DeployManager:
         login: LoginApplier = NoLoginApplier(),
         vpn: GluetunControl = NoGluetunControl(),
         qbit: QbitClient = HttpQbitClient(),
+        hardlinks: HardlinkTrigger | None = None,
     ) -> None:
         self._settings = settings
         self._engine = engine
@@ -380,6 +382,7 @@ class DeployManager:
         self._login = login
         self._vpn = vpn
         self._qbit = qbit
+        self._hardlinks = hardlinks
         self._task: asyncio.Task[None] | None = None
         # The login run's own in-memory progress line - never persisted and
         # never resumed after a restart (the pending names plus Try again
@@ -1162,6 +1165,11 @@ class DeployManager:
                 wiring=wiring_steps,
             )
         )
+        if self._hardlinks is not None:
+            # Fired, never awaited: a hung drive must never pin this task
+            # as "busy" - the check runs and saves on its own, and the next
+            # poll or Diagnostics visit sees its result.
+            self._hardlinks.request_check()
 
     async def _find_name_clash(
         self, install: InstallState, root: PurePosixPath, catalog_apps: tuple[CatalogApp, ...]
@@ -1705,6 +1713,13 @@ class DeployManager:
             # A successful move is the one thing that turns the badge off -
             # a failed one (caught above, before this line) keeps it lit.
             clear_without_vpn(self._settings.config_dir)
+
+        if self._hardlinks is not None:
+            # The one place every successful add/retry/resumed add ends -
+            # reconnect, Change VPN and restore each end in
+            # `_run_wiring_for_add` directly and never reach here, so
+            # moving an existing pair around never asks for a needless check.
+            self._hardlinks.request_check()
 
     def _add_reporter(self) -> Callable[[AppState, str, str | None], Awaitable[None]]:
         """The add path's own `report` callback for `_bring_up_app`.

@@ -31,6 +31,7 @@ from marrquee.catalog import get_app
 from marrquee.config import Settings
 from marrquee.deploy import AddStart, DeployManager, DeploySnapshot
 from marrquee.docker_client import DockerEngine
+from marrquee.hardlinks import HardlinkMonitor
 from marrquee.health import LinkProbe, read_health, read_link_health
 from marrquee.hub import (
     HUB_ADD_POLL_MS,
@@ -105,7 +106,7 @@ def _ready_for_link_edits(request: Request) -> bool:
 async def read_hub_view(request: Request) -> HubView:
     """Build the one `HubView` both `GET /` and `GET /api/hub/status` draw
     from, so an app or a link can never look Up on the page and Down on the
-    live poll (or the reverse).
+    live poll (or the reverse) - the drive check's own amber note included.
 
     The Docker read and the link checks run under one `asyncio.gather`, so
     a slow or unreachable link never adds its own wait on top of the Docker
@@ -114,11 +115,18 @@ async def read_hub_view(request: Request) -> HubView:
     public-IP lookup joins that same gather as a third member, so a hung
     control server never adds its own wait either - its own client keeps a
     short timeout and never raises.
+
+    `monitor.refresh_if_due()` is called exactly once here, whatever the
+    saved result's age - the monitor's own dedupe (Chunk 2) is what keeps
+    that to at most one check in flight, even though this function has
+    several callers (the page, the poll, and every write route's own
+    re-render).
     """
     settings: Settings = request.app.state.settings
     manager: DeployManager = request.app.state.deploy
     engine: DockerEngine = request.app.state.docker_engine
     link_probe: LinkProbe = request.app.state.link_probe
+    monitor: HardlinkMonitor = request.app.state.hardlinks
 
     snapshot = manager.snapshot()
     app_ids = tuple(app.app_id for app in snapshot.apps)
@@ -152,6 +160,8 @@ async def read_hub_view(request: Request) -> HubView:
         running_line=manager.login_progress(),
     )
 
+    monitor.refresh_if_due()
+
     return hub_view(
         app_ids,
         healths,
@@ -166,6 +176,7 @@ async def read_hub_view(request: Request) -> HubView:
         login=login,
         vpn_place=vpn_place,
         without_vpn=without_vpn_confirmed(settings.config_dir),
+        drive=monitor.latest(),
     )
 
 

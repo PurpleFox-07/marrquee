@@ -15,7 +15,10 @@ from pathlib import Path
 
 from marrquee import catalog, deploy, links, words
 
-_SRC_DIR = Path(__file__).resolve().parent.parent / "src" / "marrquee"
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_SRC_DIR = _REPO_ROOT / "src" / "marrquee"
+_README_PATH = _REPO_ROOT / "README.md"
+_COMPOSE_PATH = _REPO_ROOT / "compose.install.yaml"
 
 # Mirrors the story's Content Direction table, row for row. Adding, removing
 # or renaming any of these is a copy change and must fail here until the
@@ -368,6 +371,33 @@ _EXPECTED_INVENTORY = (
     "HUB_CHIP_VPN_CHANGE_FAILED",
     "HUB_KEEP_WITHOUT_VPN",
     "HUB_LINE_RESTARTING_WITHOUT_VPN",
+    "LINK_TEST_FILE_TEXT",
+    "DRIVE_SECTION_TITLE",
+    "DRIVE_WORKS_TITLE",
+    "DRIVE_WORKS_DETAIL",
+    "DRIVE_NOT_NEEDED_TITLE",
+    "DRIVE_NOT_NEEDED_DETAIL",
+    "DRIVE_STILL_CHECKING_TITLE",
+    "DRIVE_STILL_CHECKING_DETAIL",
+    "DRIVE_COPIES_TITLE",
+    "DRIVE_COULDNT_CHECK_TITLE",
+    "drive_reason_different_drives",
+    "drive_reason_no_hard_links",
+    "drive_reason_not_allowed",
+    "drive_reason_drive_full",
+    "drive_reason_folder_missing",
+    "drive_reason_folder_elsewhere",
+    "drive_reason_unexpected",
+    "DRIVE_TODO_SAME_DRIVE",
+    "DRIVE_TODO_NATIVE_DRIVE",
+    "DRIVE_TODO_PERMISSIONS",
+    "DRIVE_TODO_FREE_SPACE",
+    "DRIVE_TODO_REBUILD_FOLDER",
+    "DRIVE_TODO_REAL_FOLDER",
+    "DRIVE_TODO_ASK_FOR_HELP",
+    "drive_technical",
+    "HUB_DRIVE_NOTE_COPIES",
+    "HUB_DRIVE_NOTE_UNCHECKED",
 )
 
 _DEPLOY_ENGINE_WORD_COUNT = 40
@@ -381,6 +411,7 @@ _LOGIN_WORD_COUNT = 40
 _VPN_WORD_COUNT = 45
 _QBIT_WORD_COUNT = 29
 _VPN_CHANGE_WORD_COUNT = 32
+_DRIVE_WORD_COUNT = 27
 
 
 def test_words_inventory_is_pinned() -> None:
@@ -671,11 +702,10 @@ def test_the_qbittorrent_section_precedes_the_vpn_change_section() -> None:
     assert "WITHOUT_VPN_PHRASE" not in qbit_names
 
 
-def test_the_vpn_change_section_is_last() -> None:
-    """VPN changes (the break-glass phrase, Add your VPN, Change VPN) is
-    the newest section, and words.py is the only file this story touches -
-    so unlike every earlier "is last" test, this slice is closed for good:
-    nothing later in this story appends to it.
+def test_the_vpn_change_section_precedes_the_drive_section() -> None:
+    """VPN changes (the break-glass phrase, Add your VPN, Change VPN) used
+    to be the newest section - the drive check now follows it, so this
+    slice is closed the same move every earlier story made.
     """
     vpn_change_start = (
         _DEPLOY_ENGINE_WORD_COUNT
@@ -689,15 +719,95 @@ def test_the_vpn_change_section_is_last() -> None:
         + _VPN_WORD_COUNT
         + _QBIT_WORD_COUNT
     )
+    vpn_change_end = vpn_change_start + _VPN_CHANGE_WORD_COUNT
 
-    vpn_change_names = words.WORDS_INVENTORY[vpn_change_start:]
+    vpn_change_names = words.WORDS_INVENTORY[vpn_change_start:vpn_change_end]
 
-    assert vpn_change_names == _EXPECTED_INVENTORY[vpn_change_start:]
+    assert vpn_change_names == _EXPECTED_INVENTORY[vpn_change_start:vpn_change_end]
     assert vpn_change_names[0] == "WITHOUT_VPN_PHRASE"
     assert vpn_change_names[-1] == "HUB_LINE_RESTARTING_WITHOUT_VPN"
-    assert len(words.WORDS_INVENTORY) == len(_EXPECTED_INVENTORY)
     assert len(vpn_change_names) == _VPN_CHANGE_WORD_COUNT
     assert "QBITTORRENT_DESCRIPTION" not in vpn_change_names
+    assert "LINK_TEST_FILE_TEXT" not in vpn_change_names
+
+
+def test_the_drive_section_is_last() -> None:
+    """The drive check (hard-link probe, saved result) is the newest
+    section. Later chunks in this story bump `_DRIVE_WORD_COUNT` as they
+    append more words to it.
+    """
+    drive_start = (
+        _DEPLOY_ENGINE_WORD_COUNT
+        + _WIZARD_WORD_COUNT
+        + _WIRING_WORD_COUNT
+        + _DEPLOY_SCREEN_WORD_COUNT
+        + _HUB_WORD_COUNT
+        + _HUB_LINK_WORD_COUNT
+        + _HUB_INSTALL_WORD_COUNT
+        + _LOGIN_WORD_COUNT
+        + _VPN_WORD_COUNT
+        + _QBIT_WORD_COUNT
+        + _VPN_CHANGE_WORD_COUNT
+    )
+
+    drive_names = words.WORDS_INVENTORY[drive_start:]
+
+    assert drive_names == _EXPECTED_INVENTORY[drive_start:]
+    assert drive_names[0] == "LINK_TEST_FILE_TEXT"
+    assert len(words.WORDS_INVENTORY) == len(_EXPECTED_INVENTORY)
+    assert len(drive_names) == _DRIVE_WORD_COUNT
+    assert "WITHOUT_VPN_PHRASE" not in drive_names
+
+
+def test_drive_reason_and_todo_words_name_the_folder_and_match_content_direction() -> None:
+    folder = "/volume1/media/data/media/tv"
+
+    assert words.drive_reason_different_drives(folder) == (
+        f"{folder} is on a different drive or share from your downloads, so "
+        "every finished download is copied - using double the space."
+    )
+    assert words.drive_reason_no_hard_links(folder) == (
+        f"The drive holding {folder} can't make instant links (some network "
+        "shares and USB drives can't), so every finished download is copied."
+    )
+    assert words.drive_reason_folder_elsewhere(folder) == (
+        f"{folder} is a shortcut to somewhere else, so Marrquee won't test "
+        "it - and your apps can't follow it either."
+    )
+    assert folder in words.drive_reason_not_allowed(folder)
+    assert folder in words.drive_reason_drive_full(folder)
+    assert folder in words.drive_reason_folder_missing(folder)
+    assert folder in words.drive_reason_unexpected(folder)
+    assert words.DRIVE_TODO_SAME_DRIVE == (
+        "Keep your downloads and your library inside the one folder you "
+        "chose for Marrquee, on the same drive. Don't mount a separate "
+        "drive or share inside it."
+    )
+    assert words.drive_technical("EXDEV (errno 18)") == "Technical detail: EXDEV (errno 18)"
+
+
+def test_the_promise_sentences_say_anything_you_put_there() -> None:
+    """The Alignment CONFLICT resolution: the owner's "never touches
+    anything" promise is reworded everywhere it's read, from the orphaned
+    `HOST_MOUNT_COMMENT` constant to the README and install file the owner
+    actually reads.
+    """
+    promise = "never moves, changes or deletes anything you put there"
+    promise_as_a_verb = "never move, change or delete anything you put there"
+
+    assert promise in words.WIZARD_FRESH_START_NOTE
+    assert promise_as_a_verb in words.STORAGE_CHECK_OK_MESSAGE
+    assert promise in words.HOST_MOUNT_COMMENT
+    assert promise in _README_PATH.read_text()
+    assert promise in _COMPOSE_PATH.read_text()
+
+
+def test_the_lede_and_hub_footer_link_say_your_setups_health() -> None:
+    """ADJACENCY resolution: Diagnostics now covers the drive too, so its
+    lede and the Hub's footer link stop claiming to be Marrquee-only.
+    """
+    assert "your setup's health" in words.DIAGNOSTICS_LEDE
+    assert words.HUB_DIAGNOSTICS_LINK == "Check your setup's health"
 
 
 def test_wizard_headline_tuples_carry_the_gradient_word_in_the_middle() -> None:
@@ -983,7 +1093,7 @@ def test_hub_chrome_matches_content_direction() -> None:
     assert lead == "Your"
     assert accent == "media server"
     assert words.HUB_LEDE == "Everything you set up, one click away."
-    assert words.HUB_DIAGNOSTICS_LINK == "Check Marrquee's own health"
+    assert words.HUB_DIAGNOSTICS_LINK == "Check your setup's health"
 
 
 def test_hub_status_chips_are_the_owners_up_down_wording() -> None:

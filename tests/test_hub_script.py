@@ -110,6 +110,44 @@ def test_status_fields_include_running_without_vpn() -> None:
     assert "running_without_vpn" in arrays["STATUS_FIELDS"]
 
 
+def test_status_fields_include_drive_note() -> None:
+    """The drive note has to repaint on every poll - without `drive_note`
+    in `STATUS_FIELDS`, `paint` would never see the field it sets
+    `data-drive-note` and the note's own text from.
+    """
+    script = _HUB_JS_PATH.read_text()
+    arrays = _field_arrays(script)
+
+    assert "drive_note" in arrays["STATUS_FIELDS"]
+
+
+def test_paint_toggles_the_drive_note_attribute_and_its_text() -> None:
+    script = _HUB_JS_PATH.read_text()
+    match = re.search(r"function paint\([^)]*\)\s*\{.*?\n  \}", script, re.DOTALL)
+    assert match is not None, "expected a paint function in hub.js"
+    body = match.group(0)
+
+    assert "root.dataset.driveNote = payload.drive_note" in body
+    assert 'setText("drive-note-text", payload.drive_note' in body
+
+
+def test_drive_note_never_reaches_the_reload_guard_signature() -> None:
+    """The note toggles live, in place - it never reloads the page, so
+    `structureSignature` and the reload guard built from it must never
+    fold `drive_note` in.
+    """
+    script = _HUB_JS_PATH.read_text()
+    match = re.search(r"function structureSignature\([^)]*\)\s*\{.*?\n  \}", script, re.DOTALL)
+    assert match is not None, "expected a structureSignature function in hub.js"
+    assert "drive" not in match.group(0).lower()
+
+    guard_match = re.search(
+        r"function reloadIfStructureChanged\([^)]*\)\s*\{.*?\n  \}", script, re.DOTALL
+    )
+    assert guard_match is not None, "expected a reloadIfStructureChanged function in hub.js"
+    assert "drive_note" not in guard_match.group(0)
+
+
 def test_app_fields_include_paused() -> None:
     """A paused downloader tile has to repaint on every poll - without
     `paused` in `APP_FIELDS`, `paintTile` would never see the field it sets

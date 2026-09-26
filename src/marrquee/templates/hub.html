@@ -21,6 +21,7 @@
   data-add-poll-ms="{{ add_poll_ms }}"
   data-login-banner="{{ view.login.banner if view.login else 'none' }}"
   data-running-without-vpn="{{ 'true' if view.running_without_vpn else 'false' }}"
+  data-drive-note="{{ 'true' if view.drive_note else 'false' }}"
 >
   <p class="eyebrow">{{ words.HUB_EYEBROW }}</p>
   <h1>{{ words.HUB_HEADLINE[0] }}<br><span class="accent">{{ words.HUB_HEADLINE[1] }}</span></h1>
@@ -38,6 +39,11 @@
     <span class="no-vpn-badge__action">{{ words.HUB_NO_VPN_BADGE_ACTION }}</span>
   </a>
   {% endif %}
+
+  <a class="hub-drive-note" data-role="drive-note" href="/diagnostics#your-drive">
+    <span class="hub-drive-note__glyph" aria-hidden="true">&#9888;</span>
+    <span data-role="drive-note-text">{{ view.drive_note or "" }}</span>
+  </a>
 
   <p class="visually-hidden" aria-live="polite" data-role="announce">{{ view.announce }}</p>
 

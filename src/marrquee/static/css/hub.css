@@ -206,6 +206,14 @@
   display: flex;
 }
 
+[data-role="drive-note"] {
+  display: none;
+}
+
+[data-drive-note="true"] [data-role="drive-note"] {
+  display: inline-flex;
+}
+
 [data-role="stale-note"] {
   display: none;
   color: var(--spotlight-text);
@@ -491,6 +499,37 @@
   color: var(--warning);
   text-decoration: underline;
   font-weight: var(--weight-semibold);
+}
+
+/* The Hub's own amber note for the drive check - the same amber pill as
+ * the no-VPN badge above, so the two notes read as one family. Hidden by
+ * the root's own `data-drive-note` attribute, never by removing the tag -
+ * the poll needs it on the page to toggle. */
+.hub-drive-note {
+  align-items: center;
+  gap: var(--space-2);
+  background: var(--warning-light);
+  border: 1px solid var(--warning);
+  border-radius: var(--radius-full);
+  padding: var(--space-3) var(--space-4);
+  margin-bottom: var(--space-6);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-bold);
+  text-decoration: none;
+}
+
+.hub-drive-note:hover {
+  border-color: var(--spotlight);
+}
+
+.hub-drive-note:focus-visible {
+  outline: 2px solid var(--spotlight);
+  outline-offset: 2px;
+}
+
+.hub-drive-note__glyph {
+  color: var(--warning);
 }
 
 /* Removing a link only takes its card off the Hub - the button still

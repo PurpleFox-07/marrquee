@@ -11,6 +11,7 @@ exercises the port and mount the rest of the project agreed on.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +65,32 @@ def _step_named(job: dict[str, Any], *needles: str) -> dict[str, Any]:
         if all(needle.lower() in name for needle in needles):
             return step
     raise AssertionError(f"no step named with all of {needles!r} found")
+
+
+def _text_between(text: str, start: str, end: str) -> str:
+    """The text strictly between the first `start` and the next `end` after it."""
+    start_index = text.index(start) + len(start)
+    end_index = text.index(end, start_index)
+    return text[start_index:end_index]
+
+
+def _shell_case_arms(case_block: str) -> dict[str, str]:
+    """Each `label) body ;;` arm of a one-arm-per-line shell `case`, keyed by
+    its label with the body trimmed - so a body that was hollowed out to a
+    no-op, or a no-op that grew a body, both show up as a plain string
+    diff instead of a substring match that either would still satisfy.
+    """
+    arms: dict[str, str] = {}
+    for line in case_block.splitlines():
+        match = re.match(r"\s*(\S+)\)\s*(.*?)\s*;;\s*$", line)
+        if match:
+            arms[match.group(1)] = match.group(2)
+    return arms
+
+
+def _last_nonblank_line(text: str) -> str:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return lines[-1] if lines else ""
 
 
 def _publish_step(job: dict[str, Any]) -> dict[str, Any]:
@@ -1632,6 +1659,7 @@ def test_stack_smoke_no_vpn_steps_run_after_cancel_in_order_choose_add_hand_over
         _step_named(job, "no-vpn hand-over", "plain sentences")["name"]
     )
     keep_index = names.index(_step_named(job, "no-vpn restore")["name"])
+    drive_index = names.index(_step_named(job, "drive check agrees")["name"])
     dump_index = names.index(_step_named(job, "dump diagnostics")["name"])
 
     assert (
@@ -1645,6 +1673,7 @@ def test_stack_smoke_no_vpn_steps_run_after_cancel_in_order_choose_add_hand_over
         < hand_over_poll_index
         < hand_over_assert_index
         < keep_index
+        < drive_index
         < dump_index
     )
 
@@ -1661,6 +1690,7 @@ def test_stack_smoke_every_no_vpn_step_emits_error_on_failure() -> None:
         ("poll", "no-vpn hand-over"),
         ("no-vpn hand-over", "plain sentences"),
         ("no-vpn restore",),
+        ("drive check agrees",),
     ]
     for needles in needle_sets:
         step = _step_named(job, *needles)
@@ -1685,11 +1715,115 @@ def test_stack_smoke_no_vpn_step_names_avoid_forbidden_needles() -> None:
         ("poll", "no-vpn hand-over"),
         ("no-vpn hand-over", "plain sentences"),
         ("no-vpn restore",),
+        ("drive check agrees",),
     ]
     for needles in needle_sets:
         name = str(_step_named(job, *needles)["name"]).lower()
         for phrase in forbidden:
             assert phrase not in name, f"step {name!r} contains the forbidden phrase {phrase!r}"
+
+
+def test_stack_smoke_drive_check_agrees_with_sonarrs_own_hard_link() -> None:
+    """Marrquee's saved verdict, made from its own `/host` view of the
+    drive, must agree with a hard link Sonarr makes for real inside its own
+    container's `/data` view - only a real daemon and a real bind mount can
+    prove the two views see the same filesystem.
+    """
+    step = _step_named(_stack_smoke_job(), "drive check agrees")
+    run = step["run"]
+
+    # Marrquee's own saved verdict, read from inside marrquee-stack-smoke.
+    assert "load_hardlink_result" in run
+    assert "Settings.from_env" in run
+    assert "works/None" in run
+
+    # Sonarr's own hard link, run as the install's own PUID/PGID, with a
+    # tool-exists check first and a trap that always cleans up.
+    assert "install['puid']" in run
+    assert "install['pgid']" in run
+    assert "command -v ln" in run
+    assert "command -v stat" in run
+    assert 'docker exec -u "$puid:$pgid" sonarr' in run
+    assert "trap" in run
+    assert ".ci-link-proof" in run
+    assert "stat -c %i" in run
+
+    # The leftover-file check: a positive control before the real check,
+    # and an exit-code whitelist rather than a bare truthiness test.
+    assert "test -d" in run
+    assert ".marrquee-link-test" in run
+    assert "leftover" in run
+
+    # Diagnostics reads the same "works" words a person would see, compared
+    # the way Jinja actually escapes an apostrophe.
+    assert "DRIVE_WORKS_TITLE" in run
+    assert "html.unescape" in run
+    assert "html.escape" not in run
+
+    assert run.count("::error::") >= 5
+
+
+def test_stack_smoke_drive_check_never_aborts_silently_under_set_e() -> None:
+    """Every `docker exec` in this step runs under `set -euo pipefail` - one
+    that fails outright (the container isn't ready yet, a stray import
+    error) must not abort the whole step with no `::error::` reason. The
+    poll loop retries instead of dying on its first failed attempt, and the
+    PUID/PGID read is checked before `read` ever sees its output.
+    """
+    step = _step_named(_stack_smoke_job(), "drive check agrees")
+    run = step["run"]
+
+    assert '2>/dev/null) || outcome=""' in run
+    assert "ids=$(docker exec marrquee-stack-smoke python3 -c" in run
+    assert "couldn't read PUID/PGID from /config/install.json" in run
+    assert 'read -r puid pgid <<< "$ids"' in run
+
+
+def test_stack_smoke_drive_check_leftover_case_arms_are_structurally_sound() -> None:
+    """A plain substring match on `::error::` or `exit 1` anywhere in the
+    step would still pass if the `case` arm that actually GATES that text
+    were hollowed out to a no-op, or a no-op arm grew a stray `exit 1`
+    itself. Each arm is checked on its own, by its own label.
+    """
+    step = _step_named(_stack_smoke_job(), "drive check agrees")
+    run = step["run"]
+
+    case_block = _text_between(run, 'case "$leftover" in', "esac")
+    arms = _shell_case_arms(case_block)
+
+    assert set(arms) == {"0", "1", "*"}
+
+    # exit code 0 = the test file exists = litter was left behind: a real
+    # failure, not silence.
+    assert "::error::" in arms["0"]
+    assert "exit 1" in arms["0"]
+
+    # exit code 1 = the test file is gone = the check passed clean: nothing
+    # to report, and nothing that exits the step.
+    assert arms["1"] == ""
+
+    # anything else = the check itself couldn't run: also a real failure.
+    assert "::error::" in arms["*"]
+    assert "exit 1" in arms["*"]
+
+
+def test_stack_smoke_drive_check_sonarrs_link_proof_actually_compares_inodes() -> None:
+    """The proof that Sonarr's own link worked is the LAST thing its shell
+    script does, under `set -e` - a `true` (or any other placeholder)
+    swapped in for the inode comparison would make the script "succeed"
+    unconditionally, which a bare `in run` substring check for the two
+    variable names could never catch.
+    """
+    step = _step_named(_stack_smoke_job(), "drive check agrees")
+    run = step["run"]
+
+    start_marker = 'docker exec -u "$puid:$pgid" sonarr sh -c \''
+    script = _text_between(run, start_marker, "'")
+
+    assert "set -e" in script
+    assert "source_inode=$(stat -c %i /data/torrents/tv/.ci-link-proof)" in script
+    assert "dest_inode=$(stat -c %i /data/media/tv/.ci-link-proof)" in script
+    assert _last_nonblank_line(script) == '[ "$source_inode" = "$dest_inode" ]'
 
 
 def test_stack_smoke_cleanup_list_already_covers_qbittorrent_and_gluetun() -> None:

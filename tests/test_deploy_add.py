@@ -23,6 +23,7 @@ from test_deploy import (
     _fresh_root,
     _happy_engine,
     _install_state,
+    _RecordingHardlinkTrigger,
     _run_to_terminal,
     _running_container,
     _settings,
@@ -326,6 +327,39 @@ async def test_a_clean_add_leaves_an_older_last_problem_alone(tmp_path: Path) ->
     assert (settings.config_dir / "last-failure.txt").read_text() == "old\n"
 
 
+# --- The drive check is asked for once a successful add reaches its end -----
+
+
+async def test_a_successful_add_asks_for_one_check(tmp_path: Path) -> None:
+    manager, engine, settings = await _deployed_to_finale(tmp_path)
+    trigger = _RecordingHardlinkTrigger()
+    manager._hardlinks = trigger  # type: ignore[attr-defined]
+
+    result = manager.add_app("radarr")
+    assert result == "started"
+    final = await _finish_add(manager)
+
+    assert final.adding is None
+    assert trigger.calls == 1
+
+
+async def test_a_failed_add_asks_for_no_check(tmp_path: Path) -> None:
+    manager, engine, settings = await _deployed_to_finale(tmp_path)
+    trigger = _RecordingHardlinkTrigger()
+    manager._hardlinks = trigger  # type: ignore[attr-defined]
+    engine._compose_results["radarr"] = ComposeResult(  # type: ignore[attr-defined]
+        ok=False, exit_code=1, output="Error: port is already allocated"
+    )
+
+    result = manager.add_app("radarr")
+    assert result == "started"
+    final = await _finish_add(manager)
+
+    assert final.adding is not None
+    assert final.adding.state == "error"
+    assert trigger.calls == 0
+
+
 # --- Cancel: only ever removes a container it created, never a folder -------
 
 
@@ -609,6 +643,22 @@ async def test_a_failed_wiring_step_records_a_gap_and_a_clean_reconnect_clears_i
     assert reconnected.adding is None
     assert reconnected.wiring_gaps == ()
     assert clean_wiring.calls == ["radarr"]
+
+
+async def test_reconnect_asks_for_no_check(tmp_path: Path) -> None:
+    """Reconnect ends in `_run_wiring_for_add` directly, never
+    `_run_add_steps` - it retries wiring for an app that is already up.
+    """
+    manager, engine, settings = await _deployed_to_finale(tmp_path)
+    trigger = _RecordingHardlinkTrigger()
+    manager._hardlinks = trigger  # type: ignore[attr-defined]
+
+    result = manager.reconnect("sonarr")
+    assert result == "started"
+    final = await _finish_add(manager)
+
+    assert final.adding is None
+    assert trigger.calls == 0
 
 
 async def test_reconnect_refuses_an_app_that_is_not_installed(tmp_path: Path) -> None:

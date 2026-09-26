@@ -112,8 +112,8 @@ What each line does:
 - `-v /volume1:/host/volume1` - this lets Marrquee see the shared
   folders under `/volume1`, so it can check the folder you type and
   build the media folders inside it. Marrquee only ever writes inside
-  the one folder you choose. If your NAS also has a `/volume2`, add
-  `-v /volume2:/host/volume2` too.
+  the one folder you choose, and never moves, changes or deletes anything you put there.
+  If your NAS also has a `/volume2`, add `-v /volume2:/host/volume2` too.
 
 ### Option B: paste a file
 
@@ -141,10 +141,10 @@ Open a browser and go to `http://<your NAS's address>:7788`.
   one poster per app, each showing Status: Up or Status: Down. Click
   a poster to open that app.
 
-Want to check Marrquee's own health instead - whether it can talk to
-Docker and save its settings? Go to
-`http://<your NAS's address>:7788/diagnostics`. A green "Talking to
-Docker" line means it's ready. If a line there is red, the page itself
+Want to check your setup's health - whether Marrquee can talk to
+Docker, save its settings, and your drive can move downloads instantly?
+Go to `http://<your NAS's address>:7788/diagnostics`. A green line
+means that check passed. If a line there isn't green, the page itself
 explains what to do in plain language - fix what it describes, then
 select **Check again**.
 

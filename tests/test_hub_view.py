@@ -20,6 +20,7 @@ from marrquee import words
 from marrquee.catalog import CATALOG, AppRule
 from marrquee.deploy import AppAdd, Failure, WiringGap
 from marrquee.docker_client import ContainerHealth
+from marrquee.hardlinks import HardlinkOutcome, HardlinkReason, HardlinkResult
 from marrquee.health import AppHealth, HubState, LinkHealth, LinkState
 from marrquee.hub import (
     HUB_POLL_MS,
@@ -1471,3 +1472,50 @@ def test_install_row_carries_without_vpn_only_for_the_downloader() -> None:
     by_id = {row.app.id: row for row in view.install_rows}
     assert by_id["qbittorrent"].without_vpn is True
     assert by_id["sonarr"].without_vpn is False
+
+
+# --- The amber note: one place computes it, from the saved HardlinkResult --
+
+
+def _drive(outcome: HardlinkOutcome, *, reason: HardlinkReason | None = None) -> HardlinkResult:
+    return HardlinkResult(
+        outcome=outcome,
+        reason=reason,
+        folder="/volume1/media/data/media/tv" if reason is not None else None,
+        technical=None,
+        checked_at=_NOW.isoformat(),
+    )
+
+
+def test_drive_note_is_the_owners_sentence_only_for_copies_and_couldnt_check() -> None:
+    """FIRST TEST (has-data-pipeline) - the amber note's words are computed
+    in exactly one place, `hub_view(..., drive=)`, from the saved
+    `HardlinkResult` - never re-derived by the page or the poll themselves.
+    """
+    copies = hub_view(
+        [],
+        [],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        drive=_drive("copies", reason="different_drives"),
+    )
+    couldnt_check = hub_view(
+        [],
+        [],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        drive=_drive("couldnt_check", reason="folder_missing"),
+    )
+    works = hub_view([], [], authority=_AUTHORITY, proxied=False, now=_NOW, drive=_drive("works"))
+    not_needed = hub_view(
+        [], [], authority=_AUTHORITY, proxied=False, now=_NOW, drive=_drive("not_needed")
+    )
+    no_saved_result = hub_view([], [], authority=_AUTHORITY, proxied=False, now=_NOW)
+
+    assert copies.drive_note == words.HUB_DRIVE_NOTE_COPIES
+    assert couldnt_check.drive_note == words.HUB_DRIVE_NOTE_UNCHECKED
+    assert works.drive_note is None
+    assert not_needed.drive_note is None
+    assert no_saved_result.drive_note is None

@@ -14,6 +14,7 @@ import dataclasses
 import json
 import os
 import time
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -35,6 +36,7 @@ from marrquee.docker_client import (
     DockerStatus,
     FakeDockerEngine,
 )
+from marrquee.hardlinks import HardlinkMonitor, HardlinkResult, save_hardlink_result
 from marrquee.login import load_login, save_login
 from marrquee.main import create_app
 from marrquee.questions import QuestionCheck, QuestionField, QuestionStep, load_answers
@@ -47,6 +49,7 @@ from marrquee.wiring import NoWiringYet, WiringStep
 from marrquee.wiring.engine import WiringEngine
 from marrquee.wiring.qbit_client import FakeQbitClient
 from marrquee.words import (
+    HUB_DRIVE_NOTE_COPIES,
     HUB_INSTALL_LOGIN_FIRST,
     HUB_INSTALL_UNKNOWN,
     HUB_SETUP_DONE_REFUSAL,
@@ -62,7 +65,29 @@ from marrquee.words import (
 
 
 def _settings(tmp_path: Path) -> Settings:
-    return Settings(host_mount=tmp_path / "host", config_dir=tmp_path / "config")
+    settings = Settings(host_mount=tmp_path / "host", config_dir=tmp_path / "config")
+    _seed_fresh_drive_check(settings)
+    return settings
+
+
+def _seed_fresh_drive_check(settings: Settings) -> None:
+    """A drive-check result saved just now, so `create_app`'s own default
+    `HardlinkMonitor` never starts a real filesystem probe in the
+    background for a test that has no opinion about the drive check -
+    `refresh_if_due` only starts one for a missing or day-old result. A
+    test that DOES care injects its own `hardlinks=` with a saved result
+    and clock it controls, which simply overwrites this one.
+    """
+    save_hardlink_result(
+        settings.config_dir,
+        HardlinkResult(
+            outcome="works",
+            reason=None,
+            folder=None,
+            technical=None,
+            checked_at=datetime.now(UTC).isoformat(),
+        ),
+    )
 
 
 def _fresh_root(settings: Settings) -> PurePosixPath:
@@ -102,12 +127,14 @@ def _client(
     *,
     engine: FakeDockerEngine | None = None,
     vpn_control: FakeGluetunControl | None = None,
+    hardlinks: HardlinkMonitor | None = None,
 ) -> TestClient:
     app = create_app(
         settings=settings,
         engine=engine if engine is not None else FakeDockerEngine(DockerStatus(connected=True)),
         manager=manager,
         vpn_control=vpn_control,
+        hardlinks=hardlinks,
     )
     return TestClient(app)
 
@@ -458,6 +485,27 @@ def test_hub_status_vpn_tunnel_is_none_with_no_vpn_installed(tmp_path: Path) -> 
 
     assert response.status_code == 200
     assert response.json()["vpn_tunnel"] is None
+
+
+def test_hub_status_carries_the_drive_note(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_hardlink_result(
+        settings.config_dir,
+        HardlinkResult(
+            outcome="copies",
+            reason="different_drives",
+            folder="/volume1/media/data/media/tv",
+            technical=None,
+            checked_at=datetime.now(UTC).isoformat(),
+        ),
+    )
+    monitor = HardlinkMonitor(settings, clock=lambda: datetime.now(UTC))
+    client = _client(settings, _idle_manager(settings), hardlinks=monitor)
+
+    response = client.get("/api/hub/status")
+
+    assert response.status_code == 200
+    assert response.json()["drive_note"] == HUB_DRIVE_NOTE_COPIES
 
 
 def test_hub_status_carries_paused_and_can_change_seeding_for_the_downloader(
@@ -899,7 +947,6 @@ def test_diagnostics_returns_204_when_nothing_has_failed(tmp_path: Path) -> None
 
 def test_diagnostics_returns_the_failure_text_as_plain_text(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
-    settings.config_dir.mkdir(parents=True)
     (settings.config_dir / "last-failure.txt").write_text(
         "never_became_ready\nsonarr never answered\n"
     )

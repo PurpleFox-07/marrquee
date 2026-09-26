@@ -1807,6 +1807,84 @@ jobs:
             exit 1
           fi
 
+      # The one condition reading the source could never settle: Marrquee's
+      # own view of the drive (`/host/<root>/...`) and the apps' own view
+      # (`<root>/data` mounted at `/data`) must agree on whether a hard
+      # link works, on a real bind mount. Sonarr proves its own half of
+      # that agreement as the install's own PUID/PGID - the same user that
+      # owns every file it imports - never as this job's root, so a
+      # permission gap between the two users could never hide behind an
+      # over-privileged proof. Radarr is running again by this point, but
+      # only the tv pair (Sonarr's) is asserted from Sonarr's own side.
+      - name: Marrquee's drive check agrees with Sonarr's own hard link
+        run: |
+          set -euo pipefail
+
+          outcome=""
+          for _ in $(seq 1 15); do
+            outcome=$(docker exec marrquee-stack-smoke python3 -c "from marrquee.config import Settings; from marrquee.hardlinks import load_hardlink_result; r = load_hardlink_result(Settings.from_env().config_dir); print('' if r is None else f'{r.outcome}/{r.reason}')" 2>/dev/null) || outcome=""
+            if [ -n "$outcome" ]; then
+              break
+            fi
+            sleep 2
+          done
+          if [ -z "$outcome" ]; then
+            echo "::error::Marrquee's drive check never saved a result"
+            exit 1
+          fi
+          if [ "$outcome" != "works/None" ]; then
+            echo "::error::Marrquee's drive check says ${outcome}"
+            exit 1
+          fi
+
+          if ! ids=$(docker exec marrquee-stack-smoke python3 -c "import json; install = json.load(open('/config/install.json')); print(install['puid'], install['pgid'])") || [ -z "$ids" ]; then
+            echo "::error::couldn't read PUID/PGID from /config/install.json"
+            exit 1
+          fi
+          read -r puid pgid <<< "$ids"
+
+          if ! docker exec sonarr sh -c 'command -v ln && command -v stat' > /dev/null; then
+            echo "::error::Sonarr's container has neither ln nor stat to prove its own hard link with"
+            exit 1
+          fi
+
+          if ! docker exec -u "$puid:$pgid" sonarr sh -c '
+            set -e
+            trap "rm -f /data/torrents/tv/.ci-link-proof /data/media/tv/.ci-link-proof" EXIT
+            echo ci-link-proof > /data/torrents/tv/.ci-link-proof
+            ln /data/torrents/tv/.ci-link-proof /data/media/tv/.ci-link-proof
+            source_inode=$(stat -c %i /data/torrents/tv/.ci-link-proof)
+            dest_inode=$(stat -c %i /data/media/tv/.ci-link-proof)
+            [ "$source_inode" = "$dest_inode" ]
+          '; then
+            echo "::error::Sonarr could not hard-link inside /data, but Marrquee said it could"
+            exit 1
+          fi
+
+          root="/host${RUNNER_TEMP}/marrquee-smoke/media/data"
+          for kind in torrents media; do
+            if ! docker exec marrquee-stack-smoke test -d "${root}/${kind}/tv"; then
+              echo "::error::${root}/${kind}/tv did not exist - the leftover-file check below could not run"
+              exit 1
+            fi
+
+            set +e
+            docker exec marrquee-stack-smoke test -e "${root}/${kind}/tv/.marrquee-link-test"
+            leftover=$?
+            set -e
+            case "$leftover" in
+              0) echo "::error::the drive check left its test file behind in ${root}/${kind}/tv"; exit 1 ;;
+              1) ;;
+              *) echo "::error::couldn't check ${root}/${kind}/tv for a leftover test file (exit ${leftover})"; exit 1 ;;
+            esac
+          done
+
+          page=$(curl -fsS http://127.0.0.1:7788/diagnostics)
+          if ! docker exec -e DIAGNOSTICS_PAGE="$page" marrquee-stack-smoke python3 -c "import html, os; from marrquee.words import DRIVE_WORKS_TITLE; raise SystemExit(0 if DRIVE_WORKS_TITLE in html.unescape(os.environ['DIAGNOSTICS_PAGE']) else 1)"; then
+            echo "::error::Diagnostics did not show DRIVE_WORKS_TITLE after the drive check passed"
+            exit 1
+          fi
+
       # The one place technical detail is allowed to show up, and exactly
       # where a first-time developer needs it: a red run here is debuggable
       # from the workflow's own log, not just "it failed". The same text

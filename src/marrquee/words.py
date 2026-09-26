@@ -155,7 +155,7 @@ REFUSAL_UNKNOWN_APP = (
 # --- Storage check - the wizard's live, as-you-type verdict -------------------
 STORAGE_CHECK_OK_MESSAGE = (
     "This folder works. Marrquee will build your media folders inside it, "
-    "and it will never touch anything already there."
+    "and it will never move, change or delete anything you put there."
 )
 
 # Keyed by StorageCheck's own reason strings (kept as plain `str`, not the
@@ -236,7 +236,8 @@ COMPOSE_FILE_HEADER_COMMENT = (
 HOST_MOUNT_COMMENT = (
     "This lets Marrquee see your shared folders, so it can check the folder "
     "you type and build the media folders inside it. Marrquee only ever "
-    "writes inside the one folder you choose."
+    "writes inside the one folder you choose, and never moves, changes or "
+    "deletes anything you put there."
 )
 DATA_MOUNT_COMMENT = (
     "Every app that touches media shares this one /data folder. That's what "
@@ -359,7 +360,7 @@ def wizard_path_hint(shared: _Sequence[str] = ()) -> str:
 
 WIZARD_FRESH_START_NOTE = (
     "Marrquee only ever makes new, empty folders inside the one you choose. "
-    "It never moves, changes or deletes anything you already have. Already "
+    "It never moves, changes or deletes anything you put there. Already "
     "have a library? Leave it exactly where it is - you can copy things into "
     "the new folders later, or point your media server at the old folder as "
     "well."
@@ -412,8 +413,9 @@ FREE_SPACE_UNDER_ONE_GB = "less than 1 GB"
 
 # --- Diagnostics page (formerly the alive page at "/") -------------------------
 DIAGNOSTICS_LEDE = (
-    "This page checks that Marrquee can reach Docker and save its settings. "
-    "If a line is red, it says what to do."
+    "This page checks your setup's health: whether Marrquee can reach "
+    "Docker and save its settings, and whether your drive can move "
+    "downloads instantly. If a line isn't green, it says what to do."
 )
 
 
@@ -806,7 +808,7 @@ def hub_some_up(n: int, total: int) -> str:
 HUB_NOTHING_SET_UP = "No apps are set up yet."
 
 # --- Footer -------------------------------------------------------------------
-HUB_DIAGNOSTICS_LINK = "Check Marrquee's own health"
+HUB_DIAGNOSTICS_LINK = "Check your setup's health"
 
 
 def relative_time(seconds: float) -> str:
@@ -1616,6 +1618,142 @@ _VPN_CHANGE_WORDS: tuple[str, ...] = (
 # end VPN changes section
 # =============================================================================
 
+# =============================================================================
+# Your drive - proving a finished download can become a library file
+# without using the space twice (a hard link), in the owner's own words
+# =============================================================================
+
+LINK_TEST_FILE_TEXT = (
+    "Marrquee made this file to check that your drive can move downloads "
+    "instantly. It deletes it straight away - if you can see it, you can delete it."
+)
+
+# --- Diagnostics' "Your drive" section - one row per outcome, in plain words -
+
+DRIVE_SECTION_TITLE = "Your drive"
+DRIVE_WORKS_TITLE = "Downloads move into your library instantly"
+DRIVE_WORKS_DETAIL = (
+    "Marrquee just tested your drive: a finished download becomes a "
+    "library file without using any extra space."
+)
+DRIVE_NOT_NEEDED_TITLE = "Not needed yet"
+DRIVE_NOT_NEEDED_DETAIL = (
+    "Marrquee tests this once you have qBittorrent and Sonarr or Radarr - "
+    "they're the apps that move finished downloads into your library."
+)
+DRIVE_STILL_CHECKING_TITLE = "Still checking your drive"
+DRIVE_STILL_CHECKING_DETAIL = "Your drive may be waking up. Choose Check again in a minute."
+DRIVE_COPIES_TITLE = "Downloads are being copied, not moved"
+DRIVE_COULDNT_CHECK_TITLE = "Marrquee couldn't test your drive"
+
+
+def drive_reason_different_drives(folder: str) -> str:
+    return (
+        f"{folder} is on a different drive or share from your downloads, so "
+        "every finished download is copied - using double the space."
+    )
+
+
+def drive_reason_no_hard_links(folder: str) -> str:
+    return (
+        f"The drive holding {folder} can't make instant links (some network "
+        "shares and USB drives can't), so every finished download is copied."
+    )
+
+
+def drive_reason_not_allowed(folder: str) -> str:
+    return f"Marrquee wasn't allowed to test {folder}."
+
+
+def drive_reason_drive_full(folder: str) -> str:
+    return f"The drive holding {folder} is full, so Marrquee couldn't finish testing it."
+
+
+def drive_reason_folder_missing(folder: str) -> str:
+    return f"{folder} doesn't exist yet, so Marrquee couldn't test it."
+
+
+def drive_reason_folder_elsewhere(folder: str) -> str:
+    return (
+        f"{folder} is a shortcut to somewhere else, so Marrquee won't test "
+        "it - and your apps can't follow it either."
+    )
+
+
+def drive_reason_unexpected(folder: str) -> str:
+    return f"Marrquee couldn't test {folder} for an unexpected reason."
+
+
+DRIVE_TODO_SAME_DRIVE = (
+    "Keep your downloads and your library inside the one folder you chose "
+    "for Marrquee, on the same drive. Don't mount a separate drive or share "
+    "inside it."
+)
+DRIVE_TODO_NATIVE_DRIVE = (
+    "Move your big drive folder onto a drive that supports instant links - "
+    "most internal NAS drives do; some network shares and USB drives don't."
+)
+DRIVE_TODO_PERMISSIONS = (
+    "Check that the folder Marrquee uses is owned by the account you "
+    "installed Marrquee with, then choose Check again."
+)
+DRIVE_TODO_FREE_SPACE = "Free up some space on that drive, then choose Check again."
+DRIVE_TODO_REBUILD_FOLDER = (
+    "Redeploy from the setup wizard so Marrquee can rebuild the missing "
+    "folder, then choose Check again."
+)
+DRIVE_TODO_REAL_FOLDER = "Point Marrquee at the real folder instead of a shortcut to it."
+DRIVE_TODO_ASK_FOR_HELP = (
+    "Choose Check again - if it keeps happening, the project page has a place to report it."
+)
+
+
+def drive_technical(text: str) -> str:
+    return f"Technical detail: {text}"
+
+
+# --- The Hub's own amber note - the same words the poll and the page both
+# draw, since both read them from `hub_view` through the one builder,
+# `read_hub_view` -------------------------------------------------------------
+
+HUB_DRIVE_NOTE_COPIES = "Downloads are being copied, not moved - using double space"
+HUB_DRIVE_NOTE_UNCHECKED = "Marrquee couldn't test your drive - see why"
+
+
+_DRIVE_WORDS: tuple[str, ...] = (
+    "LINK_TEST_FILE_TEXT",
+    "DRIVE_SECTION_TITLE",
+    "DRIVE_WORKS_TITLE",
+    "DRIVE_WORKS_DETAIL",
+    "DRIVE_NOT_NEEDED_TITLE",
+    "DRIVE_NOT_NEEDED_DETAIL",
+    "DRIVE_STILL_CHECKING_TITLE",
+    "DRIVE_STILL_CHECKING_DETAIL",
+    "DRIVE_COPIES_TITLE",
+    "DRIVE_COULDNT_CHECK_TITLE",
+    "drive_reason_different_drives",
+    "drive_reason_no_hard_links",
+    "drive_reason_not_allowed",
+    "drive_reason_drive_full",
+    "drive_reason_folder_missing",
+    "drive_reason_folder_elsewhere",
+    "drive_reason_unexpected",
+    "DRIVE_TODO_SAME_DRIVE",
+    "DRIVE_TODO_NATIVE_DRIVE",
+    "DRIVE_TODO_PERMISSIONS",
+    "DRIVE_TODO_FREE_SPACE",
+    "DRIVE_TODO_REBUILD_FOLDER",
+    "DRIVE_TODO_REAL_FOLDER",
+    "DRIVE_TODO_ASK_FOR_HELP",
+    "drive_technical",
+    "HUB_DRIVE_NOTE_COPIES",
+    "HUB_DRIVE_NOTE_UNCHECKED",
+)
+
+# =============================================================================
+# end Your drive section
+# =============================================================================
+
 # The full review surface: every public name above, in one tuple. A later
 # feature area adds its own fenced section above this line, then extends
 # this tuple with its own `_..._WORDS` name - never editing an earlier
@@ -1632,4 +1770,5 @@ WORDS_INVENTORY: tuple[str, ...] = (
     *_VPN_WORDS,
     *_QBIT_WORDS,
     *_VPN_CHANGE_WORDS,
+    *_DRIVE_WORDS,
 )

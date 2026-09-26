@@ -23,6 +23,7 @@ from test_deploy import (
     _GLUETUN_ANSWERS,
     _fresh_root,
     _install_state,
+    _RecordingHardlinkTrigger,
     _run_to_terminal,
     _settings,
     _StatefulEngine,
@@ -230,6 +231,23 @@ async def test_a_successful_move_wires_the_mover_never_gluetun_itself(tmp_path: 
     assert wiring.calls == ["qbittorrent"]
 
 
+async def test_add_your_vpn_movers_success_asks_for_one_check(tmp_path: Path) -> None:
+    manager, engine, settings = await _qbittorrent_without_vpn_to_finale(
+        tmp_path,
+        vpn=FakeGluetunControl(status="running", place=_place()),
+        health_frames={"gluetun": ["healthy"]},
+    )
+    save_step_answers(settings.config_dir, "gluetun", _GLUETUN_ANSWERS)
+    trigger = _RecordingHardlinkTrigger()
+    manager._hardlinks = trigger  # type: ignore[attr-defined]
+
+    assert manager.add_app("gluetun") == "started"
+    final = await _finish_add(manager)
+
+    assert final.adding is None
+    assert trigger.calls == 1
+
+
 async def test_a_refused_tunnel_never_recreates_qbittorrent(tmp_path: Path) -> None:
     manager, engine, settings = await _qbittorrent_without_vpn_to_finale(tmp_path)
     save_step_answers(settings.config_dir, "gluetun", _GLUETUN_ANSWERS)
@@ -330,6 +348,30 @@ async def test_keep_running_without_vpn_restores_qbittorrent_on_its_own_network(
     assert "gluetun" not in doc["services"]
 
 
+async def test_restore_asks_for_no_check(tmp_path: Path) -> None:
+    """Restore ends in `_run_wiring_for_add` directly, never `_run_add_steps`
+    - it moves an existing pair back, it never plans a new folder.
+    """
+    manager, engine, settings = await _qbittorrent_without_vpn_to_finale(tmp_path)
+    trigger = _RecordingHardlinkTrigger()
+    manager._hardlinks = trigger  # type: ignore[attr-defined]
+    save_step_answers(settings.config_dir, "gluetun", _GLUETUN_ANSWERS)
+    engine._logs["gluetun"] = "AUTH: Received control message: AUTH_FAILED, retrying"  # type: ignore[attr-defined]
+
+    assert manager.add_app("gluetun") == "started"
+    failed = await _finish_add(manager)
+    assert failed.adding is not None
+    assert failed.adding.state == "error"
+    assert trigger.calls == 0  # the failed move itself asks for none
+
+    ok = await manager.cancel_add()
+    assert ok is True
+    final = await _finish_add(manager)
+
+    assert final.adding is None
+    assert trigger.calls == 0
+
+
 async def test_cancel_of_a_move_without_the_confirmation_refuses_and_keeps_the_record(
     tmp_path: Path,
 ) -> None:
@@ -402,6 +444,24 @@ async def test_change_vpn_removes_and_recreates_gluetun_with_the_new_secrets_the
 
     secrets_folder = settings.host_mount / "volume1" / "media" / "marrquee" / "vpn"
     assert (secrets_folder / "openvpn_user").read_text() == "a-brand-new-username"
+
+
+async def test_change_vpn_asks_for_no_check(tmp_path: Path) -> None:
+    """Change VPN ends in `_run_wiring_for_add` directly, never
+    `_run_add_steps` - it recreates an existing pair, it never plans one.
+    """
+    manager, engine, settings = await _protected_qbittorrent_to_finale(tmp_path)
+    trigger = _RecordingHardlinkTrigger()
+    manager._hardlinks = trigger  # type: ignore[attr-defined]
+
+    new_answers = dict(_GLUETUN_ANSWERS, openvpn_user="a-brand-new-username")
+    save_step_answers(settings.config_dir, "gluetun", new_answers)
+
+    assert manager.change_vpn() == "started"
+    final = await _finish_add(manager)
+
+    assert final.adding is None
+    assert trigger.calls == 0
 
 
 async def test_change_vpn_refuses_when_busy_adding_or_no_vpn_installed(tmp_path: Path) -> None:
