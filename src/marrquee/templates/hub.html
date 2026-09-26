@@ -92,6 +92,7 @@
           data-app="{{ tile.app_id }}"
           data-kind="{{ tile.kind }}"
           data-state="{{ tile.state }}"
+          data-paused="{{ 'true' if tile.paused else 'false' }}"
           {% if tile.add_state %}data-add-state="{{ tile.add_state }}"{% endif %}
           {% if tile.url %}href="{{ tile.url }}" aria-label="{{ tile.aria }}"{% endif %}
           target="_blank"
@@ -108,6 +109,9 @@
           <p data-role="line">{{ tile.line }}</p>
           <p class="hub-note" data-role="note">{{ tile.note }}</p>
         </a>
+        {% if tile.can_change_seeding %}
+        <a class="hub-tile-link" href="/?panel=seeding#hub-panel" data-panel-open="seeding">{{ words.HUB_CHANGE_SEEDING }}</a>
+        {% endif %}
         {% if tile.actions == "retry" %}
         <div class="hub-tile-actions">
           <form method="post" action="/hub/apps/{{ tile.app_id }}/retry">
@@ -375,6 +379,18 @@
       <p>{{ words.LOGIN_PLEX_NOTE }}</p>
       <a class="hub-footer-link" href="{{ login_help_url }}" target="_blank" rel="noopener noreferrer">{{ words.HUB_LOGIN_FORGOT_LINK }}</a>
       {% endif %}
+    </div>
+
+    <div data-panel-pane="seeding">
+      <h3>{{ words.HUB_SEEDING_PANEL_TITLE }}</h3>
+      <form method="post" action="/hub/seeding">
+        {% set step = seeding_step %}
+        {% set answers = seeding_form.answers %}
+        {% set problem = seeding_form.problem %}
+        {% set problem_field = seeding_form.problem_field %}
+        {% include "partials/app_questions.html" %}
+        <button type="submit" class="btn-primary">{{ words.HUB_SEEDING_SAVE }}</button>
+      </form>
     </div>
   </dialog>
 </main>

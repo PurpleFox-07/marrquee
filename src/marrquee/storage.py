@@ -425,6 +425,11 @@ def plan_folders(app_ids: Iterable[str]) -> tuple[PurePosixPath, ...]:
                 media_types.append(media_folder)
 
     planned = [PurePosixPath("data", "torrents", media) for media in media_types]
+    if not media_types and any(app.kind == "downloader" for app in apps):
+        # A downloader with no media app yet still needs somewhere to
+        # write - without this, Docker would create `data/torrents` as
+        # root on first start, and the downloader couldn't write to it.
+        planned.append(PurePosixPath("data", "torrents"))
     planned += [PurePosixPath("data", "media", media) for media in media_types]
     planned.append(PurePosixPath("marrquee"))
     planned += [PurePosixPath("marrquee", "apps", app.id) for app in apps]

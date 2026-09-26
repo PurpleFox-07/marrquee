@@ -8,14 +8,18 @@ all - every test here builds a `Settings` and calls `install_apps` directly.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path, PurePosixPath
 
 import pytest
 
+from marrquee.catalog import get_app
 from marrquee.config import Settings
-from marrquee.install import install_apps, with_app_added, with_app_removed
+from marrquee.install import api_key_for, install_apps, with_app_added, with_app_removed
 from marrquee.state import InstallState, load_state
 from marrquee.words import REFUSAL_NOTHING_CHOSEN, REFUSAL_UNKNOWN_APP
+
+_QBIT_KEY_PATTERN = re.compile(r"^qbt_[2-9A-HJ-NP-Za-km-z]{28}$")
 
 
 def _settings(tmp_path: Path) -> Settings:
@@ -140,6 +144,22 @@ def test_install_apps_refuses_gluetun_the_same_way_as_an_unknown_app(tmp_path: P
     assert load_state(settings.config_dir) is None
 
 
+def test_install_apps_accepts_gluetun_when_posted_alongside_qbittorrent(tmp_path: Path) -> None:
+    """Gluetun is still never `offered`, but posting qBittorrent - the
+    offered app that actually needs it - must never be refused just
+    because Gluetun rode along in the same post (the wizard's own
+    `POST /setup/apps` unions it in before this ever runs).
+    """
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+
+    result = install_apps(settings, str(root), ["gluetun", "qbittorrent"])
+
+    assert result.ok
+    assert result.state is not None
+    assert result.state.app_ids == ("gluetun", "qbittorrent")
+
+
 def test_install_apps_refuses_a_missing_path_and_saves_nothing(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
 
@@ -241,6 +261,47 @@ def test_with_app_added_keeps_the_apps_own_key_when_re_added() -> None:
     assert grown.app_ids == ("sonarr", "radarr")
     assert grown.api_keys["sonarr"] == "sonarr-key"
     assert grown.api_keys["radarr"] == "radarr-key"
+
+
+# --- api_key_for: a qBittorrent-valid key, arr apps unchanged ---------------
+
+
+def test_api_key_for_makes_a_qbittorrent_valid_key() -> None:
+    qbittorrent = get_app("qbittorrent")
+
+    first = api_key_for(qbittorrent)
+    second = api_key_for(qbittorrent)
+
+    assert _QBIT_KEY_PATTERN.match(first)
+    assert _QBIT_KEY_PATTERN.match(second)
+    assert first != second
+
+
+def test_api_key_for_keeps_arr_apps_on_32_hex_characters() -> None:
+    sonarr = get_app("sonarr")
+
+    key = api_key_for(sonarr)
+
+    assert re.match(r"^[0-9a-f]{32}$", key)
+
+
+def test_with_app_added_gives_qbittorrent_its_own_key_shape() -> None:
+    state = _state(("sonarr",), {"sonarr": "sonarr-key"})
+
+    grown = with_app_added(state, "qbittorrent")
+
+    assert _QBIT_KEY_PATTERN.match(grown.api_keys["qbittorrent"])
+
+
+def test_install_apps_gives_qbittorrent_a_qbt_style_key(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+
+    result = install_apps(settings, str(root), ["sonarr", "qbittorrent"])
+
+    assert result.state is not None
+    assert _QBIT_KEY_PATTERN.match(result.state.api_keys["qbittorrent"])
+    assert re.match(r"^[0-9a-f]{32}$", result.state.api_keys["sonarr"])
 
 
 def test_with_app_added_never_mutates_the_state_it_was_given() -> None:

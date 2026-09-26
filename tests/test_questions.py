@@ -13,6 +13,7 @@ from marrquee import questions, vpn, words
 from marrquee.login import LOGIN_STEP
 from marrquee.questions import (
     QUESTION_STEPS,
+    SEEDING_STEP,
     VPN_STEP,
     QuestionCheck,
     QuestionField,
@@ -43,8 +44,8 @@ def _text_step(app_id: str, step_id: str = "fixture") -> QuestionStep:
     )
 
 
-def test_question_steps_holds_exactly_the_registered_vpn_step() -> None:
-    assert QUESTION_STEPS == (VPN_STEP,)
+def test_question_steps_holds_the_registered_vpn_and_seeding_steps() -> None:
+    assert QUESTION_STEPS == (VPN_STEP, SEEDING_STEP)
 
 
 def test_question_option_and_field_gain_their_new_optional_attributes() -> None:
@@ -153,6 +154,39 @@ def test_the_vpn_steps_empty_option_fails_its_own_check_never_question_pick_one(
     assert result.field == "provider"
     assert result.problem == vpn.VPN_PROBLEM_PICK_PROVIDER
     assert result.problem != QUESTION_PICK_ONE
+
+
+def test_seeding_step_fields_are_in_contract_order() -> None:
+    names = [field.name for field in SEEDING_STEP.fields]
+
+    assert names == ["seeding", "seed_ratio", "seed_days"]
+    assert SEEDING_STEP.app_id == "qbittorrent"
+    assert SEEDING_STEP.step_id == "seeding"
+
+    seeding_field = SEEDING_STEP.fields[0]
+    assert seeding_field.kind == "choice"
+    assert seeding_field.default == "good_neighbor"
+    assert [option.value for option in seeding_field.options] == [
+        "good_neighbor",
+        "save_space",
+        "private",
+        "own",
+    ]
+
+    ratio_field = SEEDING_STEP.fields[1]
+    days_field = SEEDING_STEP.fields[2]
+    assert ratio_field.kind == "text"
+    assert days_field.kind == "text"
+
+
+def test_seeding_step_check_routes_through_check_seeding() -> None:
+    accepted = check_step(SEEDING_STEP, {"seeding": "save_space"}, {})
+    assert accepted.ok is True
+    assert accepted.answers == {"seeding": "save_space", "seed_ratio": "", "seed_days": ""}
+
+    refused = check_step(SEEDING_STEP, {"seeding": "own", "seed_ratio": "", "seed_days": ""}, {})
+    assert refused.ok is False
+    assert refused.field == "seed_ratio"
 
 
 def test_question_steps_for_orders_by_catalog_then_declared_order(

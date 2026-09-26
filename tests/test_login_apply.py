@@ -10,6 +10,7 @@ is involved.
 from __future__ import annotations
 
 import dataclasses
+import json
 
 import pytest
 
@@ -23,6 +24,7 @@ from marrquee.login_apply import (
 )
 from marrquee.state import InstallState
 from marrquee.wiring.arr_client import ArrFailure, ArrResponse, FakeArrClient
+from marrquee.wiring.qbit_client import FakeQbitClient, QbitResponse
 
 _SONARR = get_app("sonarr")
 
@@ -291,3 +293,135 @@ def test_login_apply_result_is_a_frozen_dataclass() -> None:
     result = LoginApplyResult(ok=True, technical=None)
     with pytest.raises(dataclasses.FrozenInstanceError):
         result.ok = False  # type: ignore[misc]
+
+
+# --- the qBittorrent branch: the key, never the old password -----------------
+
+_QBITTORRENT = get_app("qbittorrent")
+_QBIT_SET_PREFS_KEY = ("POST", "http://gluetun:8080", "api/v2/app/setPreferences")
+
+
+def _qbit_install(api_keys: dict[str, str] | None = None) -> InstallState:
+    return InstallState(
+        version=2,
+        storage_root="/volume1/media",
+        app_ids=("gluetun", "qbittorrent"),
+        api_keys=api_keys if api_keys is not None else {"qbittorrent": "qbt_" + "a" * 28},
+        puid=1000,
+        pgid=1000,
+        umask="002",
+        timezone="Etc/UTC",
+        created="2026-09-24T00:00:00+00:00",
+    )
+
+
+async def test_the_qbittorrent_branch_posts_username_and_password_with_the_key() -> None:
+    qbit = FakeQbitClient(
+        {_QBIT_SET_PREFS_KEY: [QbitResponse(ok=True, status=200, payload="Ok.", detail=None)]}
+    )
+    applier = HttpLoginApplier(qbit=qbit)
+    login = _login(password="new-owner-password")
+
+    result = await applier.apply(_QBITTORRENT, _qbit_install(), login)
+
+    assert result.ok is True
+    assert len(qbit.calls) == 1
+    method, base_url, path, form = qbit.calls[0]
+    assert (method, base_url, path) == _QBIT_SET_PREFS_KEY
+    assert form is not None
+    body = json.loads(form["json"])
+    assert body == {"web_ui_username": "owner", "web_ui_password": "new-owner-password"}
+
+
+async def test_the_qbittorrent_branch_defaults_to_a_real_http_client_when_none_is_given() -> None:
+    # CI calls a bare HttpLoginApplier() - the qbit keyword must default to a
+    # real HttpQbitClient, the same way `client` defaults to HttpArrClient.
+    applier = HttpLoginApplier()
+
+    assert applier._qbit is not None
+
+
+async def test_the_qbittorrent_branch_retries_a_503_never_a_400() -> None:
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    qbit = FakeQbitClient(
+        {
+            _QBIT_SET_PREFS_KEY: [
+                QbitResponse(ok=False, status=503, payload=None, detail="unavailable"),
+                QbitResponse(ok=True, status=200, payload="Ok.", detail=None),
+            ]
+        }
+    )
+    applier = HttpLoginApplier(qbit=qbit, sleep=fake_sleep, attempts=3, retry_delay=0.01)
+
+    result = await applier.apply(_QBITTORRENT, _qbit_install(), _login())
+
+    assert result.ok is True
+    assert len(sleeps) == 1
+    assert len(qbit.calls) == 2
+
+
+async def test_the_qbittorrent_branch_never_retries_a_400() -> None:
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    qbit = FakeQbitClient(
+        {_QBIT_SET_PREFS_KEY: [QbitResponse(ok=False, status=400, payload=None, detail="bad")]}
+    )
+    applier = HttpLoginApplier(qbit=qbit, sleep=fake_sleep, attempts=3, retry_delay=0.01)
+
+    result = await applier.apply(_QBITTORRENT, _qbit_install(), _login())
+
+    assert result.ok is False
+    assert sleeps == []
+    assert len(qbit.calls) == 1
+
+
+async def test_the_qbittorrent_branch_technical_never_contains_the_password() -> None:
+    qbit = FakeQbitClient(
+        {
+            _QBIT_SET_PREFS_KEY: [
+                QbitResponse(
+                    ok=False, status=400, payload=None, detail="body echoed s3cret-pw back"
+                )
+            ]
+        }
+    )
+    applier = HttpLoginApplier(qbit=qbit)
+
+    result = await applier.apply(_QBITTORRENT, _qbit_install(), _login(password="s3cret-pw"))
+
+    assert result.ok is False
+    assert result.technical is not None
+    assert "s3cret-pw" not in result.technical
+    assert "<redacted-password>" in result.technical
+
+
+async def test_the_qbittorrent_branch_with_a_missing_key_is_not_ok_and_makes_no_request() -> None:
+    qbit = FakeQbitClient({})
+    applier = HttpLoginApplier(qbit=qbit)
+
+    result = await applier.apply(_QBITTORRENT, _qbit_install(api_keys={}), _login())
+
+    assert result.ok is False
+    assert qbit.calls == []
+
+
+async def test_the_qbittorrent_branch_runs_before_the_arr_only_guard() -> None:
+    """qBittorrent's `login_kind` is "qbittorrent", not "arr" - if the
+    qbittorrent branch didn't come first, the arr-only guard would refuse
+    it outright and this would fail with "does not take a login".
+    """
+    qbit = FakeQbitClient(
+        {_QBIT_SET_PREFS_KEY: [QbitResponse(ok=True, status=200, payload="Ok.", detail=None)]}
+    )
+    applier = HttpLoginApplier(qbit=qbit)
+
+    result = await applier.apply(_QBITTORRENT, _qbit_install(), _login())
+
+    assert result.ok is True

@@ -24,7 +24,14 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from marrquee.catalog import CATALOG, AppKind, CatalogApp, get_app, unavailable_reason
+from marrquee.catalog import (
+    CATALOG,
+    AppKind,
+    CatalogApp,
+    companions_for,
+    get_app,
+    unavailable_reason,
+)
 from marrquee.config import Settings
 from marrquee.deploy import (
     AddStart,
@@ -43,6 +50,7 @@ from marrquee.install import install_apps
 from marrquee.login import LOGIN_STEP, load_login, save_login
 from marrquee.questions import (
     QuestionCheck,
+    QuestionStep,
     check_step,
     load_answers,
     question_steps_for,
@@ -212,6 +220,8 @@ class HubTileOut(BaseModel):
     note: str
     actions: Literal["none", "retry", "reconnect"]
     kind: AppKind
+    paused: bool
+    can_change_seeding: bool
 
 
 class LinkTileOut(BaseModel):
@@ -253,6 +263,7 @@ class HubInstallOut(BaseModel):
     ok: bool
     message: str | None
     step_id: str | None
+    step_app_id: str | None
     field: str | None
 
 
@@ -316,6 +327,8 @@ def _hub_tile_out(tile: HubTile) -> HubTileOut:
         note=tile.note,
         actions=tile.actions,
         kind=tile.kind,
+        paused=tile.paused,
+        can_change_seeding=tile.can_change_seeding,
     )
 
 
@@ -556,28 +569,35 @@ async def post_hub_install(
         app = get_app(app_id)
     except KeyError:
         response.status_code = 409
-        return HubInstallOut(ok=False, message=HUB_INSTALL_UNKNOWN, step_id=None, field=None)
+        return HubInstallOut(
+            ok=False, message=HUB_INSTALL_UNKNOWN, step_id=None, step_app_id=None, field=None
+        )
 
-    steps = question_steps_for((app_id,))
-    saved = load_answers(settings.config_dir).get(app_id, {})
-    checks: list[QuestionCheck] = []
+    installed_ids = tuple(progress.app_id for progress in manager.snapshot().apps)
+    steps = question_steps_for((*companions_for(app_id, installed_ids), app_id))
+    saved = load_answers(settings.config_dir)
+    checks: list[tuple[QuestionStep, QuestionCheck]] = []
     for step in steps:
-        check = check_step(step, body.answers, saved)
+        check = check_step(step, body.answers, saved.get(step.app_id, {}))
         if not check.ok:
             response.status_code = 400
             return HubInstallOut(
-                ok=False, message=check.problem, step_id=step.step_id, field=check.field
+                ok=False,
+                message=check.problem,
+                step_id=step.step_id,
+                step_app_id=step.app_id,
+                field=check.field,
             )
-        checks.append(check)
+        checks.append((step, check))
 
-    for check in checks:
-        save_step_answers(settings.config_dir, app_id, check.answers)
+    for step, check in checks:
+        save_step_answers(settings.config_dir, step.app_id, check.answers)
 
     result = manager.add_app(app_id)
     if result == "started":
         response.status_code = 202
-        return HubInstallOut(ok=True, message=None, step_id=None, field=None)
+        return HubInstallOut(ok=True, message=None, step_id=None, step_app_id=None, field=None)
 
     response.status_code = 409
     message = _add_start_refusal_message(result, app, manager)
-    return HubInstallOut(ok=False, message=message, step_id=None, field=None)
+    return HubInstallOut(ok=False, message=message, step_id=None, step_app_id=None, field=None)

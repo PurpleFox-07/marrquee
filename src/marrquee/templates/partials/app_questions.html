@@ -22,7 +22,7 @@
 
   {% for field in step.fields %}
   {% set field_id = "q-" ~ step.app_id ~ "-" ~ field.name %}
-  {% set saved = answers.get(field.name, field.default) %}
+  {% set saved = answers.get(field.name, field.default) %}{% if field.shown_when %}<div class="question-field" data-field="{{ field.name }}">{% endif %}
   {% if field.kind == "choice" %}
   <div class="app-grid" role="radiogroup" aria-label="{{ field.label }}">
     {% for option in field.options %}
@@ -88,6 +88,6 @@
     {% if field.hint %}aria-describedby="{{ field_id }}-hint"{% endif %}
   >
   {% if field.hint %}<p class="field-hint" id="{{ field_id }}-hint">{{ field.hint }}</p>{% endif %}
-  {% endif %}
+  {% endif %}{% if field.shown_when %}</div>{% endif %}
   {% endfor %}
 </fieldset>

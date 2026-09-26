@@ -358,7 +358,7 @@ def test_a_down_link_never_raises_any_down_or_docker_unreachable() -> None:
 def test_installable_is_the_catalog_minus_the_deploy_in_catalog_order() -> None:
     view = hub_view(["radarr"], [_health("radarr")], authority=_AUTHORITY, proxied=False, now=_NOW)
 
-    assert [app.id for app in view.installable] == ["prowlarr", "sonarr"]
+    assert [app.id for app in view.installable] == ["prowlarr", "sonarr", "qbittorrent"]
 
     every_id = [app.id for app in CATALOG]
     full_view = hub_view(
@@ -510,7 +510,7 @@ def test_install_rows_exclude_the_app_being_added_and_grey_an_unavailable_one(
 
     ids = [row.app.id for row in view.install_rows]
     assert "sonarr" not in ids
-    assert ids == ["prowlarr", "radarr"]
+    assert ids == ["prowlarr", "radarr", "qbittorrent"]
     by_id = {row.app.id: row for row in view.install_rows}
     assert isinstance(by_id["radarr"], InstallRow)
     assert by_id["prowlarr"].unavailable is None
@@ -536,6 +536,31 @@ def test_install_rows_carry_each_apps_registered_question_steps() -> None:
     by_id = {row.app.id: row for row in view.install_rows}
     assert by_id["prowlarr"].steps == (fixture_step,)
     assert by_id["sonarr"].steps == ()
+
+
+def test_qbittorrents_install_row_holds_the_vpn_step_then_seeding() -> None:
+    """qBittorrent's install row must ask Gluetun's own VPN question BEFORE
+    its own seeding question - the Pitch's "adding qBittorrent brings the
+    VPN first" promise, drawn on the "+" panel itself.
+    """
+    view = hub_view([], [], authority=_AUTHORITY, proxied=False, now=_NOW)
+
+    by_id = {row.app.id: row for row in view.install_rows}
+    assert [step.app_id for step in by_id["qbittorrent"].steps] == ["gluetun", "qbittorrent"]
+    assert [step.step_id for step in by_id["qbittorrent"].steps] == ["vpn", "seeding"]
+
+
+def test_an_already_installed_gluetun_never_repeats_its_own_step() -> None:
+    """qBittorrent added after Gluetun already exists asks only its own
+    seeding question - Gluetun's VPN step belongs to an app that's already
+    deployed, not to this row.
+    """
+    view = hub_view(
+        ["gluetun"], [_health("gluetun")], authority=_AUTHORITY, proxied=False, now=_NOW
+    )
+
+    by_id = {row.app.id: row for row in view.install_rows}
+    assert [step.step_id for step in by_id["qbittorrent"].steps] == ["seeding"]
 
 
 def test_a_starting_add_gets_a_spotlit_tile_with_no_url() -> None:
@@ -1047,3 +1072,137 @@ def test_the_vpn_counts_in_n_of_m_up() -> None:
     )
 
     assert view.announce == "1 of 2 apps are up."
+
+
+def test_tunnel_down_pauses_a_running_downloader_and_excludes_it_from_any_down() -> None:
+    view = hub_view(
+        ["gluetun", "qbittorrent"],
+        [
+            _health("gluetun", state="up", health="unhealthy"),
+            _health("qbittorrent", state="up"),
+        ],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+    )
+
+    tile = next(tile for tile in view.tiles if tile.app_id == "qbittorrent")
+    assert tile.state == "down"
+    assert tile.chip == words.HUB_CHIP_PAUSED
+    assert tile.line == words.HUB_LINE_PAUSED_FOR_VPN
+    assert tile.url is None
+    assert tile.aria is None
+    assert tile.paused is True
+    assert view.any_down is False
+
+
+def test_tunnel_connecting_also_pauses_the_downloader() -> None:
+    view = hub_view(
+        ["gluetun", "qbittorrent"],
+        [
+            _health("gluetun", state="up", health="starting"),
+            _health("qbittorrent", state="up"),
+        ],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+    )
+
+    tile = next(tile for tile in view.tiles if tile.app_id == "qbittorrent")
+    assert tile.paused is True
+
+
+def test_tunnel_unknown_leaves_the_downloader_tile_normal_and_linked() -> None:
+    view = hub_view(
+        ["gluetun", "qbittorrent"],
+        [
+            _health("gluetun", state="up", health=None),
+            _health("qbittorrent", state="up"),
+        ],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+    )
+
+    tile = next(tile for tile in view.tiles if tile.app_id == "qbittorrent")
+    assert tile.state == "up"
+    assert tile.paused is False
+    assert tile.url == "http://192.168.1.50:8080/"
+
+
+def test_tunnel_up_leaves_the_downloader_tile_normal_and_linked() -> None:
+    view = hub_view(
+        ["gluetun", "qbittorrent"],
+        [
+            _health("gluetun", state="up", health="healthy"),
+            _health("qbittorrent", state="up"),
+        ],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+    )
+
+    tile = next(tile for tile in view.tiles if tile.app_id == "qbittorrent")
+    assert tile.state == "up"
+    assert tile.paused is False
+    assert tile.url is not None
+
+
+def test_a_stopped_downloader_is_an_ordinary_down_never_paused() -> None:
+    view = hub_view(
+        ["gluetun", "qbittorrent"],
+        [
+            _health("gluetun", state="up", health="unhealthy"),
+            _health("qbittorrent", state="down"),
+        ],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+    )
+
+    tile = next(tile for tile in view.tiles if tile.app_id == "qbittorrent")
+    assert tile.state == "down"
+    assert tile.chip == words.HUB_CHIP_DOWN
+    assert tile.paused is False
+    assert view.any_down is True
+
+
+def test_an_installed_downloader_offers_change_seeding() -> None:
+    view = hub_view(
+        ["gluetun", "qbittorrent"],
+        [
+            _health("gluetun", state="up", health="healthy"),
+            _health("qbittorrent", state="up"),
+        ],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+    )
+
+    tile = next(tile for tile in view.tiles if tile.app_id == "qbittorrent")
+    assert tile.can_change_seeding is True
+
+
+def test_a_downloader_being_added_never_offers_change_seeding() -> None:
+    view = hub_view(
+        ["gluetun"],
+        [_health("gluetun", state="up", health="healthy")],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        adding=AppAdd(
+            app_id="qbittorrent",
+            purpose="add",
+            state="starting",
+            line="Starting qBittorrent",
+            note=None,
+            failure=None,
+            wiring=(),
+            compose_ran=False,
+            started_at="2026-09-26T00:00:00+00:00",
+        ),
+    )
+
+    tile = next(tile for tile in view.tiles if tile.app_id == "qbittorrent")
+    assert tile.can_change_seeding is False
+    assert tile.paused is False

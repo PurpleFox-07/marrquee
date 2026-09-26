@@ -29,6 +29,7 @@ from marrquee.same_origin import SameOriginGuard
 from marrquee.vpn_control import GluetunControl, HttpGluetunControl
 from marrquee.wiring import WiringRunner
 from marrquee.wiring.engine import WiringEngine
+from marrquee.wiring.qbit_client import HttpQbitClient, QbitClient
 
 # Resolved from the installed package, not the repository: the runtime image
 # copies only the built venv (no `src/` tree survives), so a path built from
@@ -48,6 +49,7 @@ def create_app(
     link_probe: LinkProbe | None = None,
     login_applier: LoginApplier | None = None,
     vpn_control: GluetunControl | None = None,
+    qbit_client: QbitClient | None = None,
 ) -> FastAPI:
     """Build the Marrquee app.
 
@@ -69,7 +71,12 @@ def create_app(
     `vpn=` AND kept on `app.state.vpn_control` for the Hub's own status read
     (Story 5) - the same single instance either way, so a test that passes
     its own `manager=` still needs to pass `vpn_control=` too if the Hub
-    route under test should see that same fake.
+    route under test should see that same fake. `qbit_client=None` builds
+    one real `HttpQbitClient()` the same way - the ONE door every
+    qBittorrent call goes through, shared by the deploy manager's own
+    bring-up/readiness check and its `HttpLoginApplier`, and kept on
+    `app.state.qbit_client` so a later chunk's `WiringEngine` can be handed
+    that same instance without re-plumbing this seam.
     """
     if settings is None:
         settings = Settings.from_env()
@@ -77,14 +84,23 @@ def create_app(
         engine = SocketDockerEngine(settings.docker_socket, compose_binary=settings.compose_binary)
     if vpn_control is None:
         vpn_control = HttpGluetunControl()
+    if qbit_client is None:
+        qbit_client = HttpQbitClient()
     if manager is None:
         manager = DeployManager(
             settings,
             engine,
             probe=probe if probe is not None else HttpReadinessProbe(),
-            wiring=wiring if wiring is not None else WiringEngine(),
-            login=login_applier if login_applier is not None else HttpLoginApplier(),
+            wiring=(
+                wiring
+                if wiring is not None
+                else WiringEngine(qbit=qbit_client, vpn=vpn_control, config_dir=settings.config_dir)
+            ),
+            login=(
+                login_applier if login_applier is not None else HttpLoginApplier(qbit=qbit_client)
+            ),
             vpn=vpn_control,
+            qbit=qbit_client,
         )
     if link_probe is None:
         link_probe = HttpLinkProbe()
@@ -101,6 +117,7 @@ def create_app(
     app.state.deploy = manager
     app.state.link_probe = link_probe
     app.state.vpn_control = vpn_control
+    app.state.qbit_client = qbit_client
     app.state.templates = Jinja2Templates(directory=_TEMPLATES_DIR)
 
     app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")

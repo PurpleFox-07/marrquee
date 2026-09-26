@@ -186,3 +186,23 @@ def test_the_vpn_down_poster_is_never_dimmed() -> None:
     body = _block_for(_HUB_CSS.read_text(), selector)
 
     assert "filter: none" in body
+
+
+def test_the_paused_dot_is_warning_not_error() -> None:
+    css = _HUB_CSS.read_text()
+
+    body = _block_for(css, '.hub-poster[data-paused="true"] .hub-dot')
+    assert "background: var(--warning);" in body
+
+    # It has to win by coming LATER in the cascade than the plain down-state
+    # dot - same selector specificity, so source order is what decides.
+    paused_index = css.index('.hub-poster[data-paused="true"] .hub-dot')
+    down_index = css.index('.hub-poster[data-state="down"] .hub-dot')
+    assert paused_index > down_index
+
+
+def test_the_tile_links_tap_target_comes_from_padding_not_a_fixed_height() -> None:
+    body = _block_for(_HUB_CSS.read_text(), ".hub-tile-link")
+
+    assert "padding-block: var(--space-3);" in body
+    assert "height" not in body

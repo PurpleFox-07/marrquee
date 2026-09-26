@@ -38,11 +38,22 @@
     "busy",
     "login_banner",
   ];
-  var APP_FIELDS = ["app_id", "state", "chip", "line", "url", "aria", "add_state", "note", "actions"];
+  var APP_FIELDS = [
+    "app_id",
+    "state",
+    "chip",
+    "line",
+    "url",
+    "aria",
+    "add_state",
+    "note",
+    "actions",
+    "paused",
+  ];
   // No "url" here: a link card's `href` is set once, by the server, and
   // stays put - the light is only ever a hint, so a poll never touches it.
   var LINK_FIELDS = ["link_id", "state", "chip", "line", "aria"];
-  var INSTALL_FIELDS = ["ok", "message", "step_id", "field"];
+  var INSTALL_FIELDS = ["ok", "message", "step_id", "step_app_id", "field"];
 
   // The signature this tab has already reloaded for, once - so a stale
   // response that arrives again right after a reload (the same change,
@@ -150,6 +161,7 @@
       return;
     }
     tile.dataset.state = app.state;
+    tile.dataset.paused = app.paused ? "true" : "false";
     if (app.add_state) {
       tile.setAttribute("data-add-state", app.add_state);
     } else {
@@ -415,18 +427,20 @@
       return;
     }
     if (status === 400) {
-      showRefusal(form, payload.step_id, payload.field, payload.message);
+      showRefusal(form, payload.step_app_id, payload.step_id, payload.field, payload.message);
       return;
     }
-    showRefusal(form, null, null, payload.message);
+    showRefusal(form, null, null, null, payload.message);
   }
 
-  function showRefusal(form, stepId, field, message) {
-    if (stepId) {
-      var appId = form.getAttribute("data-install-form");
+  function showRefusal(form, stepAppId, stepId, field, message) {
+    if (stepAppId && stepId) {
+      // The refused step's OWN owning app - never the form's (a VPN
+      // refusal from qBittorrent's install form belongs to Gluetun's own
+      // step, "gluetun:vpn", not "qbittorrent:vpn").
       var steps = questionSteps(form);
       for (var i = 0; i < steps.length; i += 1) {
-        if (steps[i].getAttribute("data-question-step") === appId + ":" + stepId) {
+        if (steps[i].getAttribute("data-question-step") === stepAppId + ":" + stepId) {
           showStep(form, i);
           break;
         }

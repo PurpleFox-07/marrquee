@@ -24,7 +24,7 @@ _EXPECTED_INVENTORY = (
     "STATUS_CHIP_WAITING",
     "STATUS_CHIP_STARTING",
     "STATUS_CHIP_DONE",
-    "app_line_downloading",
+    "app_line_getting",
     "app_line_starting",
     "app_line_warming_up",
     "app_note_slow_start",
@@ -48,7 +48,7 @@ _EXPECTED_INVENTORY = (
     "storage_check_message",
     "STATUS_CHIP_ERROR",
     "FAILURE_DOCKER_UNREACHABLE",
-    "failure_download_failed",
+    "failure_get_failed",
     "failure_never_became_ready",
     "failure_port_in_use",
     "failure_compose_failed",
@@ -307,6 +307,35 @@ _EXPECTED_INVENTORY = (
     "failure_vpn_not_connected",
     "FAILURE_VPN_NO_TUN",
     "VPN_SECRETS_MOUNT_COMMENT",
+    "QBITTORRENT_DESCRIPTION",
+    "DOWNLOADER_COMPOSE_COMMENT",
+    "PORT_SYNC_SCRIPT_COMMENT",
+    "SEEDING_STEP_TITLE",
+    "SEEDING_STEP_LEDE",
+    "SEEDING_LABEL",
+    "SEEDING_GOOD_NEIGHBOR",
+    "SEEDING_GOOD_NEIGHBOR_HINT",
+    "SEEDING_SAVE_SPACE",
+    "SEEDING_SAVE_SPACE_HINT",
+    "SEEDING_PRIVATE",
+    "SEEDING_PRIVATE_HINT",
+    "SEEDING_OWN",
+    "SEEDING_OWN_HINT",
+    "SEEDING_RATIO_LABEL",
+    "SEEDING_RATIO_HINT",
+    "SEEDING_DAYS_LABEL",
+    "SEEDING_DAYS_HINT",
+    "SEEDING_PROBLEM_RATIO",
+    "SEEDING_PROBLEM_DAYS",
+    "SEEDING_PROBLEM_OWN_EMPTY",
+    "HUB_CHIP_PAUSED",
+    "HUB_LINE_PAUSED_FOR_VPN",
+    "HUB_CHANGE_SEEDING",
+    "HUB_SEEDING_PANEL_TITLE",
+    "HUB_SEEDING_SAVE",
+    "HUB_SEEDING_BUSY",
+    "wiring_line_downloader_settings",
+    "wiring_line_download_client",
 )
 
 _DEPLOY_ENGINE_WORD_COUNT = 40
@@ -318,6 +347,7 @@ _HUB_LINK_WORD_COUNT = 31
 _HUB_INSTALL_WORD_COUNT = 24
 _LOGIN_WORD_COUNT = 40
 _VPN_WORD_COUNT = 45
+_QBIT_WORD_COUNT = 29
 
 
 def test_words_inventory_is_pinned() -> None:
@@ -348,9 +378,7 @@ def test_status_chips_match_the_mockups_exact_vocabulary() -> None:
 
 
 def test_app_line_functions_fill_in_the_apps_own_name() -> None:
-    assert words.app_line_downloading("Sonarr") == (
-        "Downloading Sonarr - this only happens the first time"
-    )
+    assert words.app_line_getting("Sonarr") == ("Getting Sonarr - this only happens the first time")
     assert words.app_line_starting("Sonarr") == "Starting Sonarr"
     assert words.app_line_warming_up("Sonarr") == "Sonarr is waking up"
     assert words.app_line_done("Sonarr") == "Sonarr is ready"
@@ -372,7 +400,7 @@ def test_refusal_functions_carry_the_typed_path_or_name() -> None:
 
 
 def test_failure_functions_carry_the_apps_own_name_and_port() -> None:
-    assert "Sonarr" in words.failure_download_failed("Sonarr")
+    assert "Sonarr" in words.failure_get_failed("Sonarr")
     assert "Sonarr" in words.failure_never_became_ready("Sonarr")
     assert "Sonarr" in words.failure_compose_failed("Sonarr")
     port_message = words.failure_port_in_use("Sonarr", 8989)
@@ -557,10 +585,9 @@ def test_the_login_section_precedes_the_vpn_section() -> None:
     assert "VPN_DESCRIPTION" not in login_names
 
 
-def test_the_vpn_section_is_last() -> None:
-    """VPN is the newest section, and words.py is the only file this story
-    touches - so unlike every earlier "is last" test, this slice is closed
-    for good: nothing later in this story appends to it.
+def test_the_vpn_section_precedes_the_qbittorrent_section() -> None:
+    """VPN used to be the newest section - qBittorrent now follows it, so
+    this slice is closed the same move every earlier story made.
     """
     vpn_start = (
         _DEPLOY_ENGINE_WORD_COUNT
@@ -572,15 +599,43 @@ def test_the_vpn_section_is_last() -> None:
         + _HUB_INSTALL_WORD_COUNT
         + _LOGIN_WORD_COUNT
     )
+    vpn_end = vpn_start + _VPN_WORD_COUNT
 
-    vpn_names = words.WORDS_INVENTORY[vpn_start:]
+    vpn_names = words.WORDS_INVENTORY[vpn_start:vpn_end]
 
-    assert vpn_names == _EXPECTED_INVENTORY[vpn_start:]
+    assert vpn_names == _EXPECTED_INVENTORY[vpn_start:vpn_end]
     assert vpn_names[0] == "VPN_DESCRIPTION"
     assert vpn_names[-1] == "VPN_SECRETS_MOUNT_COMMENT"
-    assert len(words.WORDS_INVENTORY) == len(_EXPECTED_INVENTORY)
     assert len(vpn_names) == _VPN_WORD_COUNT
     assert "CROSS_SITE_REFUSED" not in vpn_names
+    assert "QBITTORRENT_DESCRIPTION" not in vpn_names
+
+
+def test_the_qbittorrent_section_is_last() -> None:
+    """qBittorrent is the newest section, and words.py is the only file
+    this story touches - so unlike every earlier "is last" test, this
+    slice is closed for good: nothing later in this story appends to it.
+    """
+    qbit_start = (
+        _DEPLOY_ENGINE_WORD_COUNT
+        + _WIZARD_WORD_COUNT
+        + _WIRING_WORD_COUNT
+        + _DEPLOY_SCREEN_WORD_COUNT
+        + _HUB_WORD_COUNT
+        + _HUB_LINK_WORD_COUNT
+        + _HUB_INSTALL_WORD_COUNT
+        + _LOGIN_WORD_COUNT
+        + _VPN_WORD_COUNT
+    )
+
+    qbit_names = words.WORDS_INVENTORY[qbit_start:]
+
+    assert qbit_names == _EXPECTED_INVENTORY[qbit_start:]
+    assert qbit_names[0] == "QBITTORRENT_DESCRIPTION"
+    assert qbit_names[-1] == "wiring_line_download_client"
+    assert len(words.WORDS_INVENTORY) == len(_EXPECTED_INVENTORY)
+    assert len(qbit_names) == _QBIT_WORD_COUNT
+    assert "VPN_SECRETS_MOUNT_COMMENT" not in qbit_names
 
 
 def test_wizard_headline_tuples_carry_the_gradient_word_in_the_middle() -> None:
@@ -748,6 +803,14 @@ def test_wiring_line_functions_match_content_direction() -> None:
 
 def test_wiring_note_already_connected_matches_content_direction() -> None:
     assert words.WIRING_NOTE_ALREADY_CONNECTED == "Already connected - nothing to change."
+
+
+def test_qbittorrent_wiring_line_functions_name_both_apps() -> None:
+    assert words.wiring_line_downloader_settings("qBittorrent") == "Setting up qBittorrent"
+    assert (
+        words.wiring_line_download_client("Sonarr", "qBittorrent")
+        == "Connecting Sonarr to qBittorrent"
+    )
 
 
 def test_wiring_chips_are_chosen_purely_from_state() -> None:

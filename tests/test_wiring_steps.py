@@ -16,14 +16,17 @@ import pytest
 from marrquee import catalog, storage, words
 from marrquee.wiring import steps
 from marrquee.wiring.arr_client import ArrFailure, ArrResponse, FakeArrClient
+from marrquee.wiring.qbit_client import FakeQbitClient, QbitResponse
 
 PROWLARR = catalog.get_app("prowlarr")
 SONARR = catalog.get_app("sonarr")
 RADARR = catalog.get_app("radarr")
+QBITTORRENT = catalog.get_app("qbittorrent")
 
 PROWLARR_KEY = "p" * 32
 SONARR_KEY = "s" * 32
 RADARR_KEY = "r" * 32
+QBIT_KEY = "qbt_" + "k" * 28
 
 _ROOT = "/volume1/media"
 
@@ -425,3 +428,419 @@ def test_no_media_folder_name_is_hardcoded_in_steps_py() -> None:
 
     for literal in ('"tv"', "'tv'", '"movies"', "'movies'"):
         assert literal not in source
+
+
+# --- app_base_url: an app with no network of its own rides another's ---------
+
+
+def test_app_base_url_for_an_ordinary_app_is_its_own_id() -> None:
+    assert steps.app_base_url(SONARR) == "http://sonarr:8989"
+
+
+def test_app_base_url_for_qbittorrent_is_gluetun() -> None:
+    qbittorrent = catalog.get_app("qbittorrent")
+
+    assert steps.app_base_url(qbittorrent) == "http://gluetun:8080"
+
+
+# --- ensure_qbit_preferences --------------------------------------------------
+
+
+def _qbit_ok(payload: object = None, status: int = 200) -> QbitResponse:
+    return QbitResponse(ok=True, status=status, payload=payload, detail=None)
+
+
+def _qbit_failed(status: int, detail: str | None = None) -> QbitResponse:
+    return QbitResponse(ok=False, status=status, payload=None, detail=detail)
+
+
+async def test_equal_preferences_never_post() -> None:
+    fake = FakeQbitClient(
+        {
+            ("GET", "http://gluetun:8080", "api/v2/app/preferences"): [
+                _qbit_ok({"max_ratio_act": 0, "max_ratio": 1.0})
+            ],
+        }
+    )
+
+    outcome = await steps.ensure_qbit_preferences(
+        fake, QBITTORRENT, QBIT_KEY, {"max_ratio_act": 0, "max_ratio": 1.0}
+    )
+
+    assert outcome.state == "done"
+    assert outcome.changed is False
+    assert outcome.note == words.WIRING_NOTE_ALREADY_CONNECTED
+    assert fake.calls == [("GET", "http://gluetun:8080", "api/v2/app/preferences", None)]
+
+
+async def test_a_float_within_tolerance_still_counts_as_equal() -> None:
+    fake = FakeQbitClient(
+        {
+            ("GET", "http://gluetun:8080", "api/v2/app/preferences"): [
+                _qbit_ok({"max_ratio": 1.0000009})
+            ],
+        }
+    )
+
+    outcome = await steps.ensure_qbit_preferences(fake, QBITTORRENT, QBIT_KEY, {"max_ratio": 1.0})
+
+    assert outcome.state == "done"
+    assert outcome.changed is False
+
+
+async def test_a_changed_preference_posts_the_new_json() -> None:
+    fake = FakeQbitClient(
+        {
+            ("GET", "http://gluetun:8080", "api/v2/app/preferences"): [
+                _qbit_ok({"max_seeding_time": 100})
+            ],
+            ("POST", "http://gluetun:8080", "api/v2/app/setPreferences"): [_qbit_ok()],
+        }
+    )
+
+    outcome = await steps.ensure_qbit_preferences(
+        fake, QBITTORRENT, QBIT_KEY, {"max_seeding_time": 10080}
+    )
+
+    assert outcome.state == "done"
+    assert outcome.changed is True
+    post_calls = [call for call in fake.calls if call[0] == "POST"]
+    assert len(post_calls) == 1
+    form = post_calls[0][3]
+    assert form == {"json": '{"max_seeding_time":10080}'}
+
+
+async def test_preferences_read_failure_is_unreachable_against_qbittorrent() -> None:
+    fake = FakeQbitClient(
+        {("GET", "http://gluetun:8080", "api/v2/app/preferences"): [_qbit_failed(0, "boom")]}
+    )
+
+    outcome = await steps.ensure_qbit_preferences(fake, QBITTORRENT, QBIT_KEY, {"max_ratio": 1.0})
+
+    assert outcome.state == "error"
+    assert outcome.note == words.wiring_failure_unreachable("qBittorrent")
+    assert outcome.transient is True
+
+
+# --- ensure_qbit_category ------------------------------------------------------
+
+
+async def test_an_existing_category_with_the_right_save_path_is_left_alone() -> None:
+    fake = FakeQbitClient(
+        {
+            ("GET", "http://gluetun:8080", "api/v2/torrents/categories"): [
+                _qbit_ok({"tv": {"name": "tv", "savePath": "/data/torrents/tv"}})
+            ],
+        }
+    )
+
+    outcome = await steps.ensure_qbit_category(
+        fake, QBITTORRENT, QBIT_KEY, media_folder="tv", save_path="/data/torrents/tv"
+    )
+
+    assert outcome.state == "done"
+    assert outcome.changed is False
+    assert fake.calls == [("GET", "http://gluetun:8080", "api/v2/torrents/categories", None)]
+
+
+async def test_a_missing_category_is_created() -> None:
+    fake = FakeQbitClient(
+        {
+            ("GET", "http://gluetun:8080", "api/v2/torrents/categories"): [_qbit_ok({})],
+            ("POST", "http://gluetun:8080", "api/v2/torrents/createCategory"): [_qbit_ok()],
+        }
+    )
+
+    outcome = await steps.ensure_qbit_category(
+        fake, QBITTORRENT, QBIT_KEY, media_folder="tv", save_path="/data/torrents/tv"
+    )
+
+    assert outcome.state == "done"
+    assert outcome.changed is True
+    post_calls = [call for call in fake.calls if call[0] == "POST"]
+    assert post_calls == [
+        (
+            "POST",
+            "http://gluetun:8080",
+            "api/v2/torrents/createCategory",
+            {"category": "tv", "savePath": "/data/torrents/tv"},
+        )
+    ]
+
+
+async def test_a_category_with_the_wrong_save_path_is_edited() -> None:
+    fake = FakeQbitClient(
+        {
+            ("GET", "http://gluetun:8080", "api/v2/torrents/categories"): [
+                _qbit_ok({"movies": {"name": "movies", "savePath": "/data/torrents/old"}})
+            ],
+            ("POST", "http://gluetun:8080", "api/v2/torrents/editCategory"): [_qbit_ok()],
+        }
+    )
+
+    outcome = await steps.ensure_qbit_category(
+        fake, QBITTORRENT, QBIT_KEY, media_folder="movies", save_path="/data/torrents/movies"
+    )
+
+    assert outcome.state == "done"
+    assert outcome.changed is True
+    post_calls = [call for call in fake.calls if call[0] == "POST"]
+    assert post_calls == [
+        (
+            "POST",
+            "http://gluetun:8080",
+            "api/v2/torrents/editCategory",
+            {"category": "movies", "savePath": "/data/torrents/movies"},
+        )
+    ]
+
+
+async def test_category_failures_are_reported_against_qbittorrent() -> None:
+    fake = FakeQbitClient(
+        {("GET", "http://gluetun:8080", "api/v2/torrents/categories"): [_qbit_failed(500)]}
+    )
+
+    outcome = await steps.ensure_qbit_category(
+        fake, QBITTORRENT, QBIT_KEY, media_folder="tv", save_path="/data/torrents/tv"
+    )
+
+    assert outcome.state == "error"
+    assert outcome.note == words.wiring_failure_unreachable("qBittorrent")
+    assert outcome.transient is True
+
+
+# --- ensure_download_client -----------------------------------------------------
+
+_DOWNLOAD_CLIENT_SCHEMA: list[object] = [
+    {
+        "id": 0,
+        "name": "Deluge",
+        "implementation": "Deluge",
+        "fields": [{"name": "host", "value": ""}],
+    },
+    {
+        "id": 0,
+        "name": "qBittorrent",
+        "implementation": "QBittorrent",
+        "fields": [
+            {"name": "host", "value": ""},
+            {"name": "port", "value": 8080},
+            {"name": "useSsl", "value": False},
+            {"name": "urlBase", "value": ""},
+            {"name": "apiKey", "value": ""},
+            {"name": "username", "value": ""},
+            {"name": "password", "value": ""},
+            {"name": "tvCategory", "value": ""},
+        ],
+    },
+]
+
+_RADARR_DOWNLOAD_CLIENT_SCHEMA: list[object] = [
+    {
+        "id": 0,
+        "name": "qBittorrent",
+        "implementation": "QBittorrent",
+        "fields": [
+            {"name": "host", "value": ""},
+            {"name": "port", "value": 8080},
+            {"name": "useSsl", "value": False},
+            {"name": "urlBase", "value": ""},
+            {"name": "apiKey", "value": ""},
+            {"name": "username", "value": ""},
+            {"name": "password", "value": ""},
+            {"name": "movieCategory", "value": ""},
+        ],
+    },
+]
+
+
+async def test_sonarr_creates_a_qbittorrent_download_client_from_the_schema() -> None:
+    fake = FakeArrClient(
+        {
+            ("GET", "http://sonarr:8989", "api/v3/downloadclient"): [_ok([])],
+            ("GET", "http://sonarr:8989", "api/v3/downloadclient/schema"): [
+                _ok(_DOWNLOAD_CLIENT_SCHEMA)
+            ],
+            ("POST", "http://sonarr:8989", "api/v3/downloadclient"): [_created({"id": 7})],
+        }
+    )
+
+    outcome = await steps.ensure_download_client(
+        fake,
+        SONARR,
+        SONARR_KEY,
+        QBITTORRENT,
+        QBIT_KEY,
+        category_field="tvCategory",
+        category="tv",
+    )
+
+    assert outcome.state == "done"
+    assert outcome.changed is True
+    post_calls = [call for call in fake.calls if call[0] == "POST"]
+    assert len(post_calls) == 1
+    body = post_calls[0][3]
+    assert isinstance(body, dict)
+    assert body["name"] == "qBittorrent"
+    assert body["enable"] is True
+    assert body["priority"] == 1
+    assert body["removeCompletedDownloads"] is True
+    assert body["removeFailedDownloads"] is True
+    assert "id" not in body
+    fields = {entry["name"]: entry["value"] for entry in body["fields"]}
+    assert fields["host"] == "gluetun"
+    assert fields["port"] == 8080
+    assert fields["useSsl"] is False
+    assert fields["urlBase"] == ""
+    assert fields["apiKey"] == QBIT_KEY
+    assert fields["username"] == ""
+    assert fields["password"] == ""
+    assert fields["tvCategory"] == "tv"
+
+
+async def test_radarr_uses_moviecategory() -> None:
+    fake = FakeArrClient(
+        {
+            ("GET", "http://radarr:7878", "api/v3/downloadclient"): [_ok([])],
+            ("GET", "http://radarr:7878", "api/v3/downloadclient/schema"): [
+                _ok(_RADARR_DOWNLOAD_CLIENT_SCHEMA)
+            ],
+            ("POST", "http://radarr:7878", "api/v3/downloadclient"): [_created({"id": 8})],
+        }
+    )
+
+    outcome = await steps.ensure_download_client(
+        fake,
+        RADARR,
+        RADARR_KEY,
+        QBITTORRENT,
+        QBIT_KEY,
+        category_field="movieCategory",
+        category="movies",
+    )
+
+    assert outcome.state == "done"
+    body = [call for call in fake.calls if call[0] == "POST"][0][3]
+    assert isinstance(body, dict)
+    fields = {entry["name"]: entry["value"] for entry in body["fields"]}
+    assert fields["movieCategory"] == "movies"
+
+
+async def test_an_up_to_date_client_is_left_alone() -> None:
+    existing = {
+        "id": 3,
+        "name": "qBittorrent",
+        "implementation": "QBittorrent",
+        "enable": True,
+        "priority": 1,
+        "removeCompletedDownloads": True,
+        "removeFailedDownloads": True,
+        "fields": [
+            {"name": "host", "value": "gluetun"},
+            {"name": "port", "value": 8080},
+            {"name": "tvCategory", "value": "tv"},
+        ],
+    }
+    fake = FakeArrClient(
+        {("GET", "http://sonarr:8989", "api/v3/downloadclient"): [_ok([existing])]}
+    )
+
+    outcome = await steps.ensure_download_client(
+        fake,
+        SONARR,
+        SONARR_KEY,
+        QBITTORRENT,
+        QBIT_KEY,
+        category_field="tvCategory",
+        category="tv",
+    )
+
+    assert outcome.state == "done"
+    assert outcome.changed is False
+    assert outcome.note == words.WIRING_NOTE_ALREADY_CONNECTED
+    assert fake.calls == [("GET", "http://sonarr:8989", "api/v3/downloadclient", None)]
+
+
+async def test_a_client_pointing_elsewhere_is_put_back() -> None:
+    existing = {
+        "id": 3,
+        "name": "qBittorrent",
+        "implementation": "QBittorrent",
+        "enable": True,
+        "priority": 1,
+        "removeCompletedDownloads": True,
+        "removeFailedDownloads": True,
+        "fields": [
+            {"name": "host", "value": "gluetun"},
+            {"name": "port", "value": 9999},
+            {"name": "tvCategory", "value": "tv"},
+        ],
+    }
+    fake = FakeArrClient(
+        {
+            ("GET", "http://sonarr:8989", "api/v3/downloadclient"): [_ok([existing])],
+            ("PUT", "http://sonarr:8989", "api/v3/downloadclient/3"): [_ok({"id": 3})],
+        }
+    )
+
+    outcome = await steps.ensure_download_client(
+        fake,
+        SONARR,
+        SONARR_KEY,
+        QBITTORRENT,
+        QBIT_KEY,
+        category_field="tvCategory",
+        category="tv",
+    )
+
+    assert outcome.state == "done"
+    assert outcome.changed is True
+    put_calls = [call for call in fake.calls if call[0] == "PUT"]
+    assert len(put_calls) == 1
+    body = put_calls[0][3]
+    assert isinstance(body, dict)
+    fields = {entry["name"]: entry["value"] for entry in body["fields"]}
+    assert fields["port"] == 8080
+    assert fields["apiKey"] == QBIT_KEY
+
+
+async def test_a_missing_schema_entry_is_reported_against_the_partner() -> None:
+    fake = FakeArrClient(
+        {
+            ("GET", "http://sonarr:8989", "api/v3/downloadclient"): [_ok([])],
+            ("GET", "http://sonarr:8989", "api/v3/downloadclient/schema"): [_ok([])],
+        }
+    )
+
+    outcome = await steps.ensure_download_client(
+        fake,
+        SONARR,
+        SONARR_KEY,
+        QBITTORRENT,
+        QBIT_KEY,
+        category_field="tvCategory",
+        category="tv",
+    )
+
+    assert outcome.state == "error"
+    assert outcome.note == words.wiring_failure_refused("Sonarr")
+
+
+async def test_download_client_unreachable_is_reported_against_the_partner() -> None:
+    fake = FakeArrClient(
+        {("GET", "http://sonarr:8989", "api/v3/downloadclient"): [_failed(0, detail="dead")]}
+    )
+
+    outcome = await steps.ensure_download_client(
+        fake,
+        SONARR,
+        SONARR_KEY,
+        QBITTORRENT,
+        QBIT_KEY,
+        category_field="tvCategory",
+        category="tv",
+    )
+
+    assert outcome.state == "error"
+    assert outcome.note == words.wiring_failure_unreachable("Sonarr")
+    assert outcome.transient is True

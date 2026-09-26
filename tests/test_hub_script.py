@@ -99,6 +99,17 @@ def test_status_fields_include_login_banner() -> None:
     assert "login_banner" in arrays["STATUS_FIELDS"]
 
 
+def test_app_fields_include_paused() -> None:
+    """A paused downloader tile has to repaint on every poll - without
+    `paused` in `APP_FIELDS`, `paintTile` would never see the field it sets
+    `data-paused` from.
+    """
+    script = _HUB_JS_PATH.read_text()
+    arrays = _field_arrays(script)
+
+    assert "paused" in arrays["APP_FIELDS"]
+
+
 def test_the_reload_guard_signature_folds_in_the_login_banner() -> None:
     """`structureSignature` has to actually combine both inputs - a version
     that quietly went back to `return actions;` would still poll and paint

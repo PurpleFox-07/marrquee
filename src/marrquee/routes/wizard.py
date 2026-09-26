@@ -22,7 +22,14 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette.datastructures import FormData
 
 from marrquee import words
-from marrquee.catalog import CATALOG, CatalogApp, get_app, unavailable_reason
+from marrquee.catalog import (
+    CATALOG,
+    CatalogApp,
+    apps_in_order,
+    companions_for,
+    get_app,
+    unavailable_reason,
+)
 from marrquee.config import Settings
 from marrquee.deploy import DeployManager
 from marrquee.docker_client import DockerEngine, detect_host_kind
@@ -159,11 +166,23 @@ async def post_setup_apps(request: Request) -> Response:
     form = await request.form()
     submitted = [value for value in form.getlist("apps") if isinstance(value, str)]
     offered_ids = {app.id for app in _offered_apps()}
-    selected = tuple(app_id for app_id in parse_app_ids(submitted) if app_id in offered_ids)
+    ticked = tuple(app_id for app_id in parse_app_ids(submitted) if app_id in offered_ids)
 
-    if not selected:
+    if not ticked:
         context = await _apps_context(request, selected=(), refusal=words.WIZARD_PICK_AT_LEAST_ONE)
         return templates.TemplateResponse(request, "wizard_apps.html", context)
+
+    # Gluetun rides along the moment its own rider is ticked - the owner
+    # never ticks it directly (it has no checkbox), but qBittorrent must
+    # never run outside the tunnel. Unioned in before the unavailable check
+    # and the redirect, so every later screen (login, questions, drive)
+    # already sees it as part of the choice.
+    companions: list[str] = []
+    for app_id in ticked:
+        for companion_id in companions_for(app_id, ticked):
+            if companion_id not in ticked and companion_id not in companions:
+                companions.append(companion_id)
+    selected = tuple(app.id for app in apps_in_order((*ticked, *companions)))
 
     refusal = _first_unavailable_ticked_app(selected)
     if refusal is not None:

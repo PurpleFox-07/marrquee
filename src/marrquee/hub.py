@@ -29,6 +29,7 @@ from marrquee.catalog import (
     AppKind,
     CatalogApp,
     apps_in_order,
+    companions_for,
     get_app,
     unavailable_reason,
 )
@@ -44,11 +45,13 @@ from marrquee.words import (
     HUB_CHIP_ADD_FAILED,
     HUB_CHIP_ADDING,
     HUB_CHIP_DOWN,
+    HUB_CHIP_PAUSED,
     HUB_CHIP_STARTING,
     HUB_CHIP_UNKNOWN,
     HUB_CHIP_UP,
     HUB_INSTALL_BUSY_LOGIN,
     HUB_INSTALL_LOGIN_FIRST,
+    HUB_LINE_PAUSED_FOR_VPN,
     HUB_LINK_LINE_DOWN,
     HUB_LINKS_ALL_UP,
     HUB_NOTHING_SET_UP,
@@ -128,7 +131,11 @@ class HubTile:
     needs beside its usual link: `retry` for a failed add, `reconnect` for
     an app whose wiring only partly finished. `kind` is copied straight
     from the catalog so the template (and `HubTileOut`) can style the one
-    VPN poster differently without importing the catalog itself.
+    VPN poster differently without importing the catalog itself. `paused`
+    is true only for a downloader whose own container is up but the tunnel
+    it rides is down or connecting - a truthful "down" with its own wording,
+    never an error. `can_change_seeding` offers the Hub's "Change seeding"
+    link on an already-installed downloader's own tile.
     """
 
     app_id: str
@@ -144,6 +151,8 @@ class HubTile:
     note: str = ""
     actions: Literal["none", "retry", "reconnect"] = "none"
     kind: AppKind = "arr"
+    paused: bool = False
+    can_change_seeding: bool = False
 
 
 @dataclass(frozen=True)
@@ -264,7 +273,7 @@ def login_view(
     )
 
 
-PanelMode = Literal["closed", "choose", "install", "link", "edit", "login"]
+PanelMode = Literal["closed", "choose", "install", "link", "edit", "login", "seeding"]
 
 
 @dataclass(frozen=True)
@@ -297,6 +306,20 @@ class LoginFormState:
     back, right or wrong, so there is no key for one here at all. A pass
     redirects instead of reaching this type; every `LoginFormState` a
     template ever sees is a refusal.
+    """
+
+    answers: Mapping[str, str]
+    problem: str | None
+    problem_field: str | None
+
+
+@dataclass(frozen=True)
+class SeedingFormState:
+    """What the seeding pane's form should show - the saved answer on a
+    plain open, or whatever was just posted (valid or not) after a refusal.
+
+    Unlike `LoginFormState`, every field here is safe to echo back verbatim:
+    a seeding answer never carries a secret.
     """
 
     answers: Mapping[str, str]
@@ -344,6 +367,15 @@ def hub_view(
     # At most one app is ever `kind="vpn"` today - the first (only) tunnel
     # reading found wins, so this stays correct without assuming that.
     vpn_tunnel = next((tunnel for _, tunnel in built_tiles if tunnel is not None), None)
+    # A downloader's own container can be "up" while the tunnel it rides is
+    # anything but - this can only be decided once every tile (the VPN's
+    # included) has been built, so it's a second pass over the already-built
+    # tiles rather than something `_tile` could ever know on its own.
+    if vpn_tunnel in ("down", "connecting"):
+        tiles = tuple(
+            _paused_for_vpn(tile) if tile.kind == "downloader" and tile.state == "up" else tile
+            for tile in tiles
+        )
     regular_tiles = tuple(
         tile
         for tile in tiles
@@ -367,7 +399,7 @@ def hub_view(
         InstallRow(
             app=app,
             unavailable=unavailable_reason(app, deployed_ids),
-            steps=question_steps_for((app.id,)),
+            steps=question_steps_for((*companions_for(app.id, deployed_ids), app.id)),
         )
         for app in installable
         if app.id != excluded_id
@@ -405,6 +437,24 @@ def hub_view(
     )
 
 
+def _paused_for_vpn(tile: HubTile) -> HubTile:
+    """The downloader's own tile while its container is up but the tunnel it
+    rides is down or still connecting - never linked (Gluetun's own page is
+    the only door, and it's not proven yet), and never an ordinary Down
+    poster's "start it again from your NAS" advice, since the container
+    itself never stopped.
+    """
+    return replace(
+        tile,
+        state="down",
+        chip=HUB_CHIP_PAUSED,
+        line=HUB_LINE_PAUSED_FOR_VPN,
+        url=None,
+        aria=None,
+        paused=True,
+    )
+
+
 def _counts_toward_any_down(tile: HubTile, health: AppHealth | None) -> bool:
     """Whether a Down poster belongs in the "something needs attention"
     count `any_down` drives the Hub's own down-note from.
@@ -413,8 +463,11 @@ def _counts_toward_any_down(tile: HubTile, health: AppHealth | None) -> bool:
     container is still running and already retrying on its own - the
     down-note's "start it again from your NAS" would be actively wrong
     advice there, so only a stopped VPN container (the one case that advice
-    fits) counts.
+    fits) counts. A paused downloader is the same idea one hop over: its
+    container never stopped either, so it never belongs in this count.
     """
+    if tile.paused:
+        return False
     if tile.state != "down":
         return False
     if tile.kind == "vpn" and health is not None and health.state == "up":
@@ -565,6 +618,11 @@ def _tile(
         url=url,
         aria=aria,
         kind=app.kind,
+        # Every already-installed downloader gets the "Change seeding" link -
+        # a brand-new one being added never reaches this function at all (it
+        # draws from `_adding_tile` instead, which never sets this), so
+        # nothing else has to name that exception here.
+        can_change_seeding=app.kind == "downloader",
     )
     return tile, None
 
@@ -704,6 +762,12 @@ def hub_panel(panel: str | None, link_id: str | None, links: Sequence[LinkCard])
         return HubPanel(mode="link", edit=None, label="", url="", error=None)
     if panel == "login":
         return HubPanel(mode="login", edit=None, label="", url="", error=None)
+    if panel == "seeding":
+        # Whether qBittorrent is actually installed is a question about the
+        # deploy snapshot, which this function never sees (its whole job is
+        # reading the query string against the saved links) - the caller
+        # (`get_hub`) closes this back down when it isn't.
+        return HubPanel(mode="seeding", edit=None, label="", url="", error=None)
     if panel == "edit":
         card = next((link for link in links if link.id == link_id), None)
         if card is not None:

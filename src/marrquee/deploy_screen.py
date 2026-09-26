@@ -183,14 +183,14 @@ def _summary(storage_root: str | None, app_ids: tuple[str, ...]) -> tuple[Summar
     folders = plan_folders(app_ids)
     rows: list[SummaryRow] = []
 
-    # Every app that downloads shares one torrents folder, so only the
-    # first data/torrents/... entry is needed to name it - a second entry
-    # for a second app would point at the very same parent folder.
-    torrents_entry = next(
-        (entry for entry in folders if entry.parts[:2] == ("data", "torrents")), None
-    )
-    if torrents_entry is not None:
-        rows.append(SummaryRow(label=DOWNLOADS_LABEL, path=str(root / torrents_entry.parent)))
+    # Every app that downloads shares one torrents folder, so this only
+    # needs to know whether ANY data/torrents entry was planned, never
+    # which one - a bare `data/torrents` (a downloader with no media app
+    # yet) and a media-shaped `data/torrents/tv` both name the very same
+    # row, `<root>/data/torrents`.
+    has_torrents_folder = any(entry.parts[:2] == ("data", "torrents") for entry in folders)
+    if has_torrents_folder:
+        rows.append(SummaryRow(label=DOWNLOADS_LABEL, path=str(root / "data" / "torrents")))
 
     for entry in folders:
         if entry.parts[:2] != ("data", "media"):

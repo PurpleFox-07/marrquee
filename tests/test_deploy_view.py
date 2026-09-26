@@ -278,6 +278,16 @@ def test_summary_rows_are_host_paths_under_the_storage_root_never_data() -> None
     assert downloads_row.path == "/volume1/media/data/torrents"
 
 
+def test_an_install_with_only_qbittorrent_still_shows_the_downloads_row() -> None:
+    state = _install_state(("qbittorrent",), "/volume1/media")
+
+    view = deploy_view(state, _snapshot(phase="ready"), authority=None)
+
+    labels = [row.label for row in view.summary]
+    assert labels == [DOWNLOADS_LABEL]
+    assert view.summary[0].path == "/volume1/media/data/torrents"
+
+
 def test_summary_is_empty_when_no_storage_root_was_ever_saved() -> None:
     state = _install_state(("sonarr",), None)
 

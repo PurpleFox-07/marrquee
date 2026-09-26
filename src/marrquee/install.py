@@ -11,11 +11,12 @@ and never one that regenerates an API key an app is already using.
 from __future__ import annotations
 
 import dataclasses
+import secrets
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Final, Literal
 
-from marrquee.catalog import CATALOG, apps_in_order, get_app
+from marrquee.catalog import CATALOG, CatalogApp, apps_in_order, companions_for, get_app
 from marrquee.config import Settings
 from marrquee.state import InstallState, load_state, new_api_key, save_state
 from marrquee.storage import check_fresh_start, check_storage_root, derive_ids
@@ -26,10 +27,51 @@ from marrquee.words import (
     storage_check_message,
 )
 
+# qBittorrent's own key alphabet (`apikey.cpp`'s `Password::generate`) -
+# visually unambiguous: no `0`/`O`, `1`/`I`/`l`. `qbt_` + 28 of these is the
+# only shape `APIKey::isValid` accepts.
+_QBIT_KEY_ALPHABET: Final = "23456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz"
+_QBIT_KEY_LENGTH: Final = 28
+
+
+def api_key_for(app: CatalogApp) -> str:
+    """A fresh API key in the shape `app.api_key_style` calls for.
+
+    "qbt" is qBittorrent's own `qbt_`-prefixed, 28-character format; every
+    other style ("hex32", the default) is the arr apps' own 32
+    lowercase-hex-character key, generated exactly as it always has been.
+    """
+    if app.api_key_style == "qbt":
+        body = "".join(secrets.choice(_QBIT_KEY_ALPHABET) for _ in range(_QBIT_KEY_LENGTH))
+        return f"qbt_{body}"
+    return new_api_key()
+
+
 # Only `offered` ids - the wizard's own initial install can never carry an
 # app (Gluetun) that isn't a choice on the screen that fed it; a non-offered
-# id in the posted list is refused the same way an unknown one is.
-_KNOWN_APP_IDS = frozenset(app.id for app in CATALOG if app.offered)
+# id in the posted list is refused the same way an unknown one is - UNLESS
+# it's the companion a posted offered app needs (Gluetun, riding in with
+# qBittorrent): `_unknown_app_ids` below is what draws that line.
+_OFFERED_APP_IDS = frozenset(app.id for app in CATALOG if app.offered)
+
+
+def _unknown_app_ids(app_ids: list[str]) -> list[str]:
+    """Every posted id that isn't a real offered app, and isn't a
+    companion an offered app in this same post needs.
+
+    Gluetun posted alongside qBittorrent is accepted (whether or not it
+    was already in `app_ids` too - qBittorrent's own need for it is what
+    matters, not the order the owner's browser happened to post ids in);
+    Gluetun posted alone is refused exactly like a made-up id, since
+    nothing in that post asked for it.
+    """
+    offered_posted = tuple(app_id for app_id in app_ids if app_id in _OFFERED_APP_IDS)
+    allowed_companions: set[str] = set()
+    for app_id in offered_posted:
+        allowed_companions.update(companions_for(app_id, offered_posted))
+    allowed = _OFFERED_APP_IDS | allowed_companions
+    return [app_id for app_id in app_ids if app_id not in allowed]
+
 
 InstallResultKind = Literal["ok", "invalid_input", "refused"]
 
@@ -71,7 +113,7 @@ def install_apps(
             ok=False, kind="invalid_input", message=REFUSAL_NOTHING_CHOSEN, state=None
         )
 
-    unknown = [app_id for app_id in app_ids if app_id not in _KNOWN_APP_IDS]
+    unknown = _unknown_app_ids(app_ids)
     if unknown:
         return InstallResult(
             ok=False, kind="invalid_input", message=REFUSAL_UNKNOWN_APP, state=None
@@ -100,7 +142,9 @@ def install_apps(
     derived = derive_ids(settings, root)
     existing = load_state(settings.config_dir)
     existing_keys = dict(existing.api_keys) if existing is not None else {}
-    api_keys = {app_id: existing_keys.get(app_id, new_api_key()) for app_id in ordered_ids}
+    api_keys = {
+        app_id: existing_keys.get(app_id, api_key_for(get_app(app_id))) for app_id in ordered_ids
+    }
     created = existing.created if existing is not None else datetime.now(UTC).isoformat()
 
     state = InstallState(
@@ -132,7 +176,7 @@ def with_app_added(state: InstallState, app_id: str) -> InstallState:
     """
     get_app(app_id)  # raises KeyError for an unknown id
     grown_ids = tuple(app.id for app in apps_in_order((*state.app_ids, app_id)))
-    api_keys = {aid: state.api_keys.get(aid, new_api_key()) for aid in grown_ids}
+    api_keys = {aid: state.api_keys.get(aid, api_key_for(get_app(aid))) for aid in grown_ids}
     return dataclasses.replace(state, app_ids=grown_ids, api_keys=api_keys)
 
 

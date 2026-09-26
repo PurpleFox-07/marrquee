@@ -45,6 +45,7 @@ from marrquee.vpn import TunnelPlace
 from marrquee.vpn_control import FakeGluetunControl
 from marrquee.wiring import NoWiringYet, WiringStep
 from marrquee.wiring.engine import WiringEngine
+from marrquee.wiring.qbit_client import FakeQbitClient
 from marrquee.words import (
     HUB_INSTALL_LOGIN_FIRST,
     HUB_INSTALL_UNKNOWN,
@@ -132,7 +133,7 @@ def test_catalog_route_lists_apps_in_deploy_order_with_port_only(tmp_path: Path)
 
     assert response.status_code == 200
     apps = response.json()["apps"]
-    assert [app["id"] for app in apps] == ["prowlarr", "sonarr", "radarr"]
+    assert [app["id"] for app in apps] == ["prowlarr", "sonarr", "radarr", "qbittorrent"]
     assert apps[0].keys() == {"id", "name", "description", "port"}
     assert apps[0]["port"] == 9696
 
@@ -459,6 +460,69 @@ def test_hub_status_vpn_tunnel_is_none_with_no_vpn_installed(tmp_path: Path) -> 
     assert response.json()["vpn_tunnel"] is None
 
 
+def test_hub_status_carries_paused_and_can_change_seeding_for_the_downloader(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+    save_state(settings.config_dir, _install_state(("gluetun", "qbittorrent"), root))
+    finished = DeploySnapshot(
+        run_id="run-1",
+        phase="finale",
+        apps=(
+            AppProgress(
+                app_id="gluetun",
+                name="VPN",
+                state="done",
+                chip="chip",
+                line="Ready",
+                note=None,
+                port=8000,
+            ),
+            AppProgress(
+                app_id="qbittorrent",
+                name="qBittorrent",
+                state="done",
+                chip="chip",
+                line="Ready",
+                note=None,
+                port=8080,
+            ),
+        ),
+        headline="Now showing",
+        detail=None,
+        failure=None,
+        started_at="2026-09-19T00:00:00+00:00",
+        finished_at="2026-09-19T00:05:00+00:00",
+        wiring=(),
+    )
+    write_json_atomic(settings.config_dir / "deploy.json", dataclasses.asdict(finished))
+    engine = FakeDockerEngine(
+        DockerStatus(connected=True),
+        containers={
+            "qbittorrent": _running_container("qbittorrent"),
+            "gluetun": ContainerSnapshot(
+                name="gluetun",
+                exists=True,
+                state="running",
+                exit_code=None,
+                image=get_app("gluetun").image,
+                detail=None,
+                health="unhealthy",
+            ),
+        },
+    )
+    client = _client(settings, _idle_manager(settings), engine=engine)
+
+    response = client.get("/api/hub/status")
+
+    assert response.status_code == 200
+    by_id = {app["app_id"]: app for app in response.json()["apps"]}
+    assert by_id["qbittorrent"]["paused"] is True
+    assert by_id["qbittorrent"]["can_change_seeding"] is True
+    assert by_id["gluetun"]["paused"] is False
+
+
 # --- Installing an app from the Hub's "+" panel --------------------------------
 
 
@@ -490,7 +554,13 @@ async def test_hub_install_endpoint_starts_an_add_and_refuses_a_second(tmp_path:
     with TestClient(app) as client:
         first = client.post("/api/hub/apps/radarr/install", json={"answers": {}})
         assert first.status_code == 202
-        assert first.json() == {"ok": True, "message": None, "step_id": None, "field": None}
+        assert first.json() == {
+            "ok": True,
+            "message": None,
+            "step_id": None,
+            "step_app_id": None,
+            "field": None,
+        }
 
         second = client.post("/api/hub/apps/radarr/install", json={"answers": {}})
 
@@ -579,6 +649,42 @@ async def test_hub_install_fixture_step_refuses_with_400_and_saves_only_after_a_
         assert accepted.status_code == 202
 
     assert load_answers(settings.config_dir)["radarr"]["name"] == "Interesting"
+
+
+async def test_hub_install_qbittorrent_refuses_the_vpn_step_and_names_gluetun(
+    tmp_path: Path,
+) -> None:
+    """qBittorrent's own install form carries Gluetun's VPN step too - a
+    refusal on that step must name GLUETUN as the owning app
+    (`step_app_id`), never qBittorrent, so the browser's own
+    `data-question-step="gluetun:vpn"` fieldset is the one that lights up.
+    """
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+    save_state(settings.config_dir, _install_state(("prowlarr", "sonarr"), root))
+    save_login(settings.config_dir, "owner", "s3cret-password-1", honor_reset=None)
+    engine = _StatefulEngine(
+        ("prowlarr", "sonarr"),
+        images={
+            get_app(app_id).image
+            for app_id in ("prowlarr", "sonarr", "radarr", "gluetun", "qbittorrent")
+        },
+    )
+    manager = DeployManager(settings, engine, probe=FakeReadinessProbe(default=True))
+    manager.start()
+    await _run_to_terminal(manager)
+    assert manager.snapshot().phase == "finale"
+
+    app = create_app(settings=settings, engine=engine, manager=manager)
+    with TestClient(app) as client:
+        refused = client.post("/api/hub/apps/qbittorrent/install", json={"answers": {}})
+
+    assert refused.status_code == 400
+    body = refused.json()
+    assert body["ok"] is False
+    assert body["step_id"] == "vpn"
+    assert body["step_app_id"] == "gluetun"
+    assert load_answers(settings.config_dir) == {}
 
 
 # --- The storage check --------------------------------------------------------
@@ -938,6 +1044,26 @@ def test_create_app_wires_for_real_but_a_bare_deploy_manager_does_not(tmp_path: 
     # it only proves which runner `create_app` wired in.
     assert isinstance(app.state.deploy._wiring, WiringEngine)
     assert isinstance(_idle_manager(settings)._wiring, NoWiringYet)
+
+
+def test_create_app_builds_one_qbit_client_and_shares_it(tmp_path: Path) -> None:
+    """`create_app` builds exactly ONE qBittorrent door and hands the SAME
+    instance to both the deploy manager and its login applier - two
+    separate clients would still work, but a caller-supplied fake (a test,
+    or a future dev tool) would only ever reach one of them.
+    """
+    settings = _settings(tmp_path)
+    fake = FakeQbitClient({})
+
+    app = create_app(
+        settings=settings,
+        engine=FakeDockerEngine(DockerStatus(connected=True)),
+        qbit_client=fake,
+    )
+
+    assert app.state.deploy._qbit is fake
+    assert app.state.deploy._login._qbit is fake
+    assert app.state.qbit_client is fake
 
 
 class _PausingWiringRunner:

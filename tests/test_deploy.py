@@ -524,7 +524,7 @@ async def test_the_download_line_appears_only_when_the_image_is_absent(tmp_path:
     lines_seen = {
         app.line for snapshot in history for app in snapshot.apps if app.app_id == "sonarr"
     }
-    assert any("Downloading Sonarr" in line for line in lines_seen)
+    assert any("Getting Sonarr" in line for line in lines_seen)
 
 
 async def test_no_download_line_appears_when_the_image_is_already_present(tmp_path: Path) -> None:
@@ -544,7 +544,7 @@ async def test_no_download_line_appears_when_the_image_is_already_present(tmp_pa
     lines_seen = {
         app.line for snapshot in history for app in snapshot.apps if app.app_id == "sonarr"
     }
-    assert not any("Downloading" in line for line in lines_seen)
+    assert not any("Getting" in line for line in lines_seen)
 
 
 # --- Slow apps are reassured, never failed -----------------------------------

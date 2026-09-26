@@ -162,7 +162,8 @@ def test_one_checked_checkbox_per_catalog_app_in_catalog_order_with_description(
 
     checkboxes = _checkbox_inputs(response.text)
     assert [box["value"] for box in checkboxes] == [app.id for app in _OFFERED]
-    assert all("checked" in box for box in checkboxes)
+    checked_by_id = {box["value"]: "checked" in box for box in checkboxes}
+    assert checked_by_id == {app.id: app.default_ticked for app in _OFFERED}
     for app in _OFFERED:
         assert app.name in response.text
         assert app.description in response.text
@@ -185,7 +186,12 @@ def test_a_saved_install_ticks_exactly_the_saved_apps(tmp_path: Path) -> None:
     response = client.get("/setup/apps")
 
     checked = {box["value"]: "checked" in box for box in _checkbox_inputs(response.text)}
-    assert checked == {"prowlarr": False, "sonarr": False, "radarr": True}
+    assert checked == {
+        "prowlarr": False,
+        "sonarr": False,
+        "radarr": True,
+        "qbittorrent": False,
+    }
 
 
 def test_an_unknown_id_in_the_query_string_is_dropped_not_a_500(tmp_path: Path) -> None:
@@ -195,7 +201,12 @@ def test_an_unknown_id_in_the_query_string_is_dropped_not_a_500(tmp_path: Path) 
 
     assert response.status_code == 200
     checked = {box["value"]: "checked" in box for box in _checkbox_inputs(response.text)}
-    assert checked == {"prowlarr": False, "sonarr": False, "radarr": True}
+    assert checked == {
+        "prowlarr": False,
+        "sonarr": False,
+        "radarr": True,
+        "qbittorrent": False,
+    }
 
 
 # --- POST /setup/apps: catalog-ordered csv, or a 200 refusal ----------------
@@ -238,6 +249,36 @@ def test_posting_gluetun_alongside_real_apps_drops_it_from_the_redirect(
 
     assert response.status_code == 303
     assert response.headers["location"] == "/setup/login?apps=radarr"
+
+
+def test_ticking_qbittorrent_alone_carries_gluetun_along_in_catalog_order(
+    tmp_path: Path,
+) -> None:
+    """Gluetun rides in silently the moment its own rider is chosen - the
+    owner never ticks it directly, but qBittorrent must never run outside
+    the tunnel.
+    """
+    client = _client(_settings(tmp_path))
+
+    response = client.post("/setup/apps", data={"apps": ["qbittorrent"]}, follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/setup/login?apps=gluetun,qbittorrent"
+
+
+def test_ticking_qbittorrent_with_gluetun_already_posted_never_duplicates_it(
+    tmp_path: Path,
+) -> None:
+    client = _client(_settings(tmp_path))
+
+    response = client.post(
+        "/setup/apps",
+        data={"apps": ["gluetun", "qbittorrent", "sonarr"]},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/setup/login?apps=sonarr,gluetun,qbittorrent"
 
 
 def test_posting_nothing_rerenders_at_200_with_refusal_and_every_checkbox(

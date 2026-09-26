@@ -16,18 +16,26 @@ import asyncio
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from pathlib import PurePosixPath
-from typing import Protocol
+from pathlib import Path, PurePosixPath
+from typing import Final, Protocol
 
 from marrquee.catalog import CATALOG, CatalogApp, apps_in_order
+from marrquee.qbittorrent import QBIT_BASE_PREFERENCES
+from marrquee.questions import load_answers
+from marrquee.seeding import seeding_preferences
 from marrquee.state import InstallState
 from marrquee.storage import container_media_path, host_media_path
+from marrquee.vpn_control import GluetunControl, NoGluetunControl
 from marrquee.wiring import WiringStep, WiringStepState
 from marrquee.wiring.arr_client import ArrClient, HttpArrClient
+from marrquee.wiring.qbit_client import HttpQbitClient, QbitClient
 from marrquee.wiring.steps import (
     StepOutcome,
     app_base_url,
     ensure_application,
+    ensure_download_client,
+    ensure_qbit_category,
+    ensure_qbit_preferences,
     ensure_root_folder,
 )
 from marrquee.words import (
@@ -40,10 +48,21 @@ from marrquee.words import (
     WIRING_SKIP_PROWLARR_ALONE,
     wiring_failure_unreachable,
     wiring_line_app_sync,
+    wiring_line_download_client,
+    wiring_line_downloader_settings,
     wiring_line_root_folder,
     wiring_note_still_waking,
     wiring_skip_no_prowlarr,
 )
+
+# Sonarr's and Radarr's own field name for "which qBittorrent category holds
+# this app's downloads" - keyed by the catalog's own `media_folders` entries,
+# the same key `words.MEDIA_FOLDER_LABEL` uses. Lives here, not in
+# `wiring/steps.py`: that module never hardcodes which media folders exist.
+_CATEGORY_FIELD_FOR_MEDIA_FOLDER: Final[Mapping[str, str]] = {
+    "tv": "tvCategory",
+    "movies": "movieCategory",
+}
 
 _CHIP_FOR_STATE: dict[WiringStepState, str] = {
     "running": WIRING_CHIP_RUNNING,
@@ -57,11 +76,21 @@ _SYSTEM_STATUS_PATH = "system/status"
 
 @dataclass(frozen=True)
 class WiringContext:
-    """Everything a task needs to actually run - built once per `run()` call."""
+    """Everything a task needs to actually run - built once per `run()` call.
+
+    `qbit` and `vpn` are only ever read by qBittorrent's own tasks - an
+    ordinary arr-only run never touches either. `answers` is read fresh at
+    the start of every `run()` (see `WiringEngine.run`), never cached across
+    runs, so a "Change seeding" saved a moment ago is what the very next
+    wiring run actually applies.
+    """
 
     client: ArrClient
     state: InstallState
     apps: Mapping[str, CatalogApp]
+    qbit: QbitClient
+    vpn: GluetunControl
+    answers: Mapping[str, Mapping[str, str]]
 
 
 class WiringTask(Protocol):
@@ -148,6 +177,104 @@ class RootFolderTask:
 
 
 @dataclass(frozen=True)
+class QbitSettingsTask:
+    """qBittorrent's own global preferences: the base folder/UPnP defaults,
+    the owner's saved seeding choice, and the VPN's forwarded port when the
+    tunnel has one.
+
+    `involved` names only qBittorrent - the app was already proved ready by
+    its own bring-up (the key call answering `app/version`), so there is
+    nothing else for the engine to wait on before `apply` runs.
+    """
+
+    key: str
+    line: str
+    involved: tuple[str, ...]
+
+    @property
+    def about(self) -> tuple[str, ...]:
+        return self.involved
+
+    async def apply(self, ctx: WiringContext) -> StepOutcome:
+        app_id = self.involved[0]
+        app = ctx.apps[app_id]
+        api_key = ctx.state.api_keys[app_id]
+
+        prefs: dict[str, object] = {
+            **QBIT_BASE_PREFERENCES,
+            **seeding_preferences(ctx.answers.get(app_id)),
+        }
+        gluetun_key = ctx.state.api_keys.get("gluetun")
+        if gluetun_key is not None:
+            port = await ctx.vpn.forwarded_port(gluetun_key)
+            if isinstance(port, int):
+                prefs["listen_port"] = port
+
+        return await ensure_qbit_preferences(ctx.qbit, app, api_key, prefs)
+
+
+@dataclass(frozen=True)
+class DownloadClientTask:
+    """One partner's (Sonarr's or Radarr's) connection to qBittorrent: its
+    own category first, so Automatic Torrent Management has somewhere to
+    save into, then the download-client entry itself.
+
+    `involved` is `(partner_id, downloader_id)` - subject then object, the
+    same order `AppSyncTask` uses - so the partner's poster proves ready
+    before qBittorrent's own (already-proved) poster lights up next to it.
+    """
+
+    key: str
+    line: str
+    involved: tuple[str, ...]
+    media_folder: str
+    category_field: str
+
+    @property
+    def about(self) -> tuple[str, ...]:
+        return self.involved
+
+    async def apply(self, ctx: WiringContext) -> StepOutcome:
+        partner_id, downloader_id = self.involved
+        partner = ctx.apps[partner_id]
+        downloader = ctx.apps[downloader_id]
+        save_path = f"/data/torrents/{self.media_folder}"
+
+        category_outcome = await ensure_qbit_category(
+            ctx.qbit,
+            downloader,
+            ctx.state.api_keys[downloader_id],
+            media_folder=self.media_folder,
+            save_path=save_path,
+        )
+        if category_outcome.state == "error":
+            return category_outcome
+
+        client_outcome = await ensure_download_client(
+            ctx.client,
+            partner,
+            ctx.state.api_keys[partner_id],
+            downloader,
+            ctx.state.api_keys[downloader_id],
+            category_field=self.category_field,
+            category=self.media_folder,
+        )
+        if client_outcome.state == "error" or not category_outcome.changed:
+            return client_outcome
+
+        # The category write changed something even though the client
+        # entry itself was already correct - the step as a whole still
+        # counts as "changed", so the owner sees it did something.
+        return StepOutcome(
+            state=client_outcome.state,
+            note=None,
+            technical=client_outcome.technical,
+            changed=True,
+            transient=client_outcome.transient,
+        )
+
+
+@dataclass(frozen=True)
 class ExplainTask:
     """A step whose outcome is always `skipped`, with a fixed plain-language note.
 
@@ -224,6 +351,27 @@ def plan_wiring(state: InstallState, *, only_app: str | None = None) -> tuple[Wi
                 )
             )
 
+    downloader = next((app for app in apps if app.id == "qbittorrent"), None)
+    if downloader is not None:
+        tasks.append(
+            QbitSettingsTask(
+                key=f"downloader-settings:{downloader.id}",
+                line=wiring_line_downloader_settings(downloader.name),
+                involved=(downloader.id,),
+            )
+        )
+        for partner in partners:
+            media_folder = partner.media_folders[0]
+            tasks.append(
+                DownloadClientTask(
+                    key=f"download-client:{partner.id}",
+                    line=wiring_line_download_client(partner.name, downloader.name),
+                    involved=(partner.id, downloader.id),
+                    media_folder=media_folder,
+                    category_field=_CATEGORY_FIELD_FOR_MEDIA_FOLDER[media_folder],
+                )
+            )
+
     for app in apps:
         for media_folder in app.media_folders:
             tasks.append(
@@ -255,6 +403,9 @@ class WiringEngine:
         self,
         client: ArrClient | None = None,
         *,
+        qbit: QbitClient | None = None,
+        vpn: GluetunControl | None = None,
+        config_dir: Path | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         clock: Callable[[], float] = time.monotonic,
         ready_timeout: float = 180.0,
@@ -264,6 +415,9 @@ class WiringEngine:
         retry_delay: float = 3.0,
     ) -> None:
         self._client = client if client is not None else HttpArrClient()
+        self._qbit = qbit if qbit is not None else HttpQbitClient()
+        self._vpn = vpn if vpn is not None else NoGluetunControl()
+        self._config_dir = config_dir
         self._sleep = sleep
         self._clock = clock
         self._ready_timeout = ready_timeout
@@ -296,7 +450,17 @@ class WiringEngine:
             )
             return
 
-        ctx = WiringContext(client=self._client, state=state, apps={app.id: app for app in CATALOG})
+        # Read fresh at the start of every run, never cached - a "Change
+        # seeding" saved a moment ago must be what this very run applies.
+        answers = load_answers(self._config_dir) if self._config_dir is not None else {}
+        ctx = WiringContext(
+            client=self._client,
+            state=state,
+            apps={app.id: app for app in CATALOG},
+            qbit=self._qbit,
+            vpn=self._vpn,
+            answers=answers,
+        )
         ready_apps: set[str] = set()
         total = len(tasks)
         for index, task in enumerate(tasks, start=1):
@@ -370,9 +534,15 @@ class WiringEngine:
         """Poll `system/status` until it answers 2xx, or the budget runs out.
 
         Every app is proved ready at most once per run - the caller only
-        reaches this for an `app_id` not already in `ready_apps`.
+        reaches this for an `app_id` not already in `ready_apps`. An app
+        that isn't an arr app (qBittorrent, today) has no `system/status` to
+        poll - its own bring-up already proved it ready (the key call
+        answering `app/version`), so it counts as ready at once.
         """
         app = ctx.apps[app_id]
+        if app.kind != "arr":
+            return True
+
         api_key = ctx.state.api_keys.get(app_id, "")
         base_url = app_base_url(app)
         path = f"{app.api_base}/{_SYSTEM_STATUS_PATH}"

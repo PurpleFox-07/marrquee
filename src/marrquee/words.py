@@ -36,8 +36,8 @@ STATUS_CHIP_ERROR = "Error"
 
 
 # --- App progress line - one sentence per state, naming the app -------------
-def app_line_downloading(app_name: str) -> str:
-    return f"Downloading {app_name} - this only happens the first time"
+def app_line_getting(app_name: str) -> str:
+    return f"Getting {app_name} - this only happens the first time"
 
 
 def app_line_starting(app_name: str) -> str:
@@ -190,9 +190,9 @@ FAILURE_DOCKER_UNREACHABLE = (
 )
 
 
-def failure_download_failed(name: str) -> str:
+def failure_get_failed(name: str) -> str:
     return (
-        f"Marrquee couldn't download {name}. Check that this machine can reach "
+        f"Marrquee couldn't get {name}. Check that this machine can reach "
         "the internet, then press Try again."
     )
 
@@ -255,7 +255,7 @@ _DEPLOY_ENGINE_WORDS: tuple[str, ...] = (
     "STATUS_CHIP_WAITING",
     "STATUS_CHIP_STARTING",
     "STATUS_CHIP_DONE",
-    "app_line_downloading",
+    "app_line_getting",
     "app_line_starting",
     "app_line_warming_up",
     "app_note_slow_start",
@@ -279,7 +279,7 @@ _DEPLOY_ENGINE_WORDS: tuple[str, ...] = (
     "storage_check_message",
     "STATUS_CHIP_ERROR",
     "FAILURE_DOCKER_UNREACHABLE",
-    "failure_download_failed",
+    "failure_get_failed",
     "failure_never_became_ready",
     "failure_port_in_use",
     "failure_compose_failed",
@@ -1415,6 +1415,108 @@ _VPN_WORDS: tuple[str, ...] = (
 # end VPN section
 # =============================================================================
 
+# =============================================================================
+# qBittorrent - the downloader's own catalog description, its one seeding
+# question, and the Hub words for a paused poster and "Change seeding"
+# =============================================================================
+
+QBITTORRENT_DESCRIPTION = "Downloads what Sonarr and Radarr find - only ever through your VPN."
+
+DOWNLOADER_COMPOSE_COMMENT = (
+    "It shares your VPN's network and has no port of its own - Gluetun publishes its page instead."
+)
+
+PORT_SYNC_SCRIPT_COMMENT = (
+    "Written by Marrquee. Your VPN runs this when it forwards a port, so qBittorrent listens on it."
+)
+
+SEEDING_STEP_TITLE = "How long should qBittorrent keep sharing?"
+SEEDING_STEP_LEDE = (
+    "Sharing a finished download is called seeding. Some sites - especially private "
+    "ones - require a minimum sharing time or ratio, so check your site's rules. When "
+    "it's done, Sonarr and Radarr tidy up the download, and your library copy is "
+    "never touched."
+)
+
+SEEDING_LABEL = "How long to share"
+
+SEEDING_GOOD_NEIGHBOR = "Be a good neighbor"
+SEEDING_GOOD_NEIGHBOR_HINT = "Share for 7 days. A good default."
+SEEDING_SAVE_SPACE = "Save my disk space"
+SEEDING_SAVE_SPACE_HINT = "Stop once you've shared as much as you downloaded, or after 7 days."
+SEEDING_PRIVATE = "I use private sites"
+SEEDING_PRIVATE_HINT = "Share for 30 days - many private sites require it."
+SEEDING_OWN = "Set my own numbers"
+SEEDING_OWN_HINT = "Use this if your site has seeding rules."
+
+SEEDING_RATIO_LABEL = "Ratio"
+SEEDING_RATIO_HINT = (
+    "How much to share back, compared to what you downloaded - 1.0 means share "
+    "exactly as much as you took."
+)
+SEEDING_DAYS_LABEL = "Days to share"
+SEEDING_DAYS_HINT = "How many days to keep sharing after the download finishes."
+
+SEEDING_PROBLEM_RATIO = (
+    "Enter a ratio between 0.1 and 100, with up to 2 decimal places (for example, 1.5)."
+)
+SEEDING_PROBLEM_DAYS = "Enter a whole number of days between 1 and 365."
+SEEDING_PROBLEM_OWN_EMPTY = "Enter a ratio, a number of days, or both."
+
+HUB_CHIP_PAUSED = "Paused"
+HUB_LINE_PAUSED_FOR_VPN = "Paused - waiting for the VPN"
+HUB_CHANGE_SEEDING = "Change seeding"
+HUB_SEEDING_PANEL_TITLE = "Change how long qBittorrent shares"
+HUB_SEEDING_SAVE = "Save seeding"
+HUB_SEEDING_BUSY = (
+    "Marrquee is busy with another change. Try again in a minute - nothing was changed."
+)
+
+
+def wiring_line_downloader_settings(name: str) -> str:
+    return f"Setting up {name}"
+
+
+def wiring_line_download_client(partner: str, downloader: str) -> str:
+    return f"Connecting {partner} to {downloader}"
+
+
+_QBIT_WORDS: tuple[str, ...] = (
+    "QBITTORRENT_DESCRIPTION",
+    "DOWNLOADER_COMPOSE_COMMENT",
+    "PORT_SYNC_SCRIPT_COMMENT",
+    "SEEDING_STEP_TITLE",
+    "SEEDING_STEP_LEDE",
+    "SEEDING_LABEL",
+    "SEEDING_GOOD_NEIGHBOR",
+    "SEEDING_GOOD_NEIGHBOR_HINT",
+    "SEEDING_SAVE_SPACE",
+    "SEEDING_SAVE_SPACE_HINT",
+    "SEEDING_PRIVATE",
+    "SEEDING_PRIVATE_HINT",
+    "SEEDING_OWN",
+    "SEEDING_OWN_HINT",
+    "SEEDING_RATIO_LABEL",
+    "SEEDING_RATIO_HINT",
+    "SEEDING_DAYS_LABEL",
+    "SEEDING_DAYS_HINT",
+    "SEEDING_PROBLEM_RATIO",
+    "SEEDING_PROBLEM_DAYS",
+    "SEEDING_PROBLEM_OWN_EMPTY",
+    "HUB_CHIP_PAUSED",
+    "HUB_LINE_PAUSED_FOR_VPN",
+    "HUB_CHANGE_SEEDING",
+    "HUB_SEEDING_PANEL_TITLE",
+    "HUB_SEEDING_SAVE",
+    "HUB_SEEDING_BUSY",
+    "wiring_line_downloader_settings",
+    "wiring_line_download_client",
+)
+
+# =============================================================================
+# end qBittorrent section
+# =============================================================================
+
 # The full review surface: every public name above, in one tuple. A later
 # feature area adds its own fenced section above this line, then extends
 # this tuple with its own `_..._WORDS` name - never editing an earlier
@@ -1429,4 +1531,5 @@ WORDS_INVENTORY: tuple[str, ...] = (
     *_HUB_INSTALL_WORDS,
     *_LOGIN_WORDS,
     *_VPN_WORDS,
+    *_QBIT_WORDS,
 )

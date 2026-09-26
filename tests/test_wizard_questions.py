@@ -176,6 +176,40 @@ def test_posting_a_good_answer_moves_to_the_next_registered_step(
     assert response.headers["location"] == "/setup/questions/radarr/fixture?apps=prowlarr,radarr"
 
 
+def test_qbittorrent_ticked_asks_gluetuns_vpn_step_before_its_own_seeding(
+    tmp_path: Path,
+) -> None:
+    """The real (never monkeypatched) registry: with `qbittorrent` ticked
+    (the wizard already unioned Gluetun in), Gluetun's own VPN question is
+    pill two - never qBittorrent's seeding question - and a valid VPN
+    answer moves on to qBittorrent's own seeding step next.
+    """
+    client = _client(_settings(tmp_path))
+
+    response = client.get("/setup/questions/gluetun/vpn", params={"apps": "gluetun,qbittorrent"})
+
+    assert response.status_code == 200
+    assert 'data-question-step="gluetun:vpn"' in response.text
+    assert "qbittorrent:seeding" not in response.text
+
+    posted = client.post(
+        "/setup/questions/gluetun/vpn",
+        data={
+            "apps": "gluetun,qbittorrent",
+            "provider": "mullvad",
+            "vpn_type": "openvpn",
+            "openvpn_user": "ci-user-7f3a",
+            "openvpn_password": "pw-9d1c",
+        },
+        follow_redirects=False,
+    )
+
+    assert posted.status_code == 303
+    assert posted.headers["location"] == (
+        "/setup/questions/qbittorrent/seeding?apps=gluetun,qbittorrent"
+    )
+
+
 def test_a_password_field_never_carries_a_value_even_with_a_saved_answer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

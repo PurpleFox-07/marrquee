@@ -22,14 +22,15 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from marrquee import storage
-from marrquee.catalog import CatalogApp, apps_in_order
+from marrquee.catalog import CatalogApp, apps_in_order, riders_of
 from marrquee.config import Settings
 from marrquee.state import InstallState
 from marrquee.storage import ChownFn, to_host_view
-from marrquee.vpn import build_gluetun_config
+from marrquee.vpn import GluetunConfig, build_gluetun_config
 from marrquee.words import (
     COMPOSE_FILE_HEADER_COMMENT,
     DATA_MOUNT_COMMENT,
+    DOWNLOADER_COMPOSE_COMMENT,
     VPN_SECRETS_MOUNT_COMMENT,
 )
 
@@ -67,7 +68,11 @@ class ServicePlan:
 
     `cap_add`/`devices` default to empty - only Gluetun's branch of
     `_service_plan` ever sets them, so every arr service's rendered output
-    stays exactly as it was before this story.
+    stays exactly as it was before this story. `network_mode`, when set
+    (qBittorrent's branch, riding Gluetun's network namespace instead of
+    getting one of its own), makes `_render_service` write a
+    `network_mode:` line and skip that service's `networks:` block entirely
+    - compose refuses a service that names both.
     """
 
     app_id: str
@@ -80,6 +85,7 @@ class ServicePlan:
     comment: str
     cap_add: tuple[str, ...] = ()
     devices: tuple[str, ...] = ()
+    network_mode: str | None = None
 
 
 @dataclass(frozen=True)
@@ -113,12 +119,21 @@ def build_stack_plan(
     the same `InstallState` and the same answers always produce the same
     `StackPlan`, which is what keeps a re-deploy from producing a spurious
     diff in the file the owner reads.
+
+    The ONE place "the downloader never runs outside the VPN" is enforced
+    for compose: an app with `network_via` set (qBittorrent) but whose
+    companion (Gluetun) isn't part of this same install raises `ValueError`
+    rather than rendering a service with nothing to share a network with.
     """
     if state.storage_root is None:
         raise ValueError("cannot build a stack plan before a storage root is chosen")
 
     root = PurePosixPath(state.storage_root)
     apps = apps_in_order(state.app_ids)
+    for app in apps:
+        if app.network_via is not None and app.network_via not in state.app_ids:
+            raise ValueError(f"{app.id} needs {app.network_via}")
+
     resolved_answers: Mapping[str, Mapping[str, str]] = answers if answers is not None else {}
     services = tuple(_service_plan(app, state, root, resolved_answers) for app in apps)
 
@@ -139,13 +154,15 @@ def _service_plan(
     root: PurePosixPath,
     answers: Mapping[str, Mapping[str, str]],
 ) -> ServicePlan:
-    # Checked before the arr-only api_keys lookup below: Gluetun has no API
-    # key of its own to authenticate an arr app's login, and takes none of
-    # the `*__AUTH__*` environment those apps get - faking either would be
-    # exactly the "arr fields on a non-arr app" this kind split exists to
-    # avoid.
+    # Checked before the arr-only api_keys lookup below: neither Gluetun nor
+    # qBittorrent has an API key handed to it through the `*__AUTH__*`
+    # environment those apps get - faking either would be exactly the "arr
+    # fields on a non-arr app" this kind split exists to avoid.
     if app.kind == "vpn":
         return _vpn_service_plan(app, state, root, answers)
+
+    if app.kind == "downloader":
+        return _downloader_service_plan(app, state, root)
 
     try:
         api_key = state.api_keys[app.id]
@@ -187,27 +204,87 @@ def _service_plan(
     )
 
 
+def gluetun_config_for(
+    app: CatalogApp, state: InstallState, answers: Mapping[str, Mapping[str, str]]
+) -> GluetunConfig:
+    """Build the one `GluetunConfig` both `_vpn_service_plan` (compose) and
+    `DeployManager._write_vpn_secrets` (deploy, right before every Gluetun
+    bring-up) build `app`'s Gluetun service from.
+
+    `write_vpn_secrets` rewrites Gluetun's secrets folder to hold EXACTLY
+    the files it's handed, deleting anything else on every call - the two
+    call sites building this differently (one never knowing qBittorrent
+    exists) would silently delete qBittorrent's key and its port-sync
+    script the very next time Gluetun reconnects. There is exactly one
+    place a `downloader_key` is derived from `state`, and both callers go
+    through it.
+    """
+    try:
+        control_key = state.api_keys[app.id]
+    except KeyError:
+        raise ValueError(f"no control-server key has been generated yet for {app.id!r}") from None
+
+    downloader_key = state.api_keys.get("qbittorrent") if "qbittorrent" in state.app_ids else None
+
+    return build_gluetun_config(
+        answers.get(app.id, {}),
+        control_key=control_key,
+        timezone=state.timezone,
+        puid=state.puid,
+        pgid=state.pgid,
+        downloader_key=downloader_key,
+    )
+
+
 def _vpn_service_plan(
     app: CatalogApp,
     state: InstallState,
     root: PurePosixPath,
     answers: Mapping[str, Mapping[str, str]],
 ) -> ServicePlan:
-    try:
-        control_key = state.api_keys[app.id]
-    except KeyError:
-        raise ValueError(f"no control-server key has been generated yet for {app.id!r}") from None
-
-    config = build_gluetun_config(
-        answers.get(app.id, {}),
-        control_key=control_key,
-        timezone=state.timezone,
-        puid=state.puid,
-        pgid=state.pgid,
-    )
+    config = gluetun_config_for(app, state, answers)
 
     config_mount = f"{root / 'marrquee' / 'apps' / app.id}{_VPN_CONFIG_MOUNT_SUFFIX}"
     secrets_mount = f"{vpn_secrets_host_path(root)}{_VPN_SECRETS_MOUNT_SUFFIX}"
+    # A rider (qBittorrent) shares this container's network namespace and
+    # has no `ports:` block of its own - Gluetun publishes its port instead.
+    ports = tuple((rider.port, rider.port) for rider in riders_of(app.id, state.app_ids))
+
+    return ServicePlan(
+        app_id=app.id,
+        service=app.id,
+        image=app.image,
+        container_name=app.id,
+        ports=ports,
+        environment=config.environment,
+        volumes=(config_mount, secrets_mount),
+        comment=app.description,
+        cap_add=("NET_ADMIN",),
+        devices=("/dev/net/tun:/dev/net/tun",),
+    )
+
+
+def _downloader_service_plan(
+    app: CatalogApp, state: InstallState, root: PurePosixPath
+) -> ServicePlan:
+    """qBittorrent's own branch: it rides its companion's whole network
+    namespace instead of joining `marrquee` or publishing a port on its
+    own, and it takes no API key through the environment - its door is the
+    key pre-written into its own settings file
+    (`qbittorrent.write_qbit_conf`), never the arr `*__AUTH__*` shape.
+    """
+    environment: tuple[tuple[str, str], ...] = (
+        ("PUID", str(state.puid)),
+        ("PGID", str(state.pgid)),
+        ("TZ", state.timezone),
+        ("UMASK", state.umask),
+        ("WEBUI_PORT", str(app.port)),
+    )
+
+    config_mount = f"{root / 'marrquee' / 'apps' / app.id}{_CONFIG_MOUNT_SUFFIX}"
+    volumes = [config_mount]
+    if app.needs_data_mount:
+        volumes.append(f"{root / 'data'}{_DATA_MOUNT_SUFFIX}")
 
     return ServicePlan(
         app_id=app.id,
@@ -215,11 +292,10 @@ def _vpn_service_plan(
         image=app.image,
         container_name=app.id,
         ports=(),
-        environment=config.environment,
-        volumes=(config_mount, secrets_mount),
-        comment=app.description,
-        cap_add=("NET_ADMIN",),
-        devices=("/dev/net/tun:/dev/net/tun",),
+        environment=environment,
+        volumes=tuple(volumes),
+        comment=f"{app.description} {DOWNLOADER_COMPOSE_COMMENT}",
+        network_mode=f"service:{app.network_via}",
     )
 
 
@@ -252,6 +328,12 @@ def _render_service(service: ServicePlan, network: str) -> list[str]:
     lines.append(f"    image: {_quoted(service.image)}")
     lines.append(f"    container_name: {service.container_name}")
     lines.append("    restart: unless-stopped")
+    if service.network_mode is not None:
+        # Compose refuses a service that names both `network_mode:` and
+        # `networks:` - this service shares another container's whole
+        # network namespace instead of joining one of its own, so the
+        # `networks:` block below is skipped entirely for it.
+        lines.append(f"    network_mode: {_quoted(service.network_mode)}")
     if service.cap_add:
         lines.append("    cap_add:")
         lines.extend(f"      - {_quoted(value)}" for value in service.cap_add)
@@ -276,12 +358,13 @@ def _render_service(service: ServicePlan, network: str) -> list[str]:
                 f"      {comment}" for comment in _comment_lines(VPN_SECRETS_MOUNT_COMMENT)
             )
         lines.append(f"      - {_quoted(volume)}")
-    # A service with no `networks:` of its own would join compose's own
-    # implicit "default" network instead of this named one - listing it
-    # explicitly here is what lets every app find the others (and Marrquee
-    # itself, once it joins this same network) by name.
-    lines.append("    networks:")
-    lines.append(f"      - {network}")
+    if service.network_mode is None:
+        # A service with no `networks:` of its own would join compose's own
+        # implicit "default" network instead of this named one - listing it
+        # explicitly here is what lets every app find the others (and
+        # Marrquee itself, once it joins this same network) by name.
+        lines.append("    networks:")
+        lines.append(f"      - {network}")
     return lines
 
 

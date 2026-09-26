@@ -34,6 +34,7 @@ from marrquee.docker_client import (
     DockerStatus,
     FakeDockerEngine,
 )
+from marrquee.qbittorrent import PORT_SYNC_SCRIPT_NAME, QBIT_KEY_SECRET_NAME
 from marrquee.questions import save_step_answers
 from marrquee.state import save_state, write_json_atomic
 from marrquee.vpn import TunnelPlace
@@ -80,6 +81,21 @@ def _place() -> TunnelPlace:
     )
 
 
+def _prepare_gluetun_and_qbittorrent_state(tmp_path: Path) -> Settings:
+    """Like `_prepare_gluetun_state`, but with qBittorrent installed too.
+
+    `write_vpn_secrets` rewrites Gluetun's secrets folder to hold EXACTLY
+    the files it's handed, deleting anything else - so bringing Gluetun up
+    without knowing qBittorrent is part of this install would silently wipe
+    qBittorrent's key and its port-sync script on the very next reconnect.
+    """
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+    save_state(settings.config_dir, _install_state(("gluetun", "qbittorrent"), root))
+    save_step_answers(settings.config_dir, "gluetun", _GLUETUN_ANSWERS)
+    return settings
+
+
 # --- Success: healthy, running, a reported place ------------------------------
 
 
@@ -121,6 +137,35 @@ async def test_healthy_running_place_reports_done_and_writes_secrets_before_comp
 
     secrets_folder = settings.host_mount / "volume1" / "media" / "marrquee" / "vpn"
     assert (secrets_folder / "openvpn_user").read_text() == _GLUETUN_ANSWERS["openvpn_user"]
+
+
+async def test_gluetun_bring_up_writes_qbittorrents_key_and_port_sync_script_when_installed(
+    tmp_path: Path,
+) -> None:
+    """CRITICAL (diverges-from-existing): every Gluetun bring-up rewrites
+    the secrets folder from scratch - if it ever built its `GluetunConfig`
+    without knowing qBittorrent is part of this install, qBittorrent's key
+    and the port-sync script its own forwarding hook depends on would be
+    deleted on the very next reconnect.
+    """
+    settings = _prepare_gluetun_and_qbittorrent_state(tmp_path)
+    engine = _StatefulEngine(("gluetun",), health_frames={"gluetun": ["healthy"]})
+
+    clock = _FakeClock()
+    manager = DeployManager(
+        settings,
+        engine,
+        probe=FakeReadinessProbe(default=True),
+        clock=clock.time,
+        sleep=clock.sleep,
+        vpn=FakeGluetunControl(status="running", place=_place()),
+    )
+    manager.start()
+    await _run_to_terminal(manager)
+
+    secrets_folder = settings.host_mount / "volume1" / "media" / "marrquee" / "vpn"
+    assert (secrets_folder / QBIT_KEY_SECRET_NAME).read_text() == "fake-qbittorrent-api-key"
+    assert "listen_port" in (secrets_folder / PORT_SYNC_SCRIPT_NAME).read_text()
 
 
 # --- AUTH_FAILED wins immediately, without waiting -----------------------------

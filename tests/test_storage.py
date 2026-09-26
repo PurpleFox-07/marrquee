@@ -361,6 +361,28 @@ def test_prowlarr_alone_plans_no_data_folders() -> None:
     )
 
 
+def test_qbittorrent_alone_plans_a_bare_torrents_folder() -> None:
+    """A downloader with no media app yet still needs somewhere to write -
+    Docker would otherwise create `data/torrents` as root on first start,
+    and qBittorrent couldn't write to it.
+    """
+    assert storage.plan_folders(("qbittorrent",)) == (
+        PurePosixPath("data/torrents"),
+        PurePosixPath("marrquee"),
+        PurePosixPath("marrquee/apps/qbittorrent"),
+    )
+
+
+def test_qbittorrent_alongside_sonarr_plans_only_the_media_shaped_torrents_folder() -> None:
+    """Once a media app is chosen, its own `data/torrents/<media>` entry is
+    enough - the bare `data/torrents` folder would be redundant.
+    """
+    result = storage.plan_folders(("qbittorrent", "sonarr"))
+
+    assert PurePosixPath("data/torrents") not in result
+    assert PurePosixPath("data/torrents/tv") in result
+
+
 # --- container_media_path / host_media_path: the wiring engine's one home --
 
 

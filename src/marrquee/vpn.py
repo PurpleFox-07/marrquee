@@ -2,10 +2,11 @@
 VPN questions looks like, and what Gluetun itself is handed once an answer
 is accepted.
 
-This is a leaf, like `catalog.py`: it imports only the standard library and
-`words`, so nothing about the question-answering machinery (`questions.py`)
-or the deploy engine can ever leak back into what a VPN answer *is*. The
-adapter that turns a `VpnAnswerCheck` into a `QuestionCheck`, and the
+This is a leaf, like `catalog.py`: it imports only the standard library,
+`words` and (for the two files below) `qbittorrent` - never `questions.py`
+or the deploy engine, so nothing about the question-answering machinery or
+how a deploy actually runs can ever leak back into what a VPN answer *is*.
+The adapter that turns a `VpnAnswerCheck` into a `QuestionCheck`, and the
 `QuestionStep` that asks for it, both live in `questions.py` instead - that
 is what keeps this module free of the one import (`questions`) that would
 create a cycle.
@@ -14,7 +15,10 @@ Hand-off for whatever runs behind this tunnel: a `CatalogApp` that sets
 `network_via="gluetun"` joins this container's network instead of getting
 its own, and reads its forwarded port through
 `vpn_control.GluetunControl.forwarded_port`. Nothing about that app is
-built here - this module only ever describes Gluetun itself.
+built here - this module only ever describes Gluetun itself - except for
+`build_gluetun_config`'s own `downloader_key` argument: qBittorrent has no
+network of its own to receive its key or its port-sync script through, so
+Gluetun's own root-only secrets folder is the only place left to put them.
 """
 
 from __future__ import annotations
@@ -25,6 +29,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Final, Literal
 
+from marrquee.qbittorrent import PORT_SYNC_SCRIPT_NAME, QBIT_KEY_SECRET_NAME, port_sync_script
 from marrquee.words import (
     VPN_LINE_PROTECTED,
     VPN_PROBLEM_OPENVPN_PASSWORD,
@@ -451,6 +456,14 @@ def _with_pmp_suffix(username: str) -> str:
     return username if username.endswith("+pmp") else f"{username}+pmp"
 
 
+# qBittorrent's own WebUI port, fixed in the catalog and never changed by an
+# owner - a plain constant here rather than a `catalog` import, which would
+# pull this "Gluetun facts" leaf into knowing what a catalog even is. The
+# port-sync script talks to `127.0.0.1:<this>` from inside Gluetun's own
+# network namespace, which qBittorrent shares.
+_DOWNLOADER_WEBUI_PORT: Final = 8080
+
+
 def build_gluetun_config(
     answers: Mapping[str, str],
     *,
@@ -458,6 +471,7 @@ def build_gluetun_config(
     timezone: str,
     puid: int,
     pgid: int,
+    downloader_key: str | None = None,
 ) -> GluetunConfig:
     """Turn one saved answer set into what Gluetun is actually handed.
 
@@ -465,6 +479,16 @@ def build_gluetun_config(
     answers don't pass `check_vpn_answers` - a caller building compose from
     stale or missing answers must fail loudly, never render a tunnel with
     settings Gluetun would refuse anyway.
+
+    `downloader_key`, when set, is qBittorrent's own API key - qBittorrent
+    has no network or secrets mount of its own, so its key and the
+    port-sync script Gluetun's forwarding hook runs both live in Gluetun's
+    root-only secrets folder instead, written here regardless of whether
+    this provider can actually forward a port (an owner switching providers
+    later must not need qBittorrent's key regenerated to pick them up). The
+    two `VPN_PORT_FORWARDING_*_COMMAND` environment entries are added only
+    when port forwarding is also on - Gluetun has nothing to run them for
+    otherwise.
     """
     check = check_vpn_answers(answers)
     if not check.ok:
@@ -518,6 +542,20 @@ def build_gluetun_config(
             secret_files["wireguard_addresses"] = a["wireguard_addresses"]
         if a["wireguard_preshared_key"]:
             secret_files["wireguard_preshared_key"] = a["wireguard_preshared_key"]
+
+    if downloader_key is not None:
+        secret_files[QBIT_KEY_SECRET_NAME] = downloader_key
+        secret_files[PORT_SYNC_SCRIPT_NAME] = port_sync_script(_DOWNLOADER_WEBUI_PORT)
+        if port_forwarding_on:
+            # Built with `+`, never an f-string: `{{PORT}}` is Gluetun's own
+            # literal marker (`command.go` replaces that exact substring on
+            # every forward), and an f-string's brace-escaping rules would
+            # turn it into something else entirely.
+            script_path = "/run/secrets/" + PORT_SYNC_SCRIPT_NAME
+            up_command = "/bin/sh " + script_path + " {{PORT}}"
+            down_command = "/bin/sh " + script_path + " 0"
+            environment.append(("VPN_PORT_FORWARDING_UP_COMMAND", up_command))
+            environment.append(("VPN_PORT_FORWARDING_DOWN_COMMAND", down_command))
 
     return GluetunConfig(environment=tuple(environment), secret_files=secret_files)
 

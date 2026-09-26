@@ -48,6 +48,7 @@ from marrquee.storage import read_marker
 from marrquee.vpn import TunnelPlace
 from marrquee.vpn_control import FakeGluetunControl, GluetunControl, NoGluetunControl
 from marrquee.wiring import WiringStep
+from marrquee.wiring.qbit_client import HttpQbitClient, QbitClient
 
 # --- A wiring runner that scripts `only_app` and one gap ---------------------
 
@@ -87,6 +88,7 @@ async def _deployed_to_finale(
     *,
     with_login: bool = True,
     vpn: GluetunControl | None = None,
+    qbit: QbitClient | None = None,
     **engine_kwargs: object,
 ) -> tuple[DeployManager, _StatefulEngine, Settings]:
     """A manager already at `finale` for `app_ids`, on the same stateful
@@ -101,6 +103,9 @@ async def _deployed_to_finale(
     hands the manager a `FakeLoginApplier` that always accepts it - every
     add test that isn't specifically about the login itself never has to
     think about it. `with_login=False` is for the tests that are.
+
+    `qbit=None` leaves `DeployManager`'s own default (`HttpQbitClient()`)
+    in place - fine for every test whose add never reaches a downloader.
     """
     settings = _settings(tmp_path)
     root = _fresh_root(settings)
@@ -123,6 +128,7 @@ async def _deployed_to_finale(
         sleep=clock.sleep,
         login=FakeLoginApplier(),
         vpn=vpn if vpn is not None else NoGluetunControl(),
+        qbit=qbit if qbit is not None else HttpQbitClient(),
     )
     manager.start()
     history = await _run_to_terminal(manager)

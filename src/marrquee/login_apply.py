@@ -24,6 +24,7 @@ from marrquee.catalog import CatalogApp
 from marrquee.login import SavedLogin
 from marrquee.state import InstallState
 from marrquee.wiring.arr_client import ArrClient, ArrResponse, HttpArrClient
+from marrquee.wiring.qbit_client import HttpQbitClient, QbitClient, QbitResponse, preferences_form
 from marrquee.wiring.steps import app_base_url
 
 logger = logging.getLogger(__name__)
@@ -129,13 +130,27 @@ def _failure_technical(app_id: str, method: str, path: str, response: ArrRespons
     return " ".join(parts)
 
 
-class HttpLoginApplier:
-    """The real `LoginApplier`, for `login_kind == "arr"` apps.
+def _qbit_failure_technical(app_id: str, path: str, response: QbitResponse) -> str:
+    """Built only from the app id, path, status and the free-text detail -
+    NEVER from `payload` - the same "no echoed body" rule `_failure_technical`
+    keeps for the arr apps.
+    """
+    parts = [f"{app_id}: POST {path} -> HTTP {response.status}"]
+    if response.detail:
+        parts.append(response.detail)
+    return " ".join(parts)
 
-    `GET`s the app's current host config, then `PUT`s it back with the
-    forms/enabled auth switch and the saved username and password - the
+
+class HttpLoginApplier:
+    """The real `LoginApplier`, for `login_kind == "arr"` and `"qbittorrent"`
+    apps.
+
+    An arr app is `GET`'s its current host config, then `PUT`'s it back with
+    the forms/enabled auth switch and the saved username and password - the
     same single-user `Upsert` Change and the forgotten-password reset also
-    go through, since neither one needs the app's old password.
+    go through, since neither one needs the app's old password. qBittorrent
+    takes the exact same login through one POST instead, using its own API
+    key rather than a cookie session - see `_apply_qbittorrent`.
     """
 
     def __init__(
@@ -145,11 +160,13 @@ class HttpLoginApplier:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         attempts: int = 3,
         retry_delay: float = 2.0,
+        qbit: QbitClient | None = None,
     ) -> None:
         self._client = client if client is not None else HttpArrClient()
         self._sleep = sleep
         self._attempts = attempts
         self._retry_delay = retry_delay
+        self._qbit = qbit if qbit is not None else HttpQbitClient()
 
     async def apply(
         self, app: CatalogApp, install: InstallState, login: SavedLogin
@@ -166,6 +183,9 @@ class HttpLoginApplier:
     async def _apply(
         self, app: CatalogApp, install: InstallState, login: SavedLogin
     ) -> LoginApplyResult:
+        if app.login_kind == "qbittorrent":
+            return await self._apply_qbittorrent(app, install, login)
+
         if app.login_kind != "arr":
             return LoginApplyResult(ok=False, technical=f"{app.id}: does not take a login")
 
@@ -201,6 +221,44 @@ class HttpLoginApplier:
             return LoginApplyResult(ok=False, technical=_redact_password(technical, login.password))
 
         return LoginApplyResult(ok=True, technical=None)
+
+    async def _apply_qbittorrent(
+        self, app: CatalogApp, install: InstallState, login: SavedLogin
+    ) -> LoginApplyResult:
+        """qBittorrent takes the login through its own API key, never a
+        cookie session and never its own old password: one POST of
+        `web_ui_username`/`web_ui_password`, hashed server-side
+        (`appcontroller.cpp:907-921`). This is what lets Change and the
+        forgotten-password reset work with no password qBittorrent already
+        has - the key is the only credential Marrquee ever needs to hold.
+        """
+        api_key = install.api_keys.get(app.id)
+        if not api_key:
+            return LoginApplyResult(ok=False, technical=f"{app.id}: no API key generated yet")
+
+        base_url = app_base_url(app)
+        path = f"{app.api_base}/app/setPreferences"
+        form = preferences_form(
+            {"web_ui_username": login.username, "web_ui_password": login.password}
+        )
+
+        response = await self._qbit_request_with_retry(base_url, path, api_key, form)
+        if not response.ok:
+            technical = _qbit_failure_technical(app.id, path, response)
+            return LoginApplyResult(ok=False, technical=_redact_password(technical, login.password))
+
+        return LoginApplyResult(ok=True, technical=None)
+
+    async def _qbit_request_with_retry(
+        self, base_url: str, path: str, api_key: str, form: Mapping[str, str]
+    ) -> QbitResponse:
+        response = await self._qbit.request("POST", base_url, path, api_key, form=form)
+        attempt = 1
+        while _is_transient(response.status) and attempt < self._attempts:
+            await self._sleep(self._retry_delay)
+            response = await self._qbit.request("POST", base_url, path, api_key, form=form)
+            attempt += 1
+        return response
 
     async def _request_with_retry(
         self,

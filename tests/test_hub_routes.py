@@ -13,6 +13,7 @@ which state, the root's own attributes) is read with the stdlib
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import re
 import time
@@ -29,9 +30,17 @@ from test_deploy_login import _already_finale_manager
 from marrquee import hub as hub_module
 from marrquee import questions as questions_module
 from marrquee import words
-from marrquee.catalog import CATALOG, apps_in_order
+from marrquee.catalog import CATALOG, apps_in_order, get_app
 from marrquee.config import Settings
-from marrquee.deploy import AppAdd, AppProgress, DeployManager, DeploySnapshot, Failure, WiringGap
+from marrquee.deploy import (
+    AppAdd,
+    AppProgress,
+    DeployManager,
+    DeploySnapshot,
+    Failure,
+    FakeReadinessProbe,
+    WiringGap,
+)
 from marrquee.docker_client import ContainerSnapshot, DockerStatus, FakeDockerEngine
 from marrquee.health import FakeLinkProbe
 from marrquee.hub import LOGIN_HELP_URL
@@ -39,7 +48,15 @@ from marrquee.links import LINK_COUNT_MAX, LinkCard, load_links, save_links
 from marrquee.login import LOGIN_STEP, load_login, save_login
 from marrquee.login_apply import FakeLoginApplier
 from marrquee.main import create_app
-from marrquee.questions import VPN_STEP, QuestionCheck, QuestionField, QuestionStep
+from marrquee.questions import (
+    SEEDING_STEP,
+    VPN_STEP,
+    QuestionCheck,
+    QuestionField,
+    QuestionStep,
+    load_answers,
+    save_step_answers,
+)
 from marrquee.routes.wizard import router as wizard_router
 from marrquee.state import STATE_VERSION, InstallState, load_state, save_state, write_json_atomic
 from marrquee.vpn import VPN_PROVIDERS, TunnelPlace, provider_wiki_url
@@ -268,6 +285,16 @@ def _dialog(page_html: str) -> dict[str, str | None]:
     collector = _DialogCollector()
     collector.feed(page_html)
     return collector.attrs
+
+
+def _seeding_pane_html(page_html: str) -> str:
+    """The seeding pane's own markup, sliced out of the whole page - it's
+    the dialog's last pane, so its own close tag is always the very next
+    `</dialog>`.
+    """
+    match = re.search(r'<div data-panel-pane="seeding">.*?</dialog>', page_html, re.DOTALL)
+    assert match is not None, "no seeding pane found on the page"
+    return match.group(0)
 
 
 class _AnchorNestingCollector(HTMLParser):
@@ -1010,8 +1037,9 @@ def test_panel_nonsense_and_edit_unknown_link_draw_it_closed(tmp_path: Path) -> 
 
 def test_install_pane_is_truthful(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
-    save_state(settings.config_dir, _install_state(("prowlarr", "sonarr", "radarr")))
-    _write_snapshot(settings, _finale_snapshot(("prowlarr", "sonarr", "radarr")))
+    all_offered = ("prowlarr", "sonarr", "radarr", "qbittorrent")
+    save_state(settings.config_dir, _install_state(all_offered))
+    _write_snapshot(settings, _finale_snapshot(all_offered))
     save_login(settings.config_dir, "owner", "s3cret-password-1", honor_reset=None)
     all_done_client = _client(settings)
 
@@ -1916,8 +1944,14 @@ def test_the_choose_login_banner_and_the_gluetun_install_row_render_together(
         config_dir=tmp_path / "config",
         reset_login="forgot-my-password-2026",
     )
-    save_state(settings.config_dir, _install_state(("prowlarr",)))
-    _write_snapshot(settings, _finale_snapshot(("prowlarr",)))
+    # qBittorrent is deployed alongside Prowlarr here (a pure view test,
+    # never a real compose plan) so its own install row - which would
+    # otherwise ALSO carry Gluetun's VPN step as a companion - drops out
+    # of `installable` entirely, leaving exactly one gluetun row on the
+    # page for this test's own id-uniqueness assertion to be about.
+    deployed = ("prowlarr", "qbittorrent")
+    save_state(settings.config_dir, _install_state(deployed))
+    _write_snapshot(settings, _finale_snapshot(deployed))
     save_login(settings.config_dir, "owner", "old-password-1", honor_reset=None)
     offered_catalog = tuple(
         dataclasses.replace(app, offered=True) if app.id == "gluetun" else app for app in CATALOG
@@ -1925,7 +1959,7 @@ def test_the_choose_login_banner_and_the_gluetun_install_row_render_together(
     monkeypatch.setattr(hub_module, "CATALOG", offered_catalog)
     engine = FakeDockerEngine(
         DockerStatus(connected=True, version="27.3.1"),
-        containers=_running_containers(("prowlarr",)),
+        containers=_running_containers(deployed),
     )
     client = _client(settings, engine)
 
@@ -2079,3 +2113,168 @@ def test_the_vpn_tile_carries_data_kind_vpn_and_an_arr_tile_carries_data_kind_ar
     assert posters["gluetun"]["data-kind"] == "vpn"
     assert posters["gluetun"]["data-state"] == "down"
     assert posters["prowlarr"]["data-kind"] == "arr"
+
+
+# --- qBittorrent's own paused poster and "Change seeding" -------------------
+
+
+def _qbittorrent_containers() -> dict[str, ContainerSnapshot]:
+    return {
+        "qbittorrent": ContainerSnapshot(
+            name="qbittorrent",
+            exists=True,
+            state="running",
+            exit_code=None,
+            image=None,
+            detail=None,
+        ),
+        "gluetun": ContainerSnapshot(
+            name="gluetun",
+            exists=True,
+            state="running",
+            exit_code=None,
+            image=None,
+            detail=None,
+            health="unhealthy",
+        ),
+    }
+
+
+def test_seeding_panel_hooks_exist_when_qbittorrent_is_installed(tmp_path: Path) -> None:
+    """FIRST TEST - every hook the page promises for the seeding pane
+    genuinely exists once qBittorrent is installed: the poster's own
+    `data-paused`, the "Change seeding" link's `data-panel-open="seeding"`,
+    the pane's `data-panel-pane="seeding"`, its form's
+    `action="/hub/seeding"`, and the own-numbers fields' `data-field`
+    wrappers.
+    """
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("gluetun", "qbittorrent")))
+    _write_snapshot(settings, _finale_snapshot(("gluetun", "qbittorrent")))
+    engine = FakeDockerEngine(
+        DockerStatus(connected=True, version="27.3.1"), containers=_qbittorrent_containers()
+    )
+    client = _client(settings, engine)
+
+    page = client.get("/?panel=seeding")
+
+    posters = _posters(page.text)
+    assert posters["qbittorrent"]["data-paused"] == "true"
+    assert re.search(r'<a[^>]*data-panel-open="seeding"[^>]*>', page.text) is not None
+    assert _dialog(page.text).get("data-panel-mode") == "seeding"
+
+    pane = _seeding_pane_html(page.text)
+    assert 'action="/hub/seeding"' in pane
+    assert 'data-field="seed_ratio"' in pane
+    assert 'data-field="seed_days"' in pane
+
+
+def test_the_seeding_steps_own_number_fields_carry_a_data_field_wrapper() -> None:
+    html = _render_question_step(SEEDING_STEP)
+
+    assert 'data-field="seed_ratio"' in html
+    assert 'data-field="seed_days"' in html
+    # The choice field itself never gets one - only a field with its own
+    # `shown_when` does.
+    assert 'data-field="seeding"' not in html
+
+
+def test_a_non_qbittorrent_hub_never_offers_the_seeding_panel(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    _write_snapshot(settings, _finale_snapshot(("sonarr",)))
+    client = _client(settings)
+
+    page = client.get("/?panel=seeding")
+
+    assert _dialog(page.text).get("data-panel-mode") == "closed"
+
+
+def test_change_seeding_saves_the_new_answer_and_reconnects(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("gluetun", "qbittorrent")))
+    _write_snapshot(settings, _finale_snapshot(("gluetun", "qbittorrent")))
+    engine = FakeDockerEngine(DockerStatus(connected=True, version="27.3.1"))
+    manager = DeployManager(settings, engine)
+    app = create_app(settings=settings, engine=engine, manager=manager)
+    client = TestClient(app)
+
+    response = client.post(
+        "/hub/seeding",
+        data={"seeding": "private", "seed_ratio": "", "seed_days": ""},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/"
+    time.sleep(0.05)
+    assert load_answers(settings.config_dir)["qbittorrent"]["seeding"] == "private"
+    assert manager.snapshot().adding is None
+
+
+async def _never_returns(_seconds: float) -> None:
+    """A `sleep` that never wakes up - the deterministic way to hold a
+    `DeployManager` run "busy" forever, with no race against how fast a
+    fake add would otherwise finish.
+    """
+    await asyncio.Event().wait()
+
+
+def test_seeding_refuses_and_saves_nothing_while_the_manager_is_busy(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("gluetun", "qbittorrent")))
+    _write_snapshot(settings, _finale_snapshot(("gluetun", "qbittorrent")))
+    save_login(settings.config_dir, "owner", "s3cret-password-1", honor_reset=None)
+    engine = FakeDockerEngine(
+        DockerStatus(connected=True, version="27.3.1"), images={get_app("radarr").image}
+    )
+    manager = DeployManager(
+        settings, engine, probe=FakeReadinessProbe(default=False), sleep=_never_returns
+    )
+    app = create_app(settings=settings, engine=engine, manager=manager)
+
+    with TestClient(app) as client:
+        started = client.post("/api/hub/apps/radarr/install", json={"answers": {}})
+        assert started.status_code == 202
+
+        response = client.post(
+            "/hub/seeding",
+            data={"seeding": "private", "seed_ratio": "", "seed_days": ""},
+        )
+
+        assert response.status_code == 200
+        assert _dialog(response.text).get("data-panel-mode") == "seeding"
+        assert words.HUB_SEEDING_BUSY in _seeding_pane_html(response.text)
+        assert "qbittorrent" not in load_answers(settings.config_dir)
+
+
+def test_own_with_blank_numbers_refuses_on_seed_ratio_and_saves_nothing(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("gluetun", "qbittorrent")))
+    _write_snapshot(settings, _finale_snapshot(("gluetun", "qbittorrent")))
+    client = _client(settings)
+
+    response = client.post(
+        "/hub/seeding", data={"seeding": "own", "seed_ratio": "", "seed_days": ""}
+    )
+
+    assert response.status_code == 200
+    pane = _seeding_pane_html(response.text)
+    assert words.SEEDING_PROBLEM_OWN_EMPTY in pane
+    assert "qbittorrent" not in load_answers(settings.config_dir)
+
+
+def test_the_seeding_pane_preselects_the_saved_preset(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("gluetun", "qbittorrent")))
+    _write_snapshot(settings, _finale_snapshot(("gluetun", "qbittorrent")))
+    save_step_answers(
+        settings.config_dir,
+        "qbittorrent",
+        {"seeding": "private", "seed_ratio": "", "seed_days": ""},
+    )
+    client = _client(settings)
+
+    pane = _seeding_pane_html(client.get("/?panel=seeding").text)
+
+    assert re.search(r'value="private"\s+checked', pane) is not None

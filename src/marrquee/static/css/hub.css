@@ -117,6 +117,13 @@
   background: var(--error);
 }
 
+/* A pause is not an error - Gluetun's own reconnect is already handling it,
+ * so a paused downloader's dot stays amber, winning over the plain
+ * down-state red above by coming later in the cascade (same specificity). */
+.hub-poster[data-paused="true"] .hub-dot {
+  background: var(--warning);
+}
+
 .hub-poster [data-role="line"] {
   margin: var(--space-2) 0 0;
   font-size: var(--text-xs);
@@ -147,6 +154,23 @@
   display: flex;
   gap: var(--space-2);
   margin-top: var(--space-2);
+}
+
+/* "Change seeding" - a sibling of the poster's own link, matching
+ * `.hub-footer-link`'s established in-page text link, with its own smaller
+ * top margin (it sits right under the tile, not the whole page). */
+.hub-tile-link {
+  display: inline-block;
+  margin-top: var(--space-2);
+  padding-block: var(--space-3);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  text-decoration: underline;
+}
+
+.hub-tile-link:focus-visible {
+  outline: 2px solid var(--spotlight);
+  outline-offset: 2px;
 }
 
 /* --- Stage: today it holds one child, the poster grid ---------------------- */
@@ -335,7 +359,8 @@
 .hub-panel[data-panel-mode="install"] [data-panel-pane="install"],
 .hub-panel[data-panel-mode="link"] [data-panel-pane="link"],
 .hub-panel[data-panel-mode="edit"] [data-panel-pane="edit"],
-.hub-panel[data-panel-mode="login"] [data-panel-pane="login"] {
+.hub-panel[data-panel-mode="login"] [data-panel-pane="login"],
+.hub-panel[data-panel-mode="seeding"] [data-panel-pane="seeding"] {
   display: block;
 }
 

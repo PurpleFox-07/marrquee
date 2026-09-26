@@ -94,13 +94,14 @@ def test_wizard_steps_are_numbered_one_through_four_in_order() -> None:
 
 
 def test_wizard_steps_matches_the_four_fixed_pills_when_nothing_is_registered() -> None:
-    # Gluetun is the one catalog app with a registered question step, so
-    # "nothing is registered" holds only for subsets that leave it out.
+    # Gluetun and qBittorrent are the two catalog apps with a registered
+    # question step, so "nothing is registered" holds only for subsets
+    # that leave both out.
     every_subset = (
         (),
         ("prowlarr",),
         ("prowlarr", "sonarr"),
-        tuple(app.id for app in catalog.CATALOG if app.id != "gluetun"),
+        tuple(app.id for app in catalog.CATALOG if app.id not in ("gluetun", "qbittorrent")),
     )
     for app_ids in every_subset:
         steps = wizard.wizard_steps(app_ids)
@@ -134,6 +135,19 @@ def test_wizard_steps_inserts_a_ticked_apps_question_step_between_login_and_driv
         (3, "Fixture questions", "q:radarr:fixture"),
         (4, words.WIZARD_STEP_DRIVE, "drive"),
         (5, words.WIZARD_STEP_DEPLOY, "deploy"),
+    ]
+
+
+def test_wizard_steps_with_qbittorrent_ticked_asks_vpn_then_seeding() -> None:
+    steps = wizard.wizard_steps(("gluetun", "qbittorrent"))
+
+    assert [(step.number, step.label, step.key) for step in steps] == [
+        (1, words.WIZARD_STEP_APPS, "apps"),
+        (2, words.WIZARD_STEP_LOGIN, "login"),
+        (3, words.VPN_STEP_TITLE, "q:gluetun:vpn"),
+        (4, words.SEEDING_STEP_TITLE, "q:qbittorrent:seeding"),
+        (5, words.WIZARD_STEP_DRIVE, "drive"),
+        (6, words.WIZARD_STEP_DEPLOY, "deploy"),
     ]
 
 

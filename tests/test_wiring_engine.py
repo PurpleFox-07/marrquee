@@ -8,21 +8,27 @@ readiness budget or a 30-second reassurance threshold costs nothing real.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
+from pathlib import Path
 
 import pytest
 
-from marrquee import words
+from marrquee import questions, words
 from marrquee.state import STATE_VERSION, InstallState
+from marrquee.vpn_control import FakeGluetunControl
 from marrquee.wiring import WiringRunner, WiringStep
 from marrquee.wiring.arr_client import ArrFailure, ArrResponse, FakeArrClient, HttpArrClient
 from marrquee.wiring.engine import (
     AppSyncTask,
+    DownloadClientTask,
     ExplainTask,
+    QbitSettingsTask,
     RootFolderTask,
     WiringEngine,
     plan_wiring,
 )
+from marrquee.wiring.qbit_client import FakeQbitClient, QbitResponse
 
 _ROOT = "/volume1/media"
 
@@ -100,6 +106,16 @@ def _failed(
     status: int, *, failures: tuple[ArrFailure, ...] = (), detail: str | None = None
 ) -> ArrResponse:
     return ArrResponse(ok=False, status=status, payload=None, failures=failures, detail=detail)
+
+
+def _qbit_ok(payload: object = None, status: int = 200) -> QbitResponse:
+    return QbitResponse(ok=True, status=status, payload=payload, detail=None)
+
+
+def _posted_json(call: tuple[str, str, str, Mapping[str, str] | None]) -> object:
+    form = call[3]
+    assert form is not None
+    return json.loads(form["json"])
 
 
 def _frames_by_key(steps: list[WiringStep]) -> dict[str, list[WiringStep]]:
@@ -540,3 +556,232 @@ async def test_only_app_step_numbering_counts_the_filtered_list() -> None:
     frames = _frames_by_key(steps)
     assert set(frames) == {"app-sync:radarr", "root-folder:radarr"}
     assert {frame.total for step_frames in frames.values() for frame in step_frames} == {2}
+
+
+# --- plan_wiring: qBittorrent's own settings and download-client tasks ------
+
+
+def test_downloader_tasks_land_after_app_sync_and_before_root_folders() -> None:
+    state = _install_state(("prowlarr", "sonarr", "radarr", "gluetun", "qbittorrent"))
+
+    keys = [task.key for task in plan_wiring(state)]
+
+    assert keys == [
+        "app-sync:sonarr",
+        "app-sync:radarr",
+        "downloader-settings:qbittorrent",
+        "download-client:sonarr",
+        "download-client:radarr",
+        "root-folder:sonarr",
+        "root-folder:radarr",
+    ]
+
+
+def test_no_qbittorrent_leaves_the_plan_exactly_as_before() -> None:
+    state = _install_state(("prowlarr", "sonarr", "radarr"))
+
+    keys = [task.key for task in plan_wiring(state)]
+
+    assert keys == [
+        "app-sync:sonarr",
+        "app-sync:radarr",
+        "root-folder:sonarr",
+        "root-folder:radarr",
+    ]
+
+
+def test_only_app_sonarr_keeps_its_download_client_task() -> None:
+    state = _install_state(("prowlarr", "sonarr", "radarr", "gluetun", "qbittorrent"))
+
+    keys = [task.key for task in plan_wiring(state, only_app="sonarr")]
+
+    assert keys == ["app-sync:sonarr", "download-client:sonarr", "root-folder:sonarr"]
+
+
+def test_downloader_tasks_about_equals_involved() -> None:
+    state = _install_state(("sonarr", "gluetun", "qbittorrent"))
+    tasks = {task.key: task for task in plan_wiring(state)}
+
+    settings_task = tasks["downloader-settings:qbittorrent"]
+    assert isinstance(settings_task, QbitSettingsTask)
+    assert settings_task.involved == ("qbittorrent",)
+    assert settings_task.about == settings_task.involved
+
+    client_task = tasks["download-client:sonarr"]
+    assert isinstance(client_task, DownloadClientTask)
+    assert client_task.involved == ("sonarr", "qbittorrent")
+    assert client_task.about == client_task.involved
+
+
+def test_radarr_download_client_task_uses_movies() -> None:
+    state = _install_state(("radarr", "gluetun", "qbittorrent"))
+    tasks = {task.key: task for task in plan_wiring(state)}
+
+    client_task = tasks["download-client:radarr"]
+    assert isinstance(client_task, DownloadClientTask)
+    assert client_task.category_field == "movieCategory"
+    assert client_task.media_folder == "movies"
+
+
+# --- WiringEngine.run: qBittorrent's own settings task ----------------------
+
+
+async def test_qbittorrent_is_ready_without_polling_system_status() -> None:
+    fake_arr = FakeArrClient({})
+    fake_qbit = FakeQbitClient(
+        {
+            ("GET", "http://gluetun:8080", "api/v2/app/preferences"): [_qbit_ok({})],
+            ("POST", "http://gluetun:8080", "api/v2/app/setPreferences"): [_qbit_ok()],
+        }
+    )
+    engine = WiringEngine(client=fake_arr, qbit=fake_qbit)
+    steps: list[WiringStep] = []
+
+    await engine.run(_install_state(("gluetun", "qbittorrent")), steps.append)
+
+    frames = _frames_by_key(steps)["downloader-settings:qbittorrent"]
+    assert frames[-1].state == "done"
+    assert not any(call[2].endswith("system/status") for call in fake_arr.calls)
+
+
+async def test_equal_seeding_preferences_post_nothing() -> None:
+    from marrquee.qbittorrent import QBIT_BASE_PREFERENCES
+    from marrquee.seeding import seeding_preferences
+
+    current = {**QBIT_BASE_PREFERENCES, **seeding_preferences(None)}
+    fake_qbit = FakeQbitClient(
+        {("GET", "http://gluetun:8080", "api/v2/app/preferences"): [_qbit_ok(current)]}
+    )
+    engine = WiringEngine(client=FakeArrClient({}), qbit=fake_qbit)
+    steps: list[WiringStep] = []
+
+    await engine.run(_install_state(("gluetun", "qbittorrent")), steps.append)
+
+    frames = _frames_by_key(steps)["downloader-settings:qbittorrent"]
+    assert frames[-1].state == "done"
+    assert frames[-1].note == words.WIRING_NOTE_ALREADY_CONNECTED
+    assert not any(call[0] == "POST" for call in fake_qbit.calls)
+
+
+async def test_a_changed_seeding_answer_posts_the_new_limits(tmp_path: Path) -> None:
+    questions.save_step_answers(tmp_path, "qbittorrent", {"seeding": "private"})
+    fake_qbit = FakeQbitClient(
+        {
+            ("GET", "http://gluetun:8080", "api/v2/app/preferences"): [_qbit_ok({})],
+            ("POST", "http://gluetun:8080", "api/v2/app/setPreferences"): [_qbit_ok()],
+        }
+    )
+    engine = WiringEngine(client=FakeArrClient({}), qbit=fake_qbit, config_dir=tmp_path)
+    steps: list[WiringStep] = []
+
+    await engine.run(_install_state(("gluetun", "qbittorrent")), steps.append)
+
+    post_calls = [call for call in fake_qbit.calls if call[0] == "POST"]
+    assert len(post_calls) == 1
+    body = _posted_json(post_calls[0])
+    assert isinstance(body, dict)
+    assert body["max_seeding_time"] == 43200
+
+
+async def test_a_forwarded_port_is_included_a_missing_one_is_not() -> None:
+    fake_qbit = FakeQbitClient(
+        {
+            ("GET", "http://gluetun:8080", "api/v2/app/preferences"): [
+                _qbit_ok({}),
+                _qbit_ok({}),
+            ],
+            ("POST", "http://gluetun:8080", "api/v2/app/setPreferences"): [
+                _qbit_ok(),
+                _qbit_ok(),
+            ],
+        }
+    )
+    state = _install_state(("gluetun", "qbittorrent"))
+
+    engine_with_port = WiringEngine(
+        client=FakeArrClient({}), qbit=fake_qbit, vpn=FakeGluetunControl(port=51413)
+    )
+    steps_with_port: list[WiringStep] = []
+    await engine_with_port.run(state, steps_with_port.append)
+    body_with_port = _posted_json(fake_qbit.calls[1])
+    assert isinstance(body_with_port, dict)
+    assert body_with_port["listen_port"] == 51413
+
+    engine_without_port = WiringEngine(
+        client=FakeArrClient({}), qbit=fake_qbit, vpn=FakeGluetunControl(port=None)
+    )
+    steps_without_port: list[WiringStep] = []
+    await engine_without_port.run(state, steps_without_port.append)
+    body_without_port = _posted_json(fake_qbit.calls[3])
+    assert isinstance(body_without_port, dict)
+    assert "listen_port" not in body_without_port
+
+
+# --- WiringEngine.run: Sonarr/Radarr's download client ----------------------
+
+
+async def test_download_client_task_creates_category_then_the_client() -> None:
+    fake_arr = FakeArrClient(
+        {
+            ("GET", "http://sonarr:8989", "api/v3/system/status"): [_ok(None)],
+            ("GET", "http://sonarr:8989", "api/v3/downloadclient"): [_ok([])],
+            ("GET", "http://sonarr:8989", "api/v3/downloadclient/schema"): [
+                _ok(
+                    [
+                        {
+                            "id": 0,
+                            "name": "qBittorrent",
+                            "implementation": "QBittorrent",
+                            "fields": [
+                                {"name": "host", "value": ""},
+                                {"name": "port", "value": 8080},
+                                {"name": "tvCategory", "value": ""},
+                            ],
+                        }
+                    ]
+                )
+            ],
+            ("POST", "http://sonarr:8989", "api/v3/downloadclient"): [_created({"id": 4})],
+        }
+    )
+    fake_qbit = FakeQbitClient(
+        {
+            ("GET", "http://gluetun:8080", "api/v2/app/preferences"): [_qbit_ok({})],
+            ("POST", "http://gluetun:8080", "api/v2/app/setPreferences"): [_qbit_ok()],
+            ("GET", "http://gluetun:8080", "api/v2/torrents/categories"): [_qbit_ok({})],
+            ("POST", "http://gluetun:8080", "api/v2/torrents/createCategory"): [_qbit_ok()],
+        }
+    )
+    engine = WiringEngine(client=fake_arr, qbit=fake_qbit)
+    steps: list[WiringStep] = []
+
+    await engine.run(_install_state(("sonarr", "gluetun", "qbittorrent")), steps.append)
+
+    frames = _frames_by_key(steps)["download-client:sonarr"]
+    assert frames[-1].state == "done"
+    assert any(call[2] == "api/v2/torrents/createCategory" for call in fake_qbit.calls)
+    assert any(call[0] == "POST" and call[2] == "api/v3/downloadclient" for call in fake_arr.calls)
+
+
+async def test_a_category_failure_stops_before_the_client_is_ever_written() -> None:
+    """The category write happens first: if qBittorrent refuses it, Sonarr's
+    own download-client endpoint is never even called.
+    """
+    fake_arr = FakeArrClient({("GET", "http://sonarr:8989", "api/v3/system/status"): [_ok(None)]})
+    fake_qbit = FakeQbitClient(
+        {
+            ("GET", "http://gluetun:8080", "api/v2/app/preferences"): [_qbit_ok({})],
+            ("POST", "http://gluetun:8080", "api/v2/app/setPreferences"): [_qbit_ok()],
+            ("GET", "http://gluetun:8080", "api/v2/torrents/categories"): [
+                QbitResponse(ok=False, status=403, payload=None, detail="refused")
+            ],
+        }
+    )
+    engine = WiringEngine(client=fake_arr, qbit=fake_qbit)
+    steps: list[WiringStep] = []
+
+    await engine.run(_install_state(("sonarr", "gluetun", "qbittorrent")), steps.append)
+
+    frames = _frames_by_key(steps)["download-client:sonarr"]
+    assert frames[-1].state == "error"
+    assert not any(call[2].startswith("api/v3/downloadclient") for call in fake_arr.calls)

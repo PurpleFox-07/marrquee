@@ -911,7 +911,7 @@ def test_stack_smoke_always_cleans_up_containers_network_and_temp_files() -> Non
 
     assert step.get("if") == "always()"
     run = step["run"]
-    for name in ("prowlarr", "sonarr", "radarr", "gluetun", "marrquee-stack-smoke"):
+    for name in ("prowlarr", "sonarr", "radarr", "gluetun", "qbittorrent", "marrquee-stack-smoke"):
         assert name in run
     assert "docker network rm marrquee" in run
     # `sudo`, not a plain `rm -rf`: some of what's under the temp folder can
@@ -1075,6 +1075,46 @@ def test_stack_smoke_kill_switch_pair_blocks_traffic_without_the_tunnel() -> Non
     assert "::error::the runner itself could not reach 1.1.1.1" in run
 
 
+def test_stack_smoke_kill_switch_check_has_a_positive_control_through_gluetuns_namespace() -> None:
+    """`docker run --network container:gluetun` joining Gluetun's namespace
+    is proven separately from the real check, against a target that must
+    always answer regardless of tunnel state (Gluetun's own control server,
+    on loopback, which is never subject to Gluetun's own firewall) - so a
+    "couldn't connect" result below is trusted to mean the kill switch, not
+    a broken namespace join.
+    """
+    step = _step_named(_stack_smoke_job(), "nothing gets out without the tunnel")
+    run = step["run"]
+
+    assert "127.0.0.1:8000/v1/vpn/status" in run
+    assert "control_exit" in run
+    assert "::error::the kill-switch check could not run" in run
+    assert "::error::the kill-switch check's positive control got no HTTP response" in run
+
+
+def test_stack_smoke_kill_switch_real_check_never_reads_a_docker_failure_as_blocked() -> None:
+    """The bug this hardens: `if docker run ...; then error; fi` reads ANY
+    nonzero exit - including `docker run` itself failing to join the
+    namespace (Docker's own 125+ convention) - as "the kill switch held".
+    The exit code is captured and judged instead of the command's
+    truthiness, and a docker-level failure gets its own distinct message.
+    """
+    step = _step_named(_stack_smoke_job(), "nothing gets out without the tunnel")
+    run = step["run"]
+
+    assert "real_exit=$?" in run
+    assert "-ge 125" in run
+    assert 'if [ "$real_exit" -eq 0 ]' in run
+    # The old vacuous pattern must be gone: a bare `if docker run ...
+    # --network container:gluetun ... ; then` immediately followed by the
+    # kill-switch error, with no captured exit code in between.
+    vacuous_pattern = (
+        "if docker run --rm --network container:gluetun alpine:3.20"
+        " wget -q -T 5 -O /dev/null http://1.1.1.1; then"
+    )
+    assert vacuous_pattern not in run
+
+
 def test_stack_smoke_vpn_login_never_leaks_into_compose_or_diagnostics() -> None:
     step = _step_named(_stack_smoke_job(), "vpn login stays out of compose")
     run = step["run"]
@@ -1170,3 +1210,261 @@ def test_stack_smoke_vpn_steps_run_in_order_add_then_control_then_kill_switch_th
         < removed_index
         < cleared_index
     )
+
+
+# --- stack-smoke: qBittorrent inside Gluetun's network (developer test) ----
+# The fake VPN login above never connects, so this whole block runs with a
+# real Sonarr and a real qBittorrent but no live tunnel. Every needle below
+# pairs "qbittorrent" with another word so `_step_named`'s first-match rule
+# can never land on an existing arr-app step of the same generic shape
+# (e.g. "the one login").
+
+
+def test_stack_smoke_reasserts_gluetun_running_before_qbittorrent_joins_its_network() -> None:
+    """Mirrors the existing kill-switch wait: qBittorrent's `network_mode:
+    service:gluetun` would fail for an unrelated reason (no such container)
+    if Gluetun were ever missing here, not because the network really
+    isn't shared.
+    """
+    job = _stack_smoke_job()
+    step = _step_named(job, "gluetun is still running", "qbittorrent")
+    run = step["run"]
+
+    assert ".State.Running" in run
+    assert "seq 1 " in run
+    assert "while true" not in run
+    assert "::error::" in run
+
+    steps = _steps(job)
+    perms_step = _step_named(job, "vpn secrets folder is root-only")
+    bring_up_step = _step_named(job, "qbittorrent inside the vpn's network")
+    assert steps.index(perms_step) < steps.index(step) < steps.index(bring_up_step)
+
+
+def test_stack_smoke_brings_qbittorrent_up_inside_gluetuns_network() -> None:
+    """The FIRST assertion this chunk owns: qBittorrent's compose branch
+    really does render with no network of its own, in memory, without ever
+    writing the grown state back to `install.json`.
+    """
+    step = _step_named(_stack_smoke_job(), "qbittorrent inside the vpn's network")
+    run = step["run"]
+
+    assert "with_app_added" in run
+    assert "write_qbit_conf" in run
+    assert "build_stack_plan" in run
+    assert "render_compose" in run
+    assert "/config/ci-qbit-compose.yaml" in run
+    assert "docker cp" in run
+    assert "docker compose -p marrquee-apps" in run
+    assert "--no-recreate qbittorrent" in run
+    assert "HostConfig.NetworkMode" in run
+    assert "container:" in run
+    assert "::error::qBittorrent is not inside the VPN's network" in run
+    assert "::error::" in run
+
+    # The key itself must never reach stdout - only its length.
+    assert "key length" in run
+    assert "print(api_key)" not in run
+    assert "print(key)" not in run
+
+
+def test_stack_smoke_qbittorrent_bring_up_waits_for_its_container_before_driving_it() -> None:
+    step = _step_named(_stack_smoke_job(), "qbittorrent inside the vpn's network")
+    run = step["run"]
+
+    assert ".State.Running" in run
+    assert "seq 1 " in run
+    assert "while true" not in run
+
+
+def test_stack_smoke_qbittorrent_takes_marrquees_key() -> None:
+    step = _step_named(_stack_smoke_job(), "qbittorrent takes marrquee's key")
+    run = step["run"]
+
+    assert "HttpQbitClient" in run
+    assert "gluetun:8080" in run
+    assert "api/v2/app/version" in run
+    assert "200" in run
+    assert "401" in run or "403" in run
+    assert "::error::" in run
+
+
+def test_stack_smoke_qbittorrent_key_check_never_prints_the_key() -> None:
+    step = _step_named(_stack_smoke_job(), "qbittorrent takes marrquee's key")
+    run = step["run"]
+
+    assert "print(api_key)" not in run
+    assert "print(key)" not in run
+    assert "print(wrong_key)" not in run
+
+
+def test_stack_smoke_qbittorrent_takes_the_one_login() -> None:
+    step = _step_named(_stack_smoke_job(), "qbittorrent", "one login")
+    run = step["run"]
+
+    assert "HttpLoginApplier" in run
+    assert "SavedLogin" in run
+    assert "MARRQUEE_CI_PASSWORD" in run
+    assert "gluetun:8080/api/v2/auth/login" in run
+    assert '"Ok."' in run
+    assert "::error::" in run
+
+
+def test_stack_smoke_qbittorrent_login_check_never_echoes_the_password() -> None:
+    step = _step_named(_stack_smoke_job(), "qbittorrent", "one login")
+    for line in step["run"].splitlines():
+        stripped = line.strip()
+        if stripped.startswith("echo") or "::error::" in stripped:
+            assert "MARRQUEE_CI_PASSWORD" not in stripped, (
+                f"the CI password appears in an echoed line: {line!r}"
+            )
+
+
+def test_stack_smoke_sonarr_connects_to_qbittorrent_with_the_key_while_the_tunnel_is_down() -> None:
+    step = _step_named(_stack_smoke_job(), "sonarr connects to qbittorrent")
+    run = step["run"]
+
+    assert "ensure_qbit_category" in run
+    assert "ensure_download_client" in run
+    assert "/api/v3/downloadclient" in run
+    assert "QBittorrent" in run
+    assert "removeCompletedDownloads" in run
+    assert "gluetun" in run
+    assert "::error::" in run
+
+
+def test_stack_smoke_qbittorrent_cannot_reach_the_internet() -> None:
+    step = _step_named(_stack_smoke_job(), "the downloader can't reach the internet")
+    run = step["run"]
+
+    assert "docker exec qbittorrent" in run
+    assert "1.1.1.1" in run
+    assert "::error::qBittorrent reached the internet outside the VPN" in run
+
+
+def test_stack_smoke_kill_switch_check_asserts_the_probe_tool_exists() -> None:
+    """A missing `curl` (exit 127) must never read as "blocked" - the tool
+    is checked before either the positive control or the real check ever
+    runs, with `wget` as a fallback for whichever the image actually ships.
+    """
+    step = _step_named(_stack_smoke_job(), "the downloader can't reach the internet")
+    run = step["run"]
+
+    assert "command -v curl" in run
+    assert "command -v wget" in run
+    assert "::error::curl is not available in the qBittorrent container" in run
+    assert "the kill-switch check cannot run" in run
+
+
+def test_stack_smoke_kill_switch_check_has_a_positive_control() -> None:
+    """Gluetun's own control server, reached on loopback through the SAME
+    shared network namespace qBittorrent's real check below is judged in,
+    is never subject to Gluetun's own firewall - so it must always answer,
+    proving the probe tool and the namespace both work.
+    """
+    step = _step_named(_stack_smoke_job(), "the downloader can't reach the internet")
+    run = step["run"]
+
+    assert "127.0.0.1:8000/v1/vpn/status" in run
+    assert "::error::the kill-switch check's positive control got no HTTP response" in run
+
+
+def test_stack_smoke_kill_switch_check_whitelists_exit_codes_instead_of_truthiness() -> None:
+    """The bug this hardens: `if docker exec qbittorrent curl ...; then
+    error; fi` reads ANY nonzero exit - a missing tool, a stopped
+    container, an unrelated curl error - as "the kill switch held". Only
+    curl's own couldn't-connect (7) and timeout (28) codes count as
+    blocked; 0 is reached (an error); anything else is reported as its own,
+    distinct failure rather than silently passing.
+    """
+    step = _step_named(_stack_smoke_job(), "the downloader can't reach the internet")
+    run = step["run"]
+
+    assert "real_exit=$?" in run
+    assert "7|28" in run
+    assert "::error::the kill-switch check failed for an unrelated reason" in run
+    # The old vacuous pattern must be gone.
+    assert "if docker exec qbittorrent curl -s -m 5 -o /dev/null http://1.1.1.1; then" not in run
+
+
+def test_stack_smoke_removes_qbittorrent_before_gluetuns_teardown() -> None:
+    job = _stack_smoke_job()
+    step = _step_named(job, "remove qbittorrent")
+    run = step["run"]
+
+    assert "docker rm -f qbittorrent" in run
+
+    steps = _steps(job)
+    cannot_reach_step = _step_named(job, "the downloader can't reach the internet")
+    cancel_step = _step_named(job, "cancel the vpn add")
+    assert steps.index(cannot_reach_step) < steps.index(step) < steps.index(cancel_step)
+
+
+def test_stack_smoke_qbittorrent_steps_run_between_the_secrets_check_and_the_vpn_cancel() -> None:
+    """Pins the whole block's placement: after the root-only secrets check
+    and before the VPN cancel step, so the existing order test that checks
+    `perms_index < cancel_index` stays meaningful rather than merely true.
+    """
+    job = _stack_smoke_job()
+    names = [str(step.get("name", "")) for step in _steps(job)]
+
+    perms_index = names.index(_step_named(job, "vpn secrets folder is root-only")["name"])
+    running_index = names.index(_step_named(job, "gluetun is still running", "qbittorrent")["name"])
+    bring_up_index = names.index(_step_named(job, "qbittorrent inside the vpn's network")["name"])
+    key_index = names.index(_step_named(job, "qbittorrent takes marrquee's key")["name"])
+    login_index = names.index(_step_named(job, "qbittorrent", "one login")["name"])
+    sonarr_index = names.index(_step_named(job, "sonarr connects to qbittorrent")["name"])
+    kill_switch_index = names.index(
+        _step_named(job, "the downloader can't reach the internet")["name"]
+    )
+    remove_index = names.index(_step_named(job, "remove qbittorrent")["name"])
+    cancel_index = names.index(_step_named(job, "cancel the vpn add")["name"])
+
+    assert (
+        perms_index
+        < running_index
+        < bring_up_index
+        < key_index
+        < login_index
+        < sonarr_index
+        < kill_switch_index
+        < remove_index
+        < cancel_index
+    )
+
+
+def test_stack_smoke_every_new_qbittorrent_step_emits_error_on_failure() -> None:
+    job = _stack_smoke_job()
+    names = [
+        ("gluetun is still running", "qbittorrent"),
+        ("qbittorrent inside the vpn's network",),
+        ("qbittorrent takes marrquee's key",),
+        ("qbittorrent", "one login"),
+        ("sonarr connects to qbittorrent",),
+        ("the downloader can't reach the internet",),
+    ]
+    for needles in names:
+        step = _step_named(job, *needles)
+        assert "::error::" in step["run"], f"step {step['name']!r} never emits ::error::"
+
+
+def test_stack_smoke_new_qbittorrent_step_names_avoid_forbidden_needles() -> None:
+    """`_step_named` returns the FIRST match - a new step whose name
+    containing one of these generic phrases would silently resolve to an
+    unrelated, already-existing step instead of its own.
+    """
+    job = _stack_smoke_job()
+    forbidden = ("throwaway login", "cancel", "nothing gets out")
+    new_step_needles = [
+        ("gluetun is still running", "qbittorrent"),
+        ("qbittorrent inside the vpn's network",),
+        ("qbittorrent takes marrquee's key",),
+        ("qbittorrent", "one login"),
+        ("sonarr connects to qbittorrent",),
+        ("the downloader can't reach the internet",),
+        ("remove qbittorrent",),
+    ]
+    for needles in new_step_needles:
+        name = str(_step_named(job, *needles)["name"]).lower()
+        for phrase in forbidden:
+            assert phrase not in name, f"step {name!r} contains the forbidden phrase {phrase!r}"

@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from marrquee import vpn, words
+from marrquee import seeding, vpn, words
 from marrquee.catalog import apps_in_order
 from marrquee.state import write_json_atomic
 from marrquee.words import QUESTION_PICK_ONE
@@ -56,6 +56,11 @@ class QuestionField:
     default: str = ""
     guide_label: str = ""
     guide_url: str = ""
+    # Non-empty only for a field the partial should wrap in its own
+    # `data-field` div - a hook a show/hide rule can key off of. Every other
+    # step (the login step among them) leaves this blank, so its rendered
+    # markup never gains a wrapper it didn't already have.
+    shown_when: str = ""
 
 
 @dataclass(frozen=True)
@@ -205,11 +210,71 @@ VPN_STEP = QuestionStep(
 )
 
 
+# --- The seeding step: the only place `seeding.py`'s answer rules meet the
+# shared question-answering machinery, mirroring the VPN step above -------
+
+
+def _check_seeding_step(answers: Mapping[str, str]) -> QuestionCheck:
+    result = seeding.check_seeding(answers)
+    return QuestionCheck(
+        ok=result.ok, answers=result.answers, problem=result.problem, field=result.field
+    )
+
+
+_SEEDING_FIELDS: tuple[QuestionField, ...] = (
+    QuestionField(
+        name="seeding",
+        label=words.SEEDING_LABEL,
+        kind="choice",
+        options=(
+            QuestionOption(
+                value="good_neighbor",
+                label=words.SEEDING_GOOD_NEIGHBOR,
+                hint=words.SEEDING_GOOD_NEIGHBOR_HINT,
+            ),
+            QuestionOption(
+                value="save_space",
+                label=words.SEEDING_SAVE_SPACE,
+                hint=words.SEEDING_SAVE_SPACE_HINT,
+            ),
+            QuestionOption(
+                value="private", label=words.SEEDING_PRIVATE, hint=words.SEEDING_PRIVATE_HINT
+            ),
+            QuestionOption(value="own", label=words.SEEDING_OWN, hint=words.SEEDING_OWN_HINT),
+        ),
+        default="good_neighbor",
+    ),
+    QuestionField(
+        name="seed_ratio",
+        label=words.SEEDING_RATIO_LABEL,
+        kind="text",
+        hint=words.SEEDING_RATIO_HINT,
+        shown_when="seeding=own",
+    ),
+    QuestionField(
+        name="seed_days",
+        label=words.SEEDING_DAYS_LABEL,
+        kind="text",
+        hint=words.SEEDING_DAYS_HINT,
+        shown_when="seeding=own",
+    ),
+)
+
+SEEDING_STEP = QuestionStep(
+    app_id="qbittorrent",
+    step_id="seeding",
+    title=words.SEEDING_STEP_TITLE,
+    lede=words.SEEDING_STEP_LEDE,
+    fields=_SEEDING_FIELDS,
+    check=_check_seeding_step,
+)
+
+
 # Read only through `question_steps_for`/`find_step`, both of which look up
 # this name from the module's own globals at call time, so a test can
 # monkeypatch `marrquee.questions.QUESTION_STEPS` and have both functions
 # see the replacement. No other module may import this name directly.
-QUESTION_STEPS: tuple[QuestionStep, ...] = (VPN_STEP,)
+QUESTION_STEPS: tuple[QuestionStep, ...] = (VPN_STEP, SEEDING_STEP)
 
 
 def question_steps_for(app_ids: Iterable[str]) -> tuple[QuestionStep, ...]:

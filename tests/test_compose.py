@@ -18,7 +18,9 @@ import pytest
 import yaml
 
 from marrquee import compose, vpn, words
+from marrquee.catalog import get_app
 from marrquee.config import Settings
+from marrquee.qbittorrent import PORT_SYNC_SCRIPT_NAME, QBIT_KEY_SECRET_NAME
 from marrquee.state import STATE_VERSION, InstallState
 
 # Obviously-fake, digit-repeated "keys" - never anything that looks like a
@@ -27,6 +29,7 @@ _PROWLARR_KEY = "1" * 32
 _SONARR_KEY = "2" * 32
 _RADARR_KEY = "3" * 32
 _GLUETUN_KEY = "4" * 32
+_QBIT_KEY = "qbt_" + "5" * 28
 
 
 def _fixture_state(app_ids: tuple[str, ...] = ("prowlarr", "sonarr", "radarr")) -> InstallState:
@@ -35,6 +38,7 @@ def _fixture_state(app_ids: tuple[str, ...] = ("prowlarr", "sonarr", "radarr")) 
         "sonarr": _SONARR_KEY,
         "radarr": _RADARR_KEY,
         "gluetun": _GLUETUN_KEY,
+        "qbittorrent": _QBIT_KEY,
     }
     return InstallState(
         version=STATE_VERSION,
@@ -378,6 +382,96 @@ def test_build_stack_plan_refuses_gluetun_with_no_saved_answers() -> None:
         compose.build_stack_plan(state)  # answers=None -> {} -> nothing saved for gluetun
 
     assert _GLUETUN_KEY not in str(excinfo.value)
+
+
+# --- qBittorrent rides Gluetun's network (name-the-network rule) ------------
+
+
+def test_qbittorrent_rides_gluetuns_network_with_no_port_or_network_of_its_own() -> None:
+    """diverges-from-existing FIRST TEST: qBittorrent shares Gluetun's whole
+    network namespace instead of joining `marrquee` on its own, and Gluetun
+    - not qBittorrent - is the one thing the LAN reaches it through.
+    """
+    state = _fixture_state(("prowlarr", "sonarr", "gluetun", "qbittorrent"))
+    doc = _rendered_doc(state, _gluetun_answers())
+
+    services = _services(doc)
+    qbit = services["qbittorrent"]
+    assert qbit["network_mode"] == "service:gluetun"
+    assert "networks" not in qbit
+    assert "ports" not in qbit
+
+    gluetun = services["gluetun"]
+    assert gluetun["networks"] == ["marrquee"]
+    assert gluetun["ports"] == ["8080:8080"]
+
+
+def test_qbittorrent_without_gluetun_is_refused() -> None:
+    state = _fixture_state(("prowlarr", "sonarr", "qbittorrent"))
+
+    with pytest.raises(ValueError, match="qbittorrent needs gluetun"):
+        compose.build_stack_plan(state)
+
+
+def test_no_qbittorrent_key_or_auth_env_anywhere_in_the_rendered_file() -> None:
+    state = _fixture_state(("prowlarr", "sonarr", "gluetun", "qbittorrent"))
+    plan = compose.build_stack_plan(state, _gluetun_answers())
+    doc = yaml.safe_load(compose.render_compose(plan))
+
+    text = compose.render_compose(plan)
+    assert _QBIT_KEY not in text
+
+    qbit_env = _environment(doc["services"]["qbittorrent"])
+    assert not any("AUTH" in name for name in qbit_env)
+    assert set(qbit_env) == {"PUID", "PGID", "TZ", "UMASK", "WEBUI_PORT"}
+    assert qbit_env["WEBUI_PORT"] == "8080"
+
+
+def test_forwarding_provider_adds_both_port_commands_non_forwarding_adds_none() -> None:
+    """A non-forwarding provider still writes the key and the port-sync
+    script - an owner switching to a forwarding provider later must not
+    need qBittorrent's key regenerated to pick them up.
+    """
+    state = _fixture_state(("gluetun", "qbittorrent"))
+
+    forwarding = compose.gluetun_config_for(
+        get_app("gluetun"), state, _gluetun_answers(provider="protonvpn")
+    )
+    names = [name for name, _ in forwarding.environment]
+    assert names[-2:] == ["VPN_PORT_FORWARDING_UP_COMMAND", "VPN_PORT_FORWARDING_DOWN_COMMAND"]
+    forwarding_env = dict(forwarding.environment)
+    script_path = "/run/secrets/" + PORT_SYNC_SCRIPT_NAME
+    up_command = "/bin/sh " + script_path + " {{PORT}}"
+    down_command = "/bin/sh " + script_path + " 0"
+    assert forwarding_env["VPN_PORT_FORWARDING_UP_COMMAND"] == up_command
+    assert forwarding_env["VPN_PORT_FORWARDING_DOWN_COMMAND"] == down_command
+    assert forwarding.secret_files[QBIT_KEY_SECRET_NAME] == _QBIT_KEY
+    assert PORT_SYNC_SCRIPT_NAME in forwarding.secret_files
+
+    non_forwarding = compose.gluetun_config_for(get_app("gluetun"), state, _gluetun_answers())
+    non_forwarding_names = [name for name, _ in non_forwarding.environment]
+    assert "VPN_PORT_FORWARDING_UP_COMMAND" not in non_forwarding_names
+    assert "VPN_PORT_FORWARDING_DOWN_COMMAND" not in non_forwarding_names
+    assert non_forwarding.secret_files[QBIT_KEY_SECRET_NAME] == _QBIT_KEY
+    assert PORT_SYNC_SCRIPT_NAME in non_forwarding.secret_files
+
+
+def test_gluetun_config_for_writes_neither_qbit_file_when_qbittorrent_is_not_installed() -> None:
+    state = _fixture_state(("gluetun",))
+
+    config = compose.gluetun_config_for(get_app("gluetun"), state, _gluetun_answers())
+
+    assert QBIT_KEY_SECRET_NAME not in config.secret_files
+    assert PORT_SYNC_SCRIPT_NAME not in config.secret_files
+
+
+def test_an_install_without_qbittorrent_renders_gluetun_exactly_as_before() -> None:
+    doc = _rendered_doc(_fixture_state(("prowlarr", "gluetun")), _gluetun_answers())
+
+    gluetun = _services(doc)["gluetun"]
+    assert "network_mode" not in gluetun
+    assert "ports" not in gluetun
+    assert gluetun["networks"] == ["marrquee"]
 
 
 def test_a_state_without_gluetun_renders_byte_identical_to_before() -> None:

@@ -19,6 +19,7 @@ import pytest
 from marrquee import vpn
 from marrquee.compose import clear_vpn_secrets, vpn_secrets_host_path, write_vpn_secrets
 from marrquee.config import Settings
+from marrquee.qbittorrent import PORT_SYNC_SCRIPT_NAME, QBIT_KEY_SECRET_NAME
 from marrquee.storage import PathEscapesRoot
 from marrquee.vpn import (
     CONTROL_ROUTES,
@@ -542,6 +543,73 @@ def test_port_forwarding_is_on_for_protonvpn_and_pia_off_for_nordvpn(
         pgid=1000,
     )
     assert dict(privatevpn_wg.environment)["VPN_PORT_FORWARDING"] == "off"
+
+
+# --- downloader_key: qBittorrent's key and port-sync script, never the compose file --
+
+
+def test_no_downloader_key_means_no_qbit_secret_files() -> None:
+    config = build_gluetun_config(
+        _openvpn_answers("mullvad"), control_key="k", timezone="UTC", puid=1000, pgid=1000
+    )
+
+    assert QBIT_KEY_SECRET_NAME not in config.secret_files
+    assert PORT_SYNC_SCRIPT_NAME not in config.secret_files
+    assert not dict(config.environment).keys() & {
+        "VPN_PORT_FORWARDING_UP_COMMAND",
+        "VPN_PORT_FORWARDING_DOWN_COMMAND",
+    }
+
+
+def test_downloader_key_writes_the_key_and_script_even_without_port_forwarding() -> None:
+    config = build_gluetun_config(
+        _openvpn_answers("mullvad"),  # mullvad never forwards a port
+        control_key="k",
+        timezone="UTC",
+        puid=1000,
+        pgid=1000,
+        downloader_key="qbt_" + "a" * 28,
+    )
+
+    assert config.secret_files[QBIT_KEY_SECRET_NAME] == "qbt_" + "a" * 28
+    assert PORT_SYNC_SCRIPT_NAME in config.secret_files
+    assert "listen_port" in config.secret_files[PORT_SYNC_SCRIPT_NAME]
+    names = [name for name, _ in config.environment]
+    assert "VPN_PORT_FORWARDING_UP_COMMAND" not in names
+    assert "VPN_PORT_FORWARDING_DOWN_COMMAND" not in names
+
+
+def test_downloader_key_with_forwarding_appends_both_commands_last() -> None:
+    config = build_gluetun_config(
+        _openvpn_answers("protonvpn"),
+        control_key="k",
+        timezone="UTC",
+        puid=1000,
+        pgid=1000,
+        downloader_key="qbt_" + "b" * 28,
+    )
+
+    names = [name for name, _ in config.environment]
+    assert names[-2:] == ["VPN_PORT_FORWARDING_UP_COMMAND", "VPN_PORT_FORWARDING_DOWN_COMMAND"]
+    env = dict(config.environment)
+    script_path = "/run/secrets/" + PORT_SYNC_SCRIPT_NAME
+    assert env["VPN_PORT_FORWARDING_UP_COMMAND"] == "/bin/sh " + script_path + " {{PORT}}"
+    assert env["VPN_PORT_FORWARDING_DOWN_COMMAND"] == "/bin/sh " + script_path + " 0"
+
+
+def test_downloader_key_never_appears_in_the_environment_only_in_secret_files() -> None:
+    key = "qbt_" + "c" * 28
+    config = build_gluetun_config(
+        _openvpn_answers("mullvad"),
+        control_key="k",
+        timezone="UTC",
+        puid=1000,
+        pgid=1000,
+        downloader_key=key,
+    )
+
+    values = [value for _, value in config.environment]
+    assert key not in values
 
 
 def test_protonvpn_openvpn_gets_pmp_in_the_secret_file_but_not_the_saved_answer() -> None:

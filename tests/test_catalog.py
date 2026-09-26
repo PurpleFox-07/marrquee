@@ -16,27 +16,34 @@ from marrquee.catalog import (
     CATALOG,
     AppRule,
     CatalogApp,
+    app_host,
     apps_in_order,
+    companions_for,
     get_app,
+    riders_of,
     unavailable_reason,
 )
-from marrquee.words import PROWLARR_DESCRIPTION, RADARR_DESCRIPTION, SONARR_DESCRIPTION
+from marrquee.words import (
+    PROWLARR_DESCRIPTION,
+    QBITTORRENT_DESCRIPTION,
+    RADARR_DESCRIPTION,
+    SONARR_DESCRIPTION,
+)
 
 
-def test_catalog_holds_the_three_arr_apps_and_gluetun_in_deploy_order() -> None:
+def test_catalog_holds_the_three_arr_apps_gluetun_and_qbittorrent_in_deploy_order() -> None:
     ids = [app.id for app in CATALOG]
 
-    assert ids == ["prowlarr", "sonarr", "radarr", "gluetun"]
+    assert ids == ["prowlarr", "sonarr", "radarr", "gluetun", "qbittorrent"]
     orders = [app.order for app in CATALOG]
     assert orders == sorted(orders)
-    assert "qbittorrent" not in ids
 
 
 def test_the_three_arr_apps_are_unchanged_in_value() -> None:
     """Every arr catalog entry keeps its old values - the new fields only
     ever change behaviour when a caller sets them explicitly.
     """
-    arr_apps = [app for app in CATALOG if app.id != "gluetun"]
+    arr_apps = [app for app in CATALOG if app.kind == "arr"]
     assert len(arr_apps) == 3
     for app in arr_apps:
         assert app.default_ticked is True
@@ -44,6 +51,8 @@ def test_the_three_arr_apps_are_unchanged_in_value() -> None:
         assert app.rules == ()
         assert app.kind == "arr"
         assert app.offered is True
+        assert app.api_key_style == "hex32"
+        assert app.network_via is None
 
 
 def test_gluetun_is_a_vpn_app_never_offered_and_not_ticked_by_default() -> None:
@@ -61,10 +70,16 @@ def test_gluetun_is_a_vpn_app_never_offered_and_not_ticked_by_default() -> None:
     assert gluetun.needs_data_mount is False
 
 
-def test_the_three_arr_apps_take_the_login_and_gluetun_takes_none() -> None:
+def test_the_three_arr_apps_take_the_login_gluetun_takes_none_qbittorrent_its_own() -> None:
     kinds = {app.id: app.login_kind for app in CATALOG}
 
-    assert kinds == {"prowlarr": "arr", "sonarr": "arr", "radarr": "arr", "gluetun": "none"}
+    assert kinds == {
+        "prowlarr": "arr",
+        "sonarr": "arr",
+        "radarr": "arr",
+        "gluetun": "none",
+        "qbittorrent": "qbittorrent",
+    }
 
 
 def test_login_kind_default_is_none_the_fail_safe_value() -> None:
@@ -213,3 +228,46 @@ def test_apps_in_order_only_returns_the_requested_ids() -> None:
     result = apps_in_order(["radarr"])
 
     assert [app.id for app in result] == ["radarr"]
+
+
+# --- qBittorrent: the catalog entry, and its network-sharing helpers --------
+
+
+def test_qbittorrent_sits_after_gluetun_and_rides_its_network() -> None:
+    qbittorrent = get_app("qbittorrent")
+
+    ids = [app.id for app in CATALOG]
+    assert ids.index("qbittorrent") == ids.index("gluetun") + 1
+    assert qbittorrent.network_via == "gluetun"
+    assert qbittorrent.kind == "downloader"
+    assert qbittorrent.image == "lscr.io/linuxserver/qbittorrent:5.2.3"
+    assert qbittorrent.port == 8080
+    assert qbittorrent.api_base == "api/v2"
+    assert qbittorrent.media_folders == ()
+    assert qbittorrent.needs_data_mount is True
+    assert qbittorrent.default_ticked is False
+    assert qbittorrent.web_page is True
+    assert qbittorrent.offered is True
+    assert qbittorrent.login_kind == "qbittorrent"
+    assert qbittorrent.api_key_style == "qbt"
+    assert qbittorrent.rules == ()
+    assert qbittorrent.description == QBITTORRENT_DESCRIPTION
+
+
+def test_app_host_is_network_via_when_set_else_the_apps_own_id() -> None:
+    assert app_host(get_app("qbittorrent")) == "gluetun"
+    assert app_host(get_app("sonarr")) == "sonarr"
+    assert app_host(get_app("gluetun")) == "gluetun"
+
+
+def test_companions_for_adds_gluetun_only_when_it_is_missing() -> None:
+    assert companions_for("qbittorrent", ()) == ("gluetun",)
+    assert companions_for("qbittorrent", ("sonarr",)) == ("gluetun",)
+    assert companions_for("qbittorrent", ("gluetun", "sonarr")) == ()
+    assert companions_for("sonarr", ()) == ()
+
+
+def test_riders_of_returns_present_apps_that_ride_the_given_network_in_catalog_order() -> None:
+    assert riders_of("gluetun", ("qbittorrent", "sonarr", "gluetun")) == (get_app("qbittorrent"),)
+    assert riders_of("gluetun", ("sonarr", "radarr")) == ()
+    assert riders_of("qbittorrent", ("qbittorrent", "sonarr")) == ()

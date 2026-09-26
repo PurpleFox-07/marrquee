@@ -16,6 +16,7 @@ never look Up on the page and Down on the live poll.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Literal
 
@@ -27,7 +28,7 @@ from starlette.datastructures import FormData
 from marrquee import words
 from marrquee.addresses import authority_from_headers, proxy_suspected
 from marrquee.config import Settings
-from marrquee.deploy import DeployManager
+from marrquee.deploy import DeployManager, DeploySnapshot
 from marrquee.docker_client import DockerEngine
 from marrquee.health import LinkProbe, read_health, read_link_health
 from marrquee.hub import (
@@ -37,6 +38,7 @@ from marrquee.hub import (
     HubPanel,
     HubView,
     LoginFormState,
+    SeedingFormState,
     hub_panel,
     hub_view,
     login_view,
@@ -60,7 +62,7 @@ from marrquee.login import (
     password_matches,
     save_login,
 )
-from marrquee.questions import check_step
+from marrquee.questions import SEEDING_STEP, check_step, load_answers, save_step_answers
 from marrquee.state import load_state
 from marrquee.vpn import TunnelPlace
 from marrquee.vpn_control import GluetunControl
@@ -162,13 +164,23 @@ async def get_hub(request: Request) -> Response:
         return RedirectResponse("/setup/apps", status_code=303)
 
     manager: DeployManager = request.app.state.deploy
-    if manager.snapshot().phase != "finale":
+    snapshot = manager.snapshot()
+    if snapshot.phase != "finale":
         return RedirectResponse("/deploy", status_code=303)
 
     view = await read_hub_view(request)
     links = load_links(settings.config_dir)
     panel = hub_panel(request.query_params.get("panel"), request.query_params.get("link"), links)
+    if panel.mode == "seeding" and not _qbittorrent_installed(snapshot):
+        # `hub_panel` never sees the deploy snapshot - it only knows the
+        # query string asked for the seeding pane, not whether qBittorrent
+        # is actually there to change anything about.
+        panel = hub_panel(None, None, links)
     return _hub_response(request, view, panel)
+
+
+def _qbittorrent_installed(snapshot: DeploySnapshot) -> bool:
+    return any(progress.app_id == "qbittorrent" for progress in snapshot.apps)
 
 
 def _hub_response(
@@ -179,7 +191,9 @@ def _hub_response(
     status_code: int = 200,
     login_form: LoginFormState | None = None,
     change_form: LoginFormState | None = None,
+    seeding_form: SeedingFormState | None = None,
 ) -> Response:
+    settings: Settings = request.app.state.settings
     templates: Jinja2Templates = request.app.state.templates
     # The choose banner and the reset banner ask the same three questions
     # through the same `check_step` - only the step's title/lede change, so
@@ -187,6 +201,12 @@ def _hub_response(
     login_step = (
         LOGIN_RESET_STEP if view.login is not None and view.login.banner == "reset" else LOGIN_STEP
     )
+    if seeding_form is None:
+        # A plain open (no post behind it) prefills the pane from whatever's
+        # already saved - the same answer `seeding_preferences` would fall
+        # back to reading on the next wiring run.
+        saved = load_answers(settings.config_dir).get("qbittorrent", {})
+        seeding_form = SeedingFormState(answers=saved, problem=None, problem_field=None)
     context = {
         "view": view,
         "words": words,
@@ -197,6 +217,8 @@ def _hub_response(
         "change_form": change_form,
         "login_step": login_step,
         "change_step": CHANGE_STEP,
+        "seeding_step": SEEDING_STEP,
+        "seeding_form": seeding_form,
         "login_help_url": LOGIN_HELP_URL,
     }
     return templates.TemplateResponse(request, "hub.html", context, status_code=status_code)
@@ -423,6 +445,70 @@ async def post_hub_login_retry(request: Request) -> Response:
     record = load_login(settings.config_dir)
     if login_status(record, settings.reset_login) == "set" and not manager.is_busy():
         manager.apply_login()
+    return RedirectResponse("/", status_code=303)
+
+
+# --- qBittorrent's own seeding answer, changed straight from the Hub --------
+
+
+async def _seeding_refusal(
+    request: Request, *, answers: Mapping[str, str], problem: str, problem_field: str | None
+) -> Response:
+    """Re-render the live Hub with the panel forced open on the seeding pane
+    - a refusal or a busy re-render always comes from that pane, whatever
+    `?panel=` the request itself carried, and nothing is ever saved on this
+    path.
+    """
+    view = await read_hub_view(request)
+    seeding_form = SeedingFormState(answers=answers, problem=problem, problem_field=problem_field)
+    panel = HubPanel(mode="seeding", edit=None, label="", url="", error=None)
+    return _hub_response(request, view, panel, seeding_form=seeding_form)
+
+
+@router.post("/hub/seeding", response_class=HTMLResponse)
+async def post_hub_seeding(request: Request) -> Response:
+    """Change how long qBittorrent keeps sharing - the same question the
+    "+" panel already asks, answered again and re-applied everywhere the
+    first answer was: `reconnect("qbittorrent")` re-runs qBittorrent's own
+    settings step and both partners' download-client steps, so one saved
+    answer is the one path that changes seeding anywhere at all.
+    """
+    form = await request.form()
+    settings: Settings = request.app.state.settings
+    manager: DeployManager = request.app.state.deploy
+
+    snapshot = manager.snapshot()
+    if not _qbittorrent_installed(snapshot):
+        return RedirectResponse("/", status_code=303)
+
+    posted = {field.name: _form_value(form, field.name) for field in SEEDING_STEP.fields}
+
+    if manager.is_busy() or snapshot.adding is not None:
+        return await _seeding_refusal(
+            request, answers=posted, problem=words.HUB_SEEDING_BUSY, problem_field=None
+        )
+
+    saved = load_answers(settings.config_dir).get("qbittorrent", {})
+    check = check_step(SEEDING_STEP, posted, saved)
+    if not check.ok:
+        return await _seeding_refusal(
+            request,
+            answers=check.answers,
+            problem=check.problem or "",
+            problem_field=check.field,
+        )
+
+    result = manager.reconnect("qbittorrent")
+    if result != "started":
+        return await _seeding_refusal(
+            request, answers=check.answers, problem=words.HUB_SEEDING_BUSY, problem_field=None
+        )
+
+    # Saved right after `reconnect` starts, before this handler's next
+    # `await` - the run only reads `answers.json` once it actually begins,
+    # so the choice it applies is always this one, never a stale one still
+    # on disk when the run was scheduled.
+    save_step_answers(settings.config_dir, "qbittorrent", check.answers)
     return RedirectResponse("/", status_code=303)
 
 

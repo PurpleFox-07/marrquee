@@ -72,6 +72,7 @@ from marrquee.main import create_app
 from marrquee.state import InstallState, save_state, write_json_atomic
 from marrquee.wiring import WiringStep
 from marrquee.wiring.engine import plan_wiring
+from marrquee.wiring.qbit_client import FakeQbitClient
 from marrquee.words import (
     STATUS_CHIP_DONE,
     WIRING_CHIP_DONE,
@@ -369,7 +370,7 @@ def build_app(
             DockerStatus(connected=True),
             containers=_hub_containers(down_radarr=scene == "hub-stopped"),
         )
-        return create_app(settings, hub_engine)
+        return create_app(settings, hub_engine, qbit_client=FakeQbitClient({}))
 
     engine = _DemoDockerEngine(DockerStatus(connected=True))
     manager = _DemoDeployManager(
@@ -380,6 +381,7 @@ def build_app(
         sleep=sleep,
         wiring=_DemoWiringRunner(scene=scene, sleep=sleep),
         login=FakeLoginApplier(),
+        qbit=FakeQbitClient({}),
     )
     return create_app(settings, engine, manager=manager)
 

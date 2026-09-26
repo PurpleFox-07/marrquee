@@ -32,6 +32,7 @@ from marrquee.login import SavedLogin, load_login, pending_app_ids, save_login
 from marrquee.login_apply import FakeLoginApplier, LoginApplier, LoginApplyResult
 from marrquee.questions import save_step_answers
 from marrquee.state import InstallState, save_state, write_json_atomic
+from marrquee.wiring.qbit_client import FakeQbitClient, HttpQbitClient, QbitClient
 
 # --- Small builders shared by every test below --------------------------------
 
@@ -92,6 +93,7 @@ def _already_finale_manager(
     *,
     login_applier: LoginApplier,
     probe: FakeReadinessProbe | None = None,
+    qbit: QbitClient | None = None,
 ) -> tuple[DeployManager, FakeDockerEngine, Path]:
     """A manager whose `deploy.json` already says `finale` for `app_ids`,
     each with a `FakeDockerEngine`-modelled running container - the Hub's own
@@ -120,6 +122,7 @@ def _already_finale_manager(
         engine,
         probe=probe if probe is not None else FakeReadinessProbe(default=True),
         login=login_applier,
+        qbit=qbit if qbit is not None else HttpQbitClient(),
     )
     assert manager.snapshot().phase == "finale"
     return manager, engine, settings.config_dir
@@ -250,6 +253,35 @@ async def test_login_run_switches_only_the_apps_that_accepted(tmp_path: Path) ->
     record = load_login(config_dir)
     assert record.applied == {"prowlarr": saved.generation, "radarr": saved.generation}
     assert pending_app_ids(record, app_ids) == ("sonarr",)
+
+
+async def test_login_run_applies_qbittorrent_through_the_key_and_never_recreates_it(
+    tmp_path: Path,
+) -> None:
+    """qBittorrent's login is live the moment phase 1's POST succeeds - it
+    must be recorded `applied` right away, and never sit in phase 2's
+    recreate loop (that loop is `login_kind == "arr"` only), since
+    recreating it would also orphan whatever rides Gluetun's network for
+    no reason at all.
+    """
+    app_ids = ("prowlarr", "gluetun", "qbittorrent")
+    manager, engine, config_dir = _already_finale_manager(
+        tmp_path,
+        app_ids,
+        login_applier=FakeLoginApplier(),
+        qbit=FakeQbitClient({}),
+    )
+    save_step_answers(config_dir, "gluetun", _GLUETUN_ANSWERS)
+    saved = save_login(config_dir, "owner", "s3cret-password-1", honor_reset=None)
+
+    assert manager.apply_login() == "started"
+    await _finish_login(manager)
+
+    recreate_calls = [call[1][2] for call in engine.calls if call[0] == "compose_up_recreate"]
+    assert recreate_calls == ["prowlarr"]
+
+    record = load_login(config_dir)
+    assert record.applied == {"prowlarr": saved.generation, "qbittorrent": saved.generation}
 
 
 async def test_login_run_threads_saved_vpn_answers_into_the_stack_plan(tmp_path: Path) -> None:

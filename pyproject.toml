@@ -69,4 +69,5 @@ extend-immutable-calls = [
     "marrquee.wiring.NoWiringYet",
     "marrquee.login_apply.NoLoginApplier",
     "marrquee.vpn_control.NoGluetunControl",
+    "marrquee.wiring.qbit_client.HttpQbitClient",
 ]

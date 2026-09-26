@@ -970,7 +970,41 @@ jobs:
             echo "::error::the runner itself could not reach 1.1.1.1 - the kill-switch control case is invalid"
             exit 1
           fi
-          if docker run --rm --network container:gluetun alpine:3.20 wget -q -T 5 -O /dev/null http://1.1.1.1; then
+
+          # A positive control through the SAME namespace the real check
+          # below is judged in: Gluetun's own control server, on loopback,
+          # is never subject to Gluetun's own firewall, so it must always
+          # answer - proving `--network container:gluetun` really did join
+          # Gluetun's namespace before a "couldn't reach 1.1.1.1" result is
+          # trusted to mean the kill switch. `docker run` itself failing to
+          # join that namespace is Docker's own 125+ exit convention,
+          # judged separately from busybox wget's own exit codes below.
+          docker run --rm --network container:gluetun alpine:3.20 \
+            wget -q -T 5 -S -O /dev/null http://127.0.0.1:8000/v1/vpn/status \
+            > "$RUNNER_TEMP/kill_switch_positive_control.log" 2>&1
+          control_exit=$?
+          if [ "$control_exit" -ge 125 ]; then
+            echo "::error::the kill-switch check could not run (docker exit ${control_exit})"
+            cat "$RUNNER_TEMP/kill_switch_positive_control.log"
+            exit 1
+          fi
+          if ! grep -qE "HTTP/[0-9.]+ [0-9]+" "$RUNNER_TEMP/kill_switch_positive_control.log"; then
+            echo "::error::the kill-switch check's positive control got no HTTP response through Gluetun's shared network namespace - the probe or the namespace itself is broken, not the VPN"
+            cat "$RUNNER_TEMP/kill_switch_positive_control.log"
+            exit 1
+          fi
+
+          # The real check: judged by exit code, never by `if cmd; then`
+          # truthiness, so `docker run` itself failing (can't join the
+          # namespace) can never read the same as "blocked by the
+          # firewall" - the bug this whole block hardens against.
+          docker run --rm --network container:gluetun alpine:3.20 wget -q -T 5 -O /dev/null http://1.1.1.1
+          real_exit=$?
+          if [ "$real_exit" -ge 125 ]; then
+            echo "::error::the kill-switch check could not run (docker exit ${real_exit})"
+            exit 1
+          fi
+          if [ "$real_exit" -eq 0 ]; then
             echo "::error::Traffic left through the kill switch"
             exit 1
           fi
@@ -1020,6 +1054,383 @@ jobs:
               exit 1
             fi
           done <<< "$files"
+
+      # qBittorrent's own add path always brings up Gluetun behind a PROVEN
+      # tunnel first - Gluetun's fake login above never gets there. This
+      # block is Marrquee's own bring-up and wiring code, exercised
+      # directly against the failed-add Gluetun already running here, so
+      # the pieces a Mac reading source can't settle (the real image
+      # reading the pre-written key, the real one-login POST, a real
+      # Sonarr's own connection test) still get proven on a real daemon.
+      - name: Assert Gluetun is still running before qBittorrent joins its network
+        run: |
+          running=false
+          for _ in $(seq 1 30); do
+            state=$(docker inspect -f '{{.State.Running}}' gluetun 2>/dev/null || echo "false")
+            if [ "$state" = "true" ]; then
+              running=true
+              break
+            fi
+            sleep 2
+          done
+          if [ "$running" != "true" ]; then
+            echo "::error::Gluetun's container was not running before qBittorrent joined its network - the checks below would run against a network that isn't really shared"
+            exit 1
+          fi
+
+      # `with_app_added` and `write_qbit_conf` run entirely in memory and
+      # against qBittorrent's own config folder - `install.json` on disk is
+      # never touched, so this developer-only compose file never becomes
+      # part of the real install. The key itself never reaches stdout,
+      # only its length; later steps read it back straight off
+      # `/config/ci-qbit-key.json`, over their own `docker exec`, the same
+      # root-only-file pattern the VPN secrets already use.
+      - name: qBittorrent inside the VPN's network (developer test)
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/ci_qbit_bring_up.py" <<'PY'
+          import json
+          from pathlib import Path, PurePosixPath
+
+          from marrquee.compose import build_stack_plan, render_compose
+          from marrquee.config import Settings
+          from marrquee.install import with_app_added
+          from marrquee.qbittorrent import write_qbit_conf
+          from marrquee.questions import load_answers
+          from marrquee.state import load_state
+
+          settings = Settings.from_env()
+          state = load_state(settings.config_dir)
+          if state is None:
+              raise SystemExit("no install.json to grow")
+          answers = load_answers(settings.config_dir)
+
+          grown = with_app_added(state, "qbittorrent")
+          api_key = grown.api_keys["qbittorrent"]
+
+          write_qbit_conf(
+              settings, PurePosixPath(state.storage_root), api_key, grown.puid, grown.pgid
+          )
+
+          plan = build_stack_plan(grown, answers)
+          Path("/config/ci-qbit-compose.yaml").write_text(render_compose(plan))
+          Path("/config/ci-qbit-key.json").write_text(json.dumps({"qbittorrent": api_key}))
+          print(f"qbittorrent key length: {len(api_key)}")
+          PY
+
+          docker cp "$RUNNER_TEMP/ci_qbit_bring_up.py" marrquee-stack-smoke:/tmp/ci_qbit_bring_up.py
+          docker exec marrquee-stack-smoke python /tmp/ci_qbit_bring_up.py
+
+          docker cp marrquee-stack-smoke:/config/ci-qbit-compose.yaml "$RUNNER_TEMP/ci-qbit-compose.yaml"
+          if ! docker compose -p marrquee-apps -f "$RUNNER_TEMP/ci-qbit-compose.yaml" up -d --no-recreate qbittorrent; then
+            echo "::error::docker compose up -d --no-recreate qbittorrent failed"
+            exit 1
+          fi
+
+          network_mode=$(docker inspect -f '{{.HostConfig.NetworkMode}}' qbittorrent)
+          echo "qbittorrent network mode: $network_mode"
+          if [[ "$network_mode" != container:* ]]; then
+            echo "::error::qBittorrent is not inside the VPN's network"
+            exit 1
+          fi
+
+          running=false
+          for _ in $(seq 1 30); do
+            state=$(docker inspect -f '{{.State.Running}}' qbittorrent 2>/dev/null || echo "false")
+            if [ "$state" = "true" ]; then
+              running=true
+              break
+            fi
+            sleep 2
+          done
+          if [ "$running" != "true" ]; then
+            echo "::error::qBittorrent's container never reached Running before the checks below drove Marrquee against it"
+            exit 1
+          fi
+
+      # qBittorrent's WebUI can take a few seconds to bind after the
+      # container reports Running, so this polls rather than asserting a
+      # single request - the same shape every other readiness wait in this
+      # job already uses.
+      - name: qBittorrent takes Marrquee's key
+        run: |
+          cat > "$RUNNER_TEMP/ci_qbit_key_check.py" <<'PY'
+          import asyncio
+          import json
+          from pathlib import Path
+
+          from marrquee.wiring.qbit_client import HttpQbitClient
+
+          _BASE_URL = "http://gluetun:8080"
+          _PATH = "api/v2/app/version"
+
+
+          async def main() -> None:
+              api_key = json.loads(Path("/config/ci-qbit-key.json").read_text())["qbittorrent"]
+              client = HttpQbitClient()
+
+              status = 0
+              for _ in range(60):
+                  response = await client.request("GET", _BASE_URL, _PATH, api_key)
+                  status = response.status
+                  if status == 200:
+                      break
+                  await asyncio.sleep(2)
+              if status != 200:
+                  raise SystemExit(f"key: expected 200 within 2 minutes, last status was {status}")
+
+              # Same shape, guaranteed different: the real key's own alphabet
+              # never includes "0" (`apikey.cpp`'s ambiguity-free set).
+              wrong_key = "qbt_" + "0" * 28
+              wrong = await client.request("GET", _BASE_URL, _PATH, wrong_key)
+              if wrong.status not in (401, 403):
+                  raise SystemExit(f"wrong key: expected 401 or 403, got {wrong.status}")
+
+
+          asyncio.run(main())
+          PY
+
+          docker cp "$RUNNER_TEMP/ci_qbit_key_check.py" marrquee-stack-smoke:/tmp/ci_qbit_key_check.py
+          if ! output=$(docker exec marrquee-stack-smoke python /tmp/ci_qbit_key_check.py 2>&1); then
+            echo "$output"
+            MESSAGE="qBittorrent's key check failed: ${output}" \
+              python3 -c "import os; text = os.environ['MESSAGE'][:500].replace('%', '%25').replace(chr(13), '%0D').replace(chr(10), '%0A').replace('::', ': :'); print('::error::' + text)"
+            exit 1
+          fi
+          echo "$output"
+
+      # Reuses the same throwaway login every arr app in this job already
+      # took - qBittorrent gets it through its key instead of a cookie
+      # session, never its own old password. The password only ever
+      # appears inside `docker exec -e`, never printed.
+      - name: qBittorrent takes the one login
+        run: |
+          cat > "$RUNNER_TEMP/ci_qbit_login_check.py" <<'PY'
+          import asyncio
+          import dataclasses
+          import json
+          import os
+          from pathlib import Path
+
+          import httpx
+
+          from marrquee.catalog import get_app
+          from marrquee.config import Settings
+          from marrquee.install import with_app_added
+          from marrquee.login import SavedLogin
+          from marrquee.login_apply import HttpLoginApplier
+          from marrquee.state import load_state
+
+
+          def _grown_with_key(state, api_key):
+              seeded = dataclasses.replace(
+                  state, api_keys={**state.api_keys, "qbittorrent": api_key}
+              )
+              return with_app_added(seeded, "qbittorrent")
+
+
+          async def main() -> None:
+              settings = Settings.from_env()
+              state = load_state(settings.config_dir)
+              if state is None:
+                  raise SystemExit("no install.json to read")
+              api_key = json.loads(Path("/config/ci-qbit-key.json").read_text())["qbittorrent"]
+              grown = _grown_with_key(state, api_key)
+
+              password = os.environ["MARRQUEE_CI_PASSWORD"]
+              login = SavedLogin("marrquee-ci", 1, password)
+              result = await HttpLoginApplier().apply(get_app("qbittorrent"), grown, login)
+              if not result.ok:
+                  raise SystemExit(f"HttpLoginApplier did not apply the login: {result.technical}")
+
+              async with httpx.AsyncClient(timeout=10.0) as client:
+                  good = await client.post(
+                      "http://gluetun:8080/api/v2/auth/login",
+                      data={"username": "marrquee-ci", "password": password},
+                  )
+                  if good.text != "Ok.":
+                      raise SystemExit("the right password did not log in")
+
+                  bad = await client.post(
+                      "http://gluetun:8080/api/v2/auth/login",
+                      data={"username": "marrquee-ci", "password": "definitely-the-wrong-password"},
+                  )
+                  if bad.text == "Ok.":
+                      raise SystemExit("a wrong password still logged in")
+
+
+          asyncio.run(main())
+          PY
+
+          docker cp "$RUNNER_TEMP/ci_qbit_login_check.py" marrquee-stack-smoke:/tmp/ci_qbit_login_check.py
+          if ! output=$(docker exec -e MARRQUEE_CI_PASSWORD="$MARRQUEE_CI_PASSWORD" marrquee-stack-smoke python /tmp/ci_qbit_login_check.py 2>&1); then
+            echo "$output"
+            MESSAGE="qBittorrent's one-login check failed: ${output}" \
+              python3 -c "import os; text = os.environ['MESSAGE'][:500].replace('%', '%25').replace(chr(13), '%0D').replace(chr(10), '%0A').replace('::', ': :'); print('::error::' + text)"
+            exit 1
+          fi
+          echo "$output"
+
+      # The one proof reading source can't settle for this story: Sonarr's
+      # own POST runs its own live connection test against qBittorrent
+      # before it ever saves the client, so a 201 here means Sonarr really
+      # did reach qBittorrent through Gluetun's network, key and all,
+      # while the tunnel itself is still down.
+      - name: Sonarr connects to qBittorrent with the key while the tunnel is down
+        run: |
+          set -euo pipefail
+          compose_file="$RUNNER_TEMP/marrquee-smoke/media/marrquee/compose.yaml"
+          sonarr_key=$(grep -E '^\s*SONARR__AUTH__APIKEY:' "$compose_file" | sed -E 's/.*: *"([^"]+)".*/\1/')
+          if [ -z "$sonarr_key" ]; then
+            echo "::error::could not read Sonarr's API key out of the compose file"
+            exit 1
+          fi
+
+          cat > "$RUNNER_TEMP/ci_qbit_wiring_check.py" <<'PY'
+          import asyncio
+          import json
+          import os
+          from pathlib import Path
+
+          from marrquee.catalog import get_app
+          from marrquee.wiring.arr_client import HttpArrClient
+          from marrquee.wiring.qbit_client import HttpQbitClient
+          from marrquee.wiring.steps import ensure_download_client, ensure_qbit_category
+
+
+          async def main() -> None:
+              qbit_key = json.loads(Path("/config/ci-qbit-key.json").read_text())["qbittorrent"]
+              sonarr_key = os.environ["SONARR_API_KEY"]
+
+              qbit = HttpQbitClient()
+              arr = HttpArrClient()
+              qbittorrent = get_app("qbittorrent")
+              sonarr = get_app("sonarr")
+
+              category = await ensure_qbit_category(
+                  qbit, qbittorrent, qbit_key, media_folder="tv", save_path="/data/torrents/tv"
+              )
+              if category.state != "done":
+                  raise SystemExit(f"ensure_qbit_category did not finish: {category}")
+
+              client_result = await ensure_download_client(
+                  arr,
+                  sonarr,
+                  sonarr_key,
+                  qbittorrent,
+                  qbit_key,
+                  category_field="tvCategory",
+                  category="tv",
+              )
+              if client_result.state != "done":
+                  raise SystemExit(f"ensure_download_client did not finish: {client_result}")
+
+
+          asyncio.run(main())
+          PY
+
+          docker cp "$RUNNER_TEMP/ci_qbit_wiring_check.py" marrquee-stack-smoke:/tmp/ci_qbit_wiring_check.py
+          if ! output=$(docker exec -e SONARR_API_KEY="$sonarr_key" marrquee-stack-smoke python /tmp/ci_qbit_wiring_check.py 2>&1); then
+            echo "$output"
+            MESSAGE="Sonarr never connected to qBittorrent: ${output}" \
+              python3 -c "import os; text = os.environ['MESSAGE'][:500].replace('%', '%25').replace(chr(13), '%0D').replace(chr(10), '%0A').replace('::', ': :'); print('::error::' + text)"
+            exit 1
+          fi
+          echo "$output"
+
+          response=$(curl -fsS -H "X-Api-Key: ${sonarr_key}" http://127.0.0.1:8989/api/v3/downloadclient)
+          if ! echo "$response" | jq -e '[.[] | select(.implementation == "QBittorrent")] | length == 1' > /dev/null; then
+            echo "::error::Sonarr's downloadclient list has no QBittorrent entry"
+            exit 1
+          fi
+          if ! echo "$response" \
+            | jq -e '[.[] | select(.implementation == "QBittorrent")][0].fields[] | select(.name == "host") | .value == "gluetun"' \
+            > /dev/null
+          then
+            echo "::error::Sonarr's qBittorrent client does not point at gluetun"
+            exit 1
+          fi
+          if ! echo "$response" \
+            | jq -e '[.[] | select(.implementation == "QBittorrent")][0].removeCompletedDownloads == true' \
+            > /dev/null
+          then
+            echo "::error::Sonarr's qBittorrent client does not remove completed downloads"
+            exit 1
+          fi
+
+      # The control case this job already proved with alpine: a container
+      # sharing Gluetun's network namespace cannot reach the open internet
+      # while the tunnel is down. qBittorrent is that same namespace,
+      # proven directly this time rather than by a stand-in image.
+      # A missing probe tool, a stopped container or `docker exec` itself
+      # failing must never read as "the kill switch held" - each is judged
+      # by its own captured exit code rather than an `if cmd; then`
+      # truthiness test, and a positive control through the SAME shared
+      # namespace (Gluetun's own control server, on loopback - never
+      # subject to Gluetun's own firewall) proves the probe tool and the
+      # namespace both work before a "couldn't connect" result below is
+      # trusted to mean anything.
+      - name: The downloader can't reach the internet
+        run: |
+          tool=""
+          if docker exec qbittorrent sh -c 'command -v curl' > /dev/null 2>&1; then
+            tool="curl"
+          elif docker exec qbittorrent sh -c 'command -v wget' > /dev/null 2>&1; then
+            tool="wget"
+          else
+            echo "::error::curl is not available in the qBittorrent container - the kill-switch check cannot run"
+            exit 1
+          fi
+          echo "kill-switch probe tool: $tool"
+
+          if [ "$tool" = "curl" ]; then
+            control_code=$(docker exec qbittorrent curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/v1/vpn/status)
+            echo "positive control status: $control_code"
+            if [ -z "$control_code" ] || [ "$control_code" = "000" ]; then
+              echo "::error::the kill-switch check's positive control got no HTTP response through qBittorrent's shared network namespace - the probe tool or the namespace itself is broken, not the VPN"
+              exit 1
+            fi
+          else
+            docker exec qbittorrent wget -q -T 5 -S -O /dev/null http://127.0.0.1:8000/v1/vpn/status \
+              > "$RUNNER_TEMP/qbit_kill_switch_control.log" 2>&1 || true
+            if ! grep -qE "HTTP/[0-9.]+ [0-9]+" "$RUNNER_TEMP/qbit_kill_switch_control.log"; then
+              echo "::error::the kill-switch check's positive control got no HTTP response through qBittorrent's shared network namespace - the probe tool or the namespace itself is broken, not the VPN"
+              cat "$RUNNER_TEMP/qbit_kill_switch_control.log"
+              exit 1
+            fi
+          fi
+
+          if [ "$tool" = "curl" ]; then
+            docker exec qbittorrent curl -s -m 5 -o /dev/null http://1.1.1.1
+            real_exit=$?
+            case "$real_exit" in
+              7|28) echo "kill switch held (curl exit ${real_exit})" ;;
+              0) echo "::error::qBittorrent reached the internet outside the VPN"; exit 1 ;;
+              *) echo "::error::the kill-switch check failed for an unrelated reason (curl exit ${real_exit})"; exit 1 ;;
+            esac
+          else
+            docker exec qbittorrent wget -q -T 5 -O /dev/null http://1.1.1.1 2>"$RUNNER_TEMP/qbit_kill_switch_real.log"
+            real_exit=$?
+            if [ "$real_exit" -eq 0 ]; then
+              echo "::error::qBittorrent reached the internet outside the VPN"
+              exit 1
+            fi
+            if [ "$real_exit" -eq 1 ] \
+              && grep -qiE "connection refused|timed out|network unreachable|can't connect|no route to host" "$RUNNER_TEMP/qbit_kill_switch_real.log"
+            then
+              echo "kill switch held (wget exit ${real_exit})"
+            else
+              echo "::error::the kill-switch check failed for an unrelated reason (wget exit ${real_exit})"
+              cat "$RUNNER_TEMP/qbit_kill_switch_real.log"
+              exit 1
+            fi
+          fi
+
+      # qBittorrent shares Gluetun's network namespace, so it has to leave
+      # before Gluetun's own container does - otherwise Gluetun's removal
+      # below would either fail or leave qBittorrent's namespace dangling.
+      - name: Remove qBittorrent ahead of Gluetun's own teardown
+        run: docker rm -f qbittorrent
 
       - name: Cancel the VPN add
         run: |
@@ -1078,7 +1489,7 @@ jobs:
       - name: Clean up every container, network and temp folder this job made
         if: always()
         run: |
-          docker rm -f prowlarr sonarr radarr gluetun marrquee-stack-smoke 2>/dev/null || true
+          docker rm -f prowlarr sonarr radarr gluetun qbittorrent marrquee-stack-smoke 2>/dev/null || true
           docker network rm marrquee 2>/dev/null || true
           # Some of what's under here (a container's own /config contents)
           # can be created by the Docker daemon as root, which would block a
