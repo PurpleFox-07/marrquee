@@ -19,6 +19,7 @@ import marrquee.questions as questions_module
 from marrquee import words
 from marrquee.catalog import CATALOG, AppRule
 from marrquee.deploy import AppAdd, Failure, WiringGap
+from marrquee.docker_client import ContainerHealth
 from marrquee.health import AppHealth, HubState, LinkHealth, LinkState
 from marrquee.hub import (
     HUB_POLL_MS,
@@ -34,6 +35,7 @@ from marrquee.hub import (
 from marrquee.links import LinkCard
 from marrquee.login import LoginRecord, SavedLogin
 from marrquee.questions import QuestionCheck, QuestionField, QuestionStep
+from marrquee.vpn import TunnelPlace
 
 _NOW = datetime(2026, 9, 23, 12, 0, 0, tzinfo=UTC)
 _AUTHORITY = "192.168.1.50:7788"
@@ -45,8 +47,11 @@ def _health(
     state: HubState = "up",
     exists: bool = True,
     finished_at: str | None = None,
+    health: ContainerHealth | None = None,
 ) -> AppHealth:
-    return AppHealth(app_id=app_id, state=state, exists=exists, finished_at=finished_at)
+    return AppHealth(
+        app_id=app_id, state=state, exists=exists, finished_at=finished_at, health=health
+    )
 
 
 def _link(link_id: str, label: str, url: str) -> LinkCard:
@@ -365,6 +370,13 @@ def test_installable_is_the_catalog_minus_the_deploy_in_catalog_order() -> None:
     )
 
     assert full_view.installable == ()
+
+
+def test_gluetun_is_never_installable_even_with_nothing_else_deployed() -> None:
+    view = hub_view([], [], authority=_AUTHORITY, proxied=False, now=_NOW)
+
+    assert "gluetun" not in [app.id for app in view.installable]
+    assert "gluetun" not in [row.app.id for row in view.install_rows]
 
 
 # --- hub_panel: what the "+" tile's panel draws, from the query string -------
@@ -889,3 +901,149 @@ def test_hub_panel_prefills_the_stored_url_not_a_re_derived_one() -> None:
     # silently drop the path the owner actually saved.
     assert panel.url == "http://192.168.1.20:8123/lovelace"
     assert panel.error is None
+
+
+# --- The VPN tile: Docker's health decides the tunnel signal, never the ------
+# container's own running/stopped state alone ---------------------------------
+
+_PLACE = TunnelPlace(
+    public_ip="185.1.1.1", city="Amsterdam", region="North Holland", country="Netherlands"
+)
+
+
+def test_a_healthy_vpn_tile_is_up_unlinked_and_names_the_place() -> None:
+    view = hub_view(
+        ["gluetun"],
+        [_health("gluetun", state="up", health="healthy")],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        vpn_place=_PLACE,
+    )
+
+    tile = view.tiles[0]
+    assert tile.kind == "vpn"
+    assert tile.state == "up"
+    assert tile.url is None
+    assert tile.aria is None
+    assert tile.line == "Protected - your downloads appear to come from Amsterdam, Netherlands"
+    assert view.vpn_tunnel == "up"
+
+
+def test_a_healthy_vpn_tile_with_no_place_gets_the_plain_protected_line() -> None:
+    view = hub_view(
+        ["gluetun"],
+        [_health("gluetun", state="up", health="healthy")],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+    )
+
+    assert view.tiles[0].line == words.VPN_LINE_PROTECTED
+
+
+def test_a_starting_vpn_health_reads_connecting() -> None:
+    view = hub_view(
+        ["gluetun"],
+        [_health("gluetun", state="up", health="starting")],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+    )
+
+    tile = view.tiles[0]
+    assert tile.state == "starting"
+    assert tile.line == words.VPN_LINE_CONNECTING
+    assert view.vpn_tunnel == "connecting"
+
+
+def test_an_unhealthy_vpn_with_a_running_container_is_down_and_excluded_from_any_down() -> None:
+    view = hub_view(
+        ["gluetun"],
+        [_health("gluetun", state="up", health="unhealthy")],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+    )
+
+    tile = view.tiles[0]
+    assert tile.state == "down"
+    assert tile.line == words.VPN_LINE_TUNNEL_DOWN
+    assert view.vpn_tunnel == "down"
+    # Its fix is never "start it again from your NAS" - the kill switch and
+    # Gluetun's own reconnect are already doing that job.
+    assert view.any_down is False
+
+
+def test_vpn_health_none_reads_unknown_never_up() -> None:
+    view = hub_view(
+        ["gluetun"],
+        [_health("gluetun", state="up", health=None)],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+    )
+
+    tile = view.tiles[0]
+    assert tile.state == "unknown"
+    assert tile.line == words.VPN_LINE_NOT_SURE
+    assert view.vpn_tunnel == "unknown"
+
+
+def test_a_stopped_vpn_container_is_an_ordinary_down_and_counts_in_any_down() -> None:
+    view = hub_view(
+        ["gluetun"],
+        [_health("gluetun", state="down", exists=True)],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+    )
+
+    tile = view.tiles[0]
+    assert tile.state == "down"
+    assert tile.line == words.hub_line_down("VPN")
+    assert view.vpn_tunnel == "down"
+    assert view.any_down is True
+
+
+def test_a_gone_vpn_container_is_an_ordinary_down_line() -> None:
+    view = hub_view(
+        ["gluetun"],
+        [_health("gluetun", state="down", exists=False)],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+    )
+
+    assert view.tiles[0].line == words.hub_line_gone("VPN")
+
+
+def test_no_vpn_installed_leaves_vpn_tunnel_none() -> None:
+    view = hub_view(
+        ["sonarr"], [_health("sonarr", state="up")], authority=_AUTHORITY, proxied=False, now=_NOW
+    )
+
+    assert view.vpn_tunnel is None
+
+
+def test_an_arr_tiles_kind_is_arr() -> None:
+    view = hub_view(
+        ["sonarr"], [_health("sonarr", state="up")], authority=_AUTHORITY, proxied=False, now=_NOW
+    )
+
+    assert view.tiles[0].kind == "arr"
+
+
+def test_the_vpn_counts_in_n_of_m_up() -> None:
+    view = hub_view(
+        ["sonarr", "gluetun"],
+        [
+            _health("sonarr", state="down"),
+            _health("gluetun", state="up", health="healthy"),
+        ],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+    )
+
+    assert view.announce == "1 of 2 apps are up."

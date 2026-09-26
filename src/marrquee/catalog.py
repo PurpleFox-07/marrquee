@@ -16,7 +16,12 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Literal
 
-from marrquee.words import PROWLARR_DESCRIPTION, RADARR_DESCRIPTION, SONARR_DESCRIPTION
+from marrquee.words import (
+    PROWLARR_DESCRIPTION,
+    RADARR_DESCRIPTION,
+    SONARR_DESCRIPTION,
+    VPN_DESCRIPTION,
+)
 
 
 @dataclass(frozen=True)
@@ -42,10 +47,28 @@ class AppRule:
 # it never ends up locked out of one it doesn't have.
 LoginKind = Literal["arr", "none"]
 
+# What kind of app this is, so the compose builder, the deploy engine and
+# the Hub's poster all know which branch to take instead of an "arr" app
+# faking fields it doesn't have. "arr" is the default - every media app
+# that looks like Prowlarr, Sonarr or Radarr; "vpn" is Gluetun, the one app
+# with no web page, no API key and its own compose shape.
+AppKind = Literal["arr", "vpn"]
+
 
 @dataclass(frozen=True)
 class CatalogApp:
-    """Everything Marrquee needs to know about one arr app before it exists."""
+    """Everything Marrquee needs to know about one app before it exists.
+
+    `kind="vpn"` (Gluetun only, for now) selects a separate compose branch
+    and readiness check instead of faking the arr fields (`api_base`,
+    `login_kind`) it has no use for. `offered=False` keeps an app like that
+    out of every screen that lets an owner choose it directly (the wizard's
+    grid, the Hub's "+" panel, `GET /api/catalog`) while it stays a normal
+    entry everywhere else (catalog order, its own question step, its own
+    bring-up) - whatever app needs it adds it as a companion instead. A
+    later companion app is expected to name which "vpn"-kind app it runs
+    behind through a field of its own (not yet added here).
+    """
 
     id: str
     name: str
@@ -62,10 +85,14 @@ class CatalogApp:
     web_page: bool = True
     rules: tuple[AppRule, ...] = ()
     login_kind: LoginKind = "none"
+    kind: AppKind = "arr"
+    offered: bool = True
 
 
-# Prowlarr, Sonarr and Radarr only - no qBittorrent, because the downloader
-# must never run outside a VPN, and Marrquee has no VPN container yet.
+# Prowlarr, Sonarr, Radarr and Gluetun (the VPN tunnel) - no qBittorrent
+# yet, because the downloader must never run outside the tunnel Gluetun
+# proves. Gluetun is `offered=False`: it never appears as its own "+"
+# choice or wizard tick - whatever needs it adds it as a companion instead.
 CATALOG: tuple[CatalogApp, ...] = (
     CatalogApp(
         id="prowlarr",
@@ -108,6 +135,24 @@ CATALOG: tuple[CatalogApp, ...] = (
         glyph="RD",
         order=2,
         login_kind="arr",
+    ),
+    CatalogApp(
+        id="gluetun",
+        name="VPN",
+        description=VPN_DESCRIPTION,
+        image="qmcgaw/gluetun:v3",
+        port=8000,
+        env_prefix="GLUETUN",
+        api_base="v1",
+        media_folders=(),
+        needs_data_mount=False,
+        glyph="VPN",
+        order=3,
+        default_ticked=False,
+        web_page=False,
+        kind="vpn",
+        offered=False,
+        login_kind="none",
     ),
 )
 

@@ -41,6 +41,8 @@ from marrquee.questions import QuestionCheck, QuestionField, QuestionStep, load_
 from marrquee.routes.api import _event_stream
 from marrquee.state import InstallState, load_state, save_state, write_json_atomic
 from marrquee.storage import write_marker
+from marrquee.vpn import TunnelPlace
+from marrquee.vpn_control import FakeGluetunControl
 from marrquee.wiring import NoWiringYet, WiringStep
 from marrquee.wiring.engine import WiringEngine
 from marrquee.words import (
@@ -93,9 +95,18 @@ def _running_container(app_id: str) -> ContainerSnapshot:
     )
 
 
-def _client(settings: Settings, manager: DeployManager) -> TestClient:
+def _client(
+    settings: Settings,
+    manager: DeployManager,
+    *,
+    engine: FakeDockerEngine | None = None,
+    vpn_control: FakeGluetunControl | None = None,
+) -> TestClient:
     app = create_app(
-        settings=settings, engine=FakeDockerEngine(DockerStatus(connected=True)), manager=manager
+        settings=settings,
+        engine=engine if engine is not None else FakeDockerEngine(DockerStatus(connected=True)),
+        manager=manager,
+        vpn_control=vpn_control,
     )
     return TestClient(app)
 
@@ -331,6 +342,19 @@ def test_install_refuses_an_unknown_app_id_with_400(tmp_path: Path) -> None:
     assert response.status_code == 400
 
 
+def test_install_refuses_gluetun_in_the_app_list_with_400(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+    client = _client(settings, _idle_manager(settings))
+
+    response = client.post(
+        "/api/install",
+        json={"path": str(root), "app_ids": ["radarr", "gluetun"], "login": _LOGIN_BODY},
+    )
+
+    assert response.status_code == 400
+
+
 def test_install_refuses_once_the_hub_exists_and_changes_nothing(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     root = _fresh_root(settings)
@@ -355,6 +379,84 @@ def test_install_refuses_once_the_hub_exists_and_changes_nothing(tmp_path: Path)
     assert response.status_code == 409
     assert response.json()["detail"] == HUB_SETUP_DONE_REFUSAL
     assert load_state(settings.config_dir) is None
+
+
+# --- /api/hub/status: kind per tile, and the VPN's own tunnel signal ----------
+
+
+def test_hub_status_carries_kind_per_tile_and_the_vpn_tunnel_signal(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+    save_state(settings.config_dir, _install_state(("sonarr", "gluetun"), root))
+    finished = DeploySnapshot(
+        run_id="run-1",
+        phase="finale",
+        apps=(
+            AppProgress(
+                app_id="sonarr",
+                name="Sonarr",
+                state="done",
+                chip="chip",
+                line="Ready",
+                note=None,
+                port=8989,
+            ),
+            AppProgress(
+                app_id="gluetun",
+                name="VPN",
+                state="done",
+                chip="chip",
+                line="Ready",
+                note=None,
+                port=8000,
+            ),
+        ),
+        headline="Now showing",
+        detail=None,
+        failure=None,
+        started_at="2026-09-19T00:00:00+00:00",
+        finished_at="2026-09-19T00:05:00+00:00",
+        wiring=(),
+    )
+    write_json_atomic(settings.config_dir / "deploy.json", dataclasses.asdict(finished))
+    engine = FakeDockerEngine(
+        DockerStatus(connected=True),
+        containers={
+            "sonarr": _running_container("sonarr"),
+            "gluetun": ContainerSnapshot(
+                name="gluetun",
+                exists=True,
+                state="running",
+                exit_code=None,
+                image=get_app("gluetun").image,
+                detail=None,
+                health="healthy",
+            ),
+        },
+    )
+    place = TunnelPlace(
+        public_ip="185.1.1.1", city="Amsterdam", region="North Holland", country="Netherlands"
+    )
+    vpn_control = FakeGluetunControl(place=place)
+    client = _client(settings, _idle_manager(settings), engine=engine, vpn_control=vpn_control)
+
+    response = client.get("/api/hub/status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    kinds = {app["app_id"]: app["kind"] for app in payload["apps"]}
+    assert kinds == {"sonarr": "arr", "gluetun": "vpn"}
+    assert payload["vpn_tunnel"] == "up"
+
+
+def test_hub_status_vpn_tunnel_is_none_with_no_vpn_installed(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    client = _client(settings, _idle_manager(settings))
+
+    response = client.get("/api/hub/status")
+
+    assert response.status_code == 200
+    assert response.json()["vpn_tunnel"] is None
 
 
 # --- Installing an app from the Hub's "+" panel --------------------------------

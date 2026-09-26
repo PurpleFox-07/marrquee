@@ -33,12 +33,13 @@ from typing import ClassVar, Literal, Protocol, cast
 import httpx
 
 from marrquee.catalog import CatalogApp, apps_in_order, get_app, unavailable_reason
-from marrquee.compose import build_stack_plan, write_compose
+from marrquee.compose import build_stack_plan, clear_vpn_secrets, write_compose, write_vpn_secrets
 from marrquee.config import Settings
 from marrquee.docker_client import ComposeResult, DockerEngine
 from marrquee.install import with_app_added, with_app_removed
 from marrquee.login import SavedLogin, load_login, pending_app_ids, record_applied
 from marrquee.login_apply import LoginApplier, NoLoginApplier
+from marrquee.questions import load_answers
 from marrquee.state import InstallState, load_state, save_state, write_json_atomic
 from marrquee.storage import (
     FreshnessCheck,
@@ -49,9 +50,24 @@ from marrquee.storage import (
     read_marker,
     write_marker,
 )
+from marrquee.vpn import (
+    VPN_APP_ID,
+    build_gluetun_config,
+    check_vpn_answers,
+    find_provider,
+    secret_values,
+    tunnel_place_line,
+)
+from marrquee.vpn_control import (
+    GluetunControl,
+    NoGluetunControl,
+    classify_tunnel,
+    looks_like_missing_tun,
+)
 from marrquee.wiring import NoWiringYet, WiringRunner, WiringStep, WiringStepState
 from marrquee.words import (
     FAILURE_DOCKER_UNREACHABLE,
+    FAILURE_VPN_NO_TUN,
     PHASE_HEADLINE_FINALE,
     PHASE_HEADLINE_READY,
     PHASE_HEADLINE_RUNNING,
@@ -60,6 +76,8 @@ from marrquee.words import (
     STATUS_CHIP_ERROR,
     STATUS_CHIP_STARTING,
     STATUS_CHIP_WAITING,
+    VPN_LINE_CONNECTING,
+    VPN_NOTE_SLOW,
     app_headline_done,
     app_headline_starting,
     app_line_done,
@@ -72,6 +90,9 @@ from marrquee.words import (
     failure_download_failed,
     failure_never_became_ready,
     failure_port_in_use,
+    failure_vpn_not_connected,
+    failure_vpn_refused,
+    failure_vpn_settings_refused,
     hub_cancel_failed,
     hub_line_connecting,
     hub_login_line_putting,
@@ -98,6 +119,10 @@ FailureCode = Literal[
     "compose_failed",
     "never_became_ready",
     "port_in_use",
+    "vpn_refused",
+    "vpn_settings_refused",
+    "vpn_not_connected",
+    "vpn_no_tun",
 ]
 
 # An add's own tiny state machine - never "done": once wiring finishes, the
@@ -119,6 +144,7 @@ _DEPLOY_FILE_NAME = "deploy.json"
 _DIAGNOSTICS_FILE_NAME = "last-failure.txt"
 _REDACTED_PLACEHOLDER = "<redacted-api-key>"
 _REDACTED_PASSWORD_PLACEHOLDER = "<redacted-password>"
+_REDACTED_VPN_PLACEHOLDER = "<redacted-vpn-login>"
 
 
 @dataclass(frozen=True)
@@ -288,6 +314,14 @@ class DeployManager:
     POLL_INTERVAL_SECONDS: ClassVar[float] = 2.0
     REASSURANCE_AFTER_SECONDS: ClassVar[float] = 45.0
     NEVER_READY_AFTER_SECONDS: ClassVar[float] = 300.0
+    # The tunnel loop's own timeout - shorter than the arr loop's, because a
+    # tunnel that hasn't come up after two minutes needs a plain sentence,
+    # not a slow-database benefit of the doubt. The grace period is how long
+    # a healthy, running tunnel is allowed to report no address at all
+    # before Marrquee stops waiting for one and calls it proven anyway (a
+    # provider that answers `/v1/publicip/ip` slowly, say).
+    TUNNEL_NEVER_UP_AFTER_SECONDS: ClassVar[float] = 120.0
+    TUNNEL_PLACE_GRACE_SECONDS: ClassVar[float] = 20.0
 
     def __init__(
         self,
@@ -299,6 +333,7 @@ class DeployManager:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         wiring: WiringRunner = NoWiringYet(),
         login: LoginApplier = NoLoginApplier(),
+        vpn: GluetunControl = NoGluetunControl(),
     ) -> None:
         self._settings = settings
         self._engine = engine
@@ -307,6 +342,7 @@ class DeployManager:
         self._sleep = sleep
         self._wiring = wiring
         self._login = login
+        self._vpn = vpn
         self._task: asyncio.Task[None] | None = None
         # The login run's own in-memory progress line - never persisted and
         # never resumed after a restart (the pending names plus Try again
@@ -570,7 +606,19 @@ class DeployManager:
             if shrunk.storage_root is not None:
                 root = PurePosixPath(shrunk.storage_root)
                 write_marker(self._settings, root, shrunk.app_ids, shrunk.puid, shrunk.pgid)
-                write_compose(self._settings, build_stack_plan(shrunk))
+                answers = load_answers(self._settings.config_dir)
+                # A DIFFERENT app's failed add is being cancelled while
+                # Gluetun (already installed) has since been left with
+                # unusable saved answers - rewriting compose can't succeed,
+                # but the cancel itself must still complete rather than
+                # 500: `build_gluetun_config` raises with no value in its
+                # message, so logging it directly is already safe.
+                try:
+                    write_compose(self._settings, build_stack_plan(shrunk, answers))
+                except ValueError as error:
+                    logger.error("cancel: could not rewrite compose.yaml: %s", error)
+                if app.kind == "vpn":
+                    clear_vpn_secrets(self._settings, root)
 
         self._emit(self._replace_finale(adding=None))
         return True
@@ -836,7 +884,12 @@ class DeployManager:
 
         build_folders(self._settings, root, install.app_ids, install.puid, install.pgid)
         write_marker(self._settings, root, install.app_ids, install.puid, install.pgid)
-        plan = build_stack_plan(install)
+        answers = load_answers(self._settings.config_dir)
+        vpn_failure = _vpn_settings_failure(install.app_ids, answers)
+        if vpn_failure is not None:
+            await self._fail(run_id, started_at, progresses, install, vpn_failure)
+            return
+        plan = build_stack_plan(install, answers)
         compose_path = write_compose(self._settings, plan)
 
         # Marrquee has no label on the stack's own compose project, so this
@@ -857,7 +910,7 @@ class DeployManager:
         for index, app in enumerate(catalog_apps):
             report = self._full_deploy_reporter(progresses, index, app, run_id, started_at)
             failure = await self._bring_up_app(
-                app, install, compose_path, plan.network, self_id, report
+                app, install, root, compose_path, plan.network, self_id, report
             )
             if failure is not None:
                 await self._fail(run_id, started_at, progresses, install, failure)
@@ -985,6 +1038,7 @@ class DeployManager:
         self,
         app: CatalogApp,
         install: InstallState,
+        root: PurePosixPath,
         compose_path: Path,
         network: str,
         self_id: str,
@@ -1004,6 +1058,11 @@ class DeployManager:
                 technical=f"no API key was recorded for {app.id!r}",
             )
 
+        if app.kind == "vpn":
+            secrets_failure = self._write_vpn_secrets(app, install, root, api_key)
+            if secrets_failure is not None:
+                return secrets_failure
+
         downloading = not await self._engine.image_present(app.image)
         line = app_line_downloading(app.name) if downloading else app_line_starting(app.name)
         note: str | None = None
@@ -1013,6 +1072,14 @@ class DeployManager:
             self._settings.stack_project, compose_path, app.id, recreate=recreate
         )
         if not result.ok:
+            if app.kind == "vpn" and looks_like_missing_tun(result.output):
+                headline, what_to_do = _split_failure_text(FAILURE_VPN_NO_TUN)
+                return Failure(
+                    code="vpn_no_tun",
+                    headline=headline,
+                    what_to_do=what_to_do,
+                    technical=result.output,
+                )
             return _compose_failure(app, downloading, result)
 
         # Compose creates the stack's network as a side effect of its own
@@ -1028,6 +1095,13 @@ class DeployManager:
                 connect_result.detail
                 or f"could not join the {network!r} network (self_id={self_id!r})"
             )
+
+        if app.kind == "vpn":
+            # Replaces the arr readiness loop entirely: proof here is
+            # Docker's own health check AND Gluetun's own status AND a
+            # reported address - never an outside IP service, since Gluetun
+            # only ever answers from inside its own firewall.
+            return await self._await_tunnel(app, api_key, report)
 
         start = self._clock()
         reassured = False
@@ -1060,6 +1134,121 @@ class DeployManager:
             if candidate_line != line or candidate_note != note:
                 line, note = candidate_line, candidate_note
                 await report("starting", line, note)
+
+            await self._sleep(self.POLL_INTERVAL_SECONDS)
+
+    # --- Proving the tunnel: Gluetun's own branch of `_bring_up_app` -------
+
+    def _write_vpn_secrets(
+        self, app: CatalogApp, install: InstallState, root: PurePosixPath, control_key: str
+    ) -> Failure | None:
+        """Rewrite Gluetun's root-only secrets folder from the saved
+        answers, right before Docker is ever asked to start it.
+
+        `build_gluetun_config` itself never raises here: the
+        `_vpn_settings_failure` gate already ran, in this same caller,
+        before `build_stack_plan` was ever called - by the time this runs,
+        the saved answers have already passed `check_vpn_answers` once.
+        """
+        answers = load_answers(self._settings.config_dir).get(app.id, {})
+        config = build_gluetun_config(
+            answers,
+            control_key=control_key,
+            timezone=install.timezone,
+            puid=install.puid,
+            pgid=install.pgid,
+        )
+        try:
+            write_vpn_secrets(self._settings, root, config.secret_files)
+        except OSError as error:
+            headline, what_to_do = _split_failure_text(failure_compose_failed(app.name))
+            return Failure(
+                code="compose_failed",
+                headline=headline,
+                what_to_do=what_to_do,
+                technical=str(error),
+            )
+        return None
+
+    def _vpn_company_label(self, app: CatalogApp) -> str:
+        """The plain company name for a failure sentence like "ProtonVPN
+        refused...". Falls back to the app's own name (`"VPN"`) rather than
+        raising - the `_vpn_settings_failure` gate already keeps an
+        unrecognised provider out of this code path in practice.
+        """
+        answers = load_answers(self._settings.config_dir).get(app.id, {})
+        provider = find_provider(answers.get("provider", ""))
+        return provider.label if provider is not None else app.name
+
+    async def _await_tunnel(
+        self,
+        app: CatalogApp,
+        api_key: str,
+        report: Callable[[AppState, str, str | None], Awaitable[None]],
+    ) -> Failure | None:
+        """The tunnel loop: replaces the arr readiness loop entirely for a
+        `kind == "vpn"` app, in the same waiting/reassurance shape.
+
+        Proof is Docker's own health check AND Gluetun's own status AND a
+        reported address - a healthy, running tunnel that never reports a
+        place within `TUNNEL_PLACE_GRACE_SECONDS` still counts as proven
+        (the plain "protected" line, never an invented city). Nothing here
+        is persisted beyond the final `report("done", ...)` line: a stored
+        place would lie the moment Gluetun reconnects to a different
+        server.
+        """
+        company = self._vpn_company_label(app)
+        start = self._clock()
+        reassured = False
+        healthy_since: float | None = None
+        note: str | None = None
+        await report("starting", VPN_LINE_CONNECTING, note)
+
+        while True:
+            elapsed = self._clock() - start
+            if elapsed >= self.TUNNEL_NEVER_UP_AFTER_SECONDS:
+                logs = await self._engine.logs(app.id, tail=80)
+                minutes = round(self.TUNNEL_NEVER_UP_AFTER_SECONDS / 60)
+                return _vpn_verdict_failure(
+                    "vpn_not_connected", failure_vpn_not_connected(minutes), logs
+                )
+
+            container = await self._engine.inspect(app.id)
+            logs = await self._engine.logs(app.id, tail=80)
+            verdict = classify_tunnel(container, logs)
+
+            if verdict == "refused":
+                return _vpn_verdict_failure("vpn_refused", failure_vpn_refused(company), logs)
+            if verdict == "settings_refused":
+                return _vpn_verdict_failure(
+                    "vpn_settings_refused", failure_vpn_settings_refused(company), logs
+                )
+            if verdict == "gone":
+                headline, what_to_do = _split_failure_text(failure_compose_failed(app.name))
+                return Failure(
+                    code="compose_failed", headline=headline, what_to_do=what_to_do, technical=logs
+                )
+
+            if verdict == "healthy":
+                status = await self._vpn.vpn_status(api_key)
+                if status == "running":
+                    place = await self._vpn.public_ip(api_key)
+                    if place is not None:
+                        await report("done", tunnel_place_line(place), None)
+                        return None
+                    healthy_since = elapsed if healthy_since is None else healthy_since
+                    if elapsed - healthy_since >= self.TUNNEL_PLACE_GRACE_SECONDS:
+                        await report("done", tunnel_place_line(None), None)
+                        return None
+                else:
+                    healthy_since = None
+            else:
+                healthy_since = None
+
+            if not reassured and elapsed >= self.REASSURANCE_AFTER_SECONDS:
+                reassured = True
+                note = VPN_NOTE_SLOW
+                await report("starting", VPN_LINE_CONNECTING, note)
 
             await self._sleep(self.POLL_INTERVAL_SECONDS)
 
@@ -1172,7 +1361,12 @@ class DeployManager:
 
         build_folders(self._settings, root, grown.app_ids, grown.puid, grown.pgid)
         write_marker(self._settings, root, grown.app_ids, grown.puid, grown.pgid)
-        plan = build_stack_plan(grown)
+        answers = load_answers(self._settings.config_dir)
+        vpn_failure = _vpn_settings_failure(grown.app_ids, answers)
+        if vpn_failure is not None:
+            await self._fail_add(app, grown, vpn_failure, record_diagnostics)
+            return
+        plan = build_stack_plan(grown, answers)
         compose_path = write_compose(self._settings, plan)
 
         self_id = await self._engine.self_container_id()
@@ -1190,7 +1384,9 @@ class DeployManager:
             self._emit(self._replace_finale(adding=replace(current, compose_ran=True)))
 
         report = self._add_reporter()
-        failure = await self._bring_up_app(app, grown, compose_path, plan.network, self_id, report)
+        failure = await self._bring_up_app(
+            app, grown, root, compose_path, plan.network, self_id, report
+        )
         if failure is not None:
             await self._fail_add(app, grown, failure, record_diagnostics)
             return
@@ -1343,13 +1539,16 @@ class DeployManager:
 
     def _redact(self, text: str, install: InstallState) -> str:
         """The one place every diagnostics write, snapshot failure and log
-        line in this class goes through - keys first, then the saved
-        password (read fresh, never cached, and never passed in by a
-        caller that might get it stale).
+        line in this class goes through - keys first, then the saved login
+        password, then the saved VPN login (all read fresh, never cached,
+        and never passed in by a caller that might get them stale).
         """
         saved = load_login(self._settings.config_dir).login
         passwords = (saved.password,) if saved is not None else ()
-        return _redact_secrets(text, install.api_keys, passwords=passwords)
+        vpn_answers = load_answers(self._settings.config_dir).get(VPN_APP_ID, {})
+        return _redact_secrets(
+            text, install.api_keys, passwords=passwords, vpn_values=secret_values(vpn_answers)
+        )
 
     # --- Putting the saved login on one app --------------------------------
 
@@ -1455,7 +1654,16 @@ class DeployManager:
             )
             return
 
-        plan = build_stack_plan(install)
+        answers = load_answers(self._settings.config_dir)
+        vpn_failure = _vpn_settings_failure(install.app_ids, answers)
+        if vpn_failure is not None:
+            # Not "login run crashed": the apps that DID accept the login
+            # are still up and done, so this is a diagnostics line, never a
+            # Failure the login run has no snapshot to carry anyway.
+            record_diagnostics(self._redact(vpn_failure.technical, install))
+            logger.error("login run: %s", vpn_failure.technical)
+            return
+        plan = build_stack_plan(install, answers)
         compose_path = write_compose(self._settings, plan)
         self_id = await self._engine.self_container_id()
         if self_id is None:
@@ -1466,7 +1674,14 @@ class DeployManager:
         for app in accepted:
             self._login_progress = hub_login_line_restarting(app.name)
             failure = await self._bring_up_app(
-                app, install, compose_path, plan.network, self_id, report, recreate=True
+                app,
+                install,
+                plan.storage_root,
+                compose_path,
+                plan.network,
+                self_id,
+                report,
+                recreate=True,
             )
             if failure is None:
                 record_applied(self._settings.config_dir, app.id, login.generation)
@@ -1635,16 +1850,51 @@ def _compose_failure(app: CatalogApp, downloading: bool, result: ComposeResult) 
     )
 
 
-def _redact_secrets(text: str, api_keys: Mapping[str, str], passwords: Iterable[str] = ()) -> str:
-    """Replace every known API key, then every known password, with a
-    placeholder before text reaches a log line, a diagnostics file or a
-    snapshot's failure detail.
+def _vpn_settings_failure(
+    app_ids: Iterable[str], answers: Mapping[str, Mapping[str, str]]
+) -> Failure | None:
+    """`None` when Gluetun isn't installed, or its saved answers are still
+    acceptable; otherwise a `vpn_settings_refused` `Failure` that keeps
+    `build_stack_plan` from ever being called with answers it would only
+    raise on - compose is never written for a run this catches.
+    """
+    if VPN_APP_ID not in set(app_ids):
+        return None
+    check = check_vpn_answers(answers.get(VPN_APP_ID, {}))
+    if check.ok:
+        return None
+    provider = find_provider(check.answers.get("provider", ""))
+    company = provider.label if provider is not None else "VPN"
+    headline, what_to_do = _split_failure_text(failure_vpn_settings_refused(company))
+    return Failure(
+        code="vpn_settings_refused",
+        headline=headline,
+        what_to_do=what_to_do,
+        technical="the saved VPN answers are missing or invalid",
+    )
+
+
+def _vpn_verdict_failure(code: FailureCode, message: str, logs: str) -> Failure:
+    headline, what_to_do = _split_failure_text(message)
+    return Failure(code=code, headline=headline, what_to_do=what_to_do, technical=logs)
+
+
+def _redact_secrets(
+    text: str,
+    api_keys: Mapping[str, str],
+    passwords: Iterable[str] = (),
+    vpn_values: Iterable[str] = (),
+) -> str:
+    """Replace every known API key, then every known password, then every
+    known VPN credential, with a placeholder before text reaches a log
+    line, a diagnostics file or a snapshot's failure detail.
 
     Docker or an app's own error output could echo back an environment
     value we set ourselves - redacting by value here is what keeps "a secret
     never appears in a log or a diagnostics file" true even if a future log
-    line surprises us. Passwords are redacted after keys so a password that
-    happened to also look like a key still comes out right either way.
+    line surprises us. Each category is redacted after the last so a value
+    that happened to also look like an earlier category's still comes out
+    right either way.
     """
     redacted = text
     for key in api_keys.values():
@@ -1653,6 +1903,9 @@ def _redact_secrets(text: str, api_keys: Mapping[str, str], passwords: Iterable[
     for password in passwords:
         if password:
             redacted = redacted.replace(password, _REDACTED_PASSWORD_PLACEHOLDER)
+    for value in vpn_values:
+        if value:
+            redacted = redacted.replace(value, _REDACTED_VPN_PLACEHOLDER)
     return redacted
 
 
@@ -1735,6 +1988,10 @@ def _failure_from_payload(payload: dict[str, object]) -> Failure:
                     "compose_failed",
                     "never_became_ready",
                     "port_in_use",
+                    "vpn_refused",
+                    "vpn_settings_refused",
+                    "vpn_not_connected",
+                    "vpn_no_tun",
                 ),
             ),
         ),

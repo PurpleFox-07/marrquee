@@ -24,7 +24,7 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from marrquee.catalog import CATALOG, CatalogApp, get_app, unavailable_reason
+from marrquee.catalog import CATALOG, AppKind, CatalogApp, get_app, unavailable_reason
 from marrquee.config import Settings
 from marrquee.deploy import (
     AddStart,
@@ -38,7 +38,7 @@ from marrquee.deploy import (
     FailureCode,
 )
 from marrquee.health import HubState, LinkState
-from marrquee.hub import HubTile, LinkTile, LoginBanner
+from marrquee.hub import HubTile, LinkTile, LoginBanner, TunnelState
 from marrquee.install import install_apps
 from marrquee.login import LOGIN_STEP, load_login, save_login
 from marrquee.questions import (
@@ -211,6 +211,7 @@ class HubTileOut(BaseModel):
     add_state: AddState | None
     note: str
     actions: Literal["none", "retry", "reconnect"]
+    kind: AppKind
 
 
 class LinkTileOut(BaseModel):
@@ -236,6 +237,7 @@ class HubStatusOut(BaseModel):
     docker_unreachable: bool
     busy: bool
     login_banner: LoginBanner | None
+    vpn_tunnel: TunnelState | None
 
 
 class HubInstallRequest(BaseModel):
@@ -313,6 +315,7 @@ def _hub_tile_out(tile: HubTile) -> HubTileOut:
         add_state=tile.add_state,
         note=tile.note,
         actions=tile.actions,
+        kind=tile.kind,
     )
 
 
@@ -364,6 +367,7 @@ async def get_catalog() -> CatalogResponse:
         apps=[
             CatalogAppOut(id=app.id, name=app.name, description=app.description, port=app.port)
             for app in CATALOG
+            if app.offered
         ]
     )
 
@@ -510,6 +514,7 @@ async def get_hub_status(request: Request) -> HubStatusOut:
         docker_unreachable=view.docker_unreachable,
         busy=view.busy,
         login_banner=view.login.banner if view.login is not None else None,
+        vpn_tunnel=view.vpn_tunnel,
     )
 
 

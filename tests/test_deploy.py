@@ -36,6 +36,7 @@ from marrquee.deploy import (
 )
 from marrquee.docker_client import (
     ComposeResult,
+    ContainerHealth,
     ContainerRemoveResult,
     ContainerSnapshot,
     DockerStatus,
@@ -43,7 +44,10 @@ from marrquee.docker_client import (
     NetworkConnectResult,
     _service_config_signature,
 )
+from marrquee.questions import save_step_answers
 from marrquee.state import InstallState, save_state, write_json_atomic
+from marrquee.vpn import TunnelPlace
+from marrquee.vpn_control import FakeGluetunControl
 from marrquee.wiring import WiringStep, WiringStepState
 from marrquee.words import (
     PHASE_HEADLINE_READY,
@@ -53,6 +57,21 @@ from marrquee.words import (
 )
 
 # --- Shared fixtures and small builders --------------------------------------
+
+# A minimal, always-valid answer set for Gluetun's own VPN step - shared by
+# every test file that needs `build_stack_plan` to actually succeed for an
+# install that includes it, rather than raising before compose is ever
+# written.
+_GLUETUN_ANSWERS: dict[str, str] = {
+    "provider": "mullvad",
+    "vpn_type": "openvpn",
+    "openvpn_user": "ci-user-7f3a",
+    "openvpn_password": "pw-9d1c",
+    "wireguard_private_key": "",
+    "wireguard_addresses": "",
+    "wireguard_preshared_key": "",
+    "server_countries": "",
+}
 
 
 def _settings(tmp_path: Path) -> Settings:
@@ -121,6 +140,8 @@ class _StatefulEngine:
         self_container_id: str | None = "marrquee",
         network_exists: bool = False,
         remove_results: dict[str, bool] | None = None,
+        logs: dict[str, str] | None = None,
+        health_frames: dict[str, list[ContainerHealth | None]] | None = None,
     ) -> None:
         self._images = (
             images if images is not None else {get_app(app_id).image for app_id in app_ids}
@@ -130,6 +151,17 @@ class _StatefulEngine:
         self._containers: dict[str, ContainerSnapshot] = {}
         self._network_exists = network_exists
         self._remove_results = remove_results or {}
+        self._logs = logs or {}
+        # A VPN whose Docker health changes tick by tick is state this fake
+        # must model too (docker-fakes-model-state) - each name scripted
+        # here drains in order, then repeats its last value, and is only
+        # ever consulted once the container it names actually exists (a
+        # health overlay on top of a container `compose_up` created, never
+        # a substitute for it).
+        self._health_frames: dict[str, list[ContainerHealth | None]] = {
+            name: list(sequence) for name, sequence in (health_frames or {}).items()
+        }
+        self._health_positions: dict[str, int] = dict.fromkeys(self._health_frames, 0)
         self.calls: list[tuple[str, tuple[object, ...]]] = []
         # Mirrors `FakeDockerEngine`'s own recreate modelling (the
         # project's docker-fakes-model-state rule): an unchanged service's
@@ -145,12 +177,24 @@ class _StatefulEngine:
 
     async def inspect(self, name: str) -> ContainerSnapshot:
         self.calls.append(("inspect", (name,)))
-        return self._containers.get(
+        container = self._containers.get(
             name,
             ContainerSnapshot(
                 name=name, exists=False, state=None, exit_code=None, image=None, detail=None
             ),
         )
+        if container.exists and name in self._health_frames:
+            return dataclasses.replace(container, health=self._next_health(name))
+        return container
+
+    def _next_health(self, name: str) -> ContainerHealth | None:
+        frames = self._health_frames[name]
+        if not frames:
+            return None
+        position = self._health_positions[name]
+        if position < len(frames) - 1:
+            self._health_positions[name] = position + 1
+        return frames[position]
 
     async def image_present(self, reference: str) -> bool:
         self.calls.append(("image_present", (reference,)))
@@ -164,7 +208,7 @@ class _StatefulEngine:
 
     async def logs(self, name: str, tail: int = 50) -> str:
         self.calls.append(("logs", (name, tail)))
-        return ""
+        return self._logs.get(name, "")
 
     async def compose_up(
         self, project: str, compose_file: Path, service: str, *, recreate: bool = False
@@ -352,6 +396,55 @@ async def test_each_app_walks_waiting_starting_done_in_catalog_order(tmp_path: P
     assert sonarr_states[0] == "waiting"
     assert "starting" in sonarr_states
     assert sonarr_states[-1] == "done"
+
+
+async def test_full_deploy_threads_saved_vpn_answers_into_the_stack_plan(tmp_path: Path) -> None:
+    """`_run_steps`'s own `build_stack_plan` call has to pass the saved
+    answers through - Gluetun's compose branch raises without them, so a
+    deploy that includes it never even gets as far as writing compose at
+    all if they're dropped.
+    """
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+    app_ids = ("prowlarr", "gluetun")
+    save_state(settings.config_dir, _install_state(app_ids, root))
+    save_step_answers(settings.config_dir, "gluetun", _GLUETUN_ANSWERS)
+
+    engine = _StatefulEngine(
+        app_ids,
+        compose_results={
+            app_id: ComposeResult(ok=True, exit_code=0, output="") for app_id in app_ids
+        },
+        health_frames={"gluetun": ["healthy"]},
+    )
+    clock = _FakeClock()
+    manager = DeployManager(
+        settings,
+        engine,
+        probe=FakeReadinessProbe(default=True),
+        clock=clock.time,
+        sleep=clock.sleep,
+        vpn=FakeGluetunControl(
+            status="running",
+            place=TunnelPlace(
+                public_ip="185.1.1.1",
+                city="Amsterdam",
+                region="North Holland",
+                country="Netherlands",
+            ),
+        ),
+    )
+    manager.start()
+    history = await _run_to_terminal(manager)
+
+    assert history[-1].phase == "finale"
+    assert [app.app_id for app in history[-1].apps] == ["prowlarr", "gluetun"]
+    assert all(app.state == "done" for app in history[-1].apps)
+
+    compose_text = (
+        settings.host_mount / "volume1" / "media" / "marrquee" / "compose.yaml"
+    ).read_text()
+    assert "\n  gluetun:\n" in compose_text
 
 
 async def test_the_network_does_not_exist_until_the_first_compose_up(tmp_path: Path) -> None:

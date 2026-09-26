@@ -166,3 +166,23 @@ def test_app_posters_and_link_cards_fill_their_grid_cell() -> None:
     assert "flex-direction: column" in item_body
     assert "flex: 1" in _block_for(css, ".hub-app-item > .hub-poster")
     assert "flex: 1" in _block_for(css, ".hub-link-item > .hub-poster")
+
+
+def test_the_vpn_down_rule_binds_error_and_never_borders_an_ordinary_down_poster() -> None:
+    css = _HUB_CSS.read_text()
+
+    body = _block_for(css, '.hub-poster[data-kind="vpn"][data-state="down"]')
+    assert "border-color: var(--error);" in body
+
+    # The plain Down poster (no `data-kind` in its own selector) must keep
+    # its ordinary border - a VPN's own rule has to name `data-kind="vpn"`
+    # explicitly rather than widening every Down poster's border colour.
+    down_body = _block_for(css, '.hub-poster[data-state="down"]')
+    assert "border-color: var(--error);" not in down_body
+
+
+def test_the_vpn_down_poster_is_never_dimmed() -> None:
+    selector = '.hub-poster[data-kind="vpn"][data-state="down"]::before'
+    body = _block_for(_HUB_CSS.read_text(), selector)
+
+    assert "filter: none" in body

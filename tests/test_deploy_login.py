@@ -15,6 +15,7 @@ import dataclasses
 from pathlib import Path
 
 from test_deploy import (
+    _GLUETUN_ANSWERS,
     _FakeClock,
     _fresh_root,
     _install_state,
@@ -29,6 +30,7 @@ from marrquee.deploy import AppProgress, DeployManager, DeploySnapshot, FakeRead
 from marrquee.docker_client import ContainerSnapshot, DockerStatus, FakeDockerEngine
 from marrquee.login import SavedLogin, load_login, pending_app_ids, save_login
 from marrquee.login_apply import FakeLoginApplier, LoginApplier, LoginApplyResult
+from marrquee.questions import save_step_answers
 from marrquee.state import InstallState, save_state, write_json_atomic
 
 # --- Small builders shared by every test below --------------------------------
@@ -248,6 +250,69 @@ async def test_login_run_switches_only_the_apps_that_accepted(tmp_path: Path) ->
     record = load_login(config_dir)
     assert record.applied == {"prowlarr": saved.generation, "radarr": saved.generation}
     assert pending_app_ids(record, app_ids) == ("sonarr",)
+
+
+async def test_login_run_threads_saved_vpn_answers_into_the_stack_plan(tmp_path: Path) -> None:
+    """`_run_login_steps`'s own `build_stack_plan` call renders the WHOLE
+    install, not just the apps taking the login - Gluetun (`login_kind`
+    "none", never a login target itself) still needs its own saved answers
+    for that render to succeed, or the run crashes before Prowlarr's own
+    recreate ever happens.
+    """
+    app_ids = ("prowlarr", "gluetun")
+    manager, engine, config_dir = _already_finale_manager(
+        tmp_path, app_ids, login_applier=FakeLoginApplier()
+    )
+    save_step_answers(config_dir, "gluetun", _GLUETUN_ANSWERS)
+    saved = save_login(config_dir, "owner", "s3cret-password-1", honor_reset=None)
+
+    assert manager.apply_login() == "started"
+    await _finish_login(manager)
+
+    record = load_login(config_dir)
+    assert record.applied == {"prowlarr": saved.generation}
+
+    diagnostics_path = config_dir / "last-failure.txt"
+    assert not diagnostics_path.exists() or "crashed" not in diagnostics_path.read_text()
+
+    compose_text = (
+        config_dir.parent / "host" / "volume1" / "media" / "marrquee" / "compose.yaml"
+    ).read_text()
+    assert "\n  gluetun:\n" in compose_text
+
+
+async def test_login_run_with_invalid_vpn_answers_records_a_diagnostics_line_not_a_crash(
+    tmp_path: Path,
+) -> None:
+    """When Gluetun's saved answers are missing or invalid, `_run_login_steps`
+    must record a plain, redacted diagnostics line and return - never let
+    `build_stack_plan`'s `ValueError` escape to the generic "login run
+    crashed" handler, and never recreate an app that DID accept the login
+    before the run bailed.
+    """
+    app_ids = ("prowlarr", "gluetun")
+    manager, engine, config_dir = _already_finale_manager(
+        tmp_path, app_ids, login_applier=FakeLoginApplier()
+    )
+    # No answers saved for gluetun at all - `check_vpn_answers({})` refuses
+    # on the missing provider, same as a fresh install that never asked.
+    saved = save_login(config_dir, "owner", "s3cret-password-1", honor_reset=None)
+
+    assert manager.apply_login() == "started"
+    await _finish_login(manager)
+
+    # Phase 1 (putting the login on prowlarr) already ran and accepted it,
+    # but phase 2 (recreate) never got there - the vpn gate fires first.
+    record = load_login(config_dir)
+    assert record.applied == {}
+    assert pending_app_ids(record, app_ids) == ("prowlarr",)
+    assert saved.generation  # sanity: a real generation was saved
+
+    diagnostics_path = config_dir / "last-failure.txt"
+    assert diagnostics_path.exists()
+    diagnostics = diagnostics_path.read_text()
+    assert "crashed" not in diagnostics
+    assert "Traceback" not in diagnostics
 
 
 async def test_a_change_with_unchanged_compose_recreates_with_no_failure(tmp_path: Path) -> None:

@@ -226,3 +226,19 @@ def test_setup_questions_redirects_home_once_the_hub_exists(
     assert get_response.headers["location"] == "/"
     assert post_response.status_code == 303
     assert post_response.headers["location"] == "/"
+
+
+# --- questions.js keeps a `list` field's guide link in step with it ---------
+
+
+def test_the_question_page_loads_questions_js_with_defer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(questions_module, "QUESTION_STEPS", (_refusing_step(),))
+    client = _client(_settings(tmp_path))
+
+    response = client.get("/setup/questions/radarr/fixture", params={"apps": "radarr"})
+
+    assert response.status_code == 200
+    assert "<script defer" in response.text
+    assert "js/questions.js" in response.text

@@ -62,6 +62,8 @@ from marrquee.login import (
 )
 from marrquee.questions import check_step
 from marrquee.state import load_state
+from marrquee.vpn import TunnelPlace
+from marrquee.vpn_control import GluetunControl
 
 router = APIRouter()
 
@@ -95,7 +97,10 @@ async def read_hub_view(request: Request) -> HubView:
     The Docker read and the link checks run under one `asyncio.gather`, so
     a slow or unreachable link never adds its own wait on top of the Docker
     read - the same reasoning `read_health` and `read_link_health` each
-    apply within their own gather.
+    apply within their own gather. When a VPN is installed, Gluetun's own
+    public-IP lookup joins that same gather as a third member, so a hung
+    control server never adds its own wait either - its own client keeps a
+    short timeout and never raises.
     """
     settings: Settings = request.app.state.settings
     manager: DeployManager = request.app.state.deploy
@@ -106,10 +111,26 @@ async def read_hub_view(request: Request) -> HubView:
     app_ids = tuple(app.app_id for app in snapshot.apps)
     links = load_links(settings.config_dir)
 
-    healths, link_healths = await asyncio.gather(
-        read_health(engine, app_ids),
-        read_link_health(link_probe, links),
-    )
+    # Gluetun's own key only exists once the VPN is actually installed - a
+    # deploy with no VPN never touches its control server at all, the same
+    # "ask nothing you don't need to" rule `read_link_health` already
+    # follows for a Hub with no saved links.
+    install = load_state(settings.config_dir)
+    vpn_key = install.api_keys.get("gluetun") if install is not None else None
+    vpn_place: TunnelPlace | None
+    if "gluetun" in app_ids and vpn_key:
+        vpn_control: GluetunControl = request.app.state.vpn_control
+        healths, link_healths, vpn_place = await asyncio.gather(
+            read_health(engine, app_ids),
+            read_link_health(link_probe, links),
+            vpn_control.public_ip(vpn_key),
+        )
+    else:
+        vpn_place = None
+        healths, link_healths = await asyncio.gather(
+            read_health(engine, app_ids),
+            read_link_health(link_probe, links),
+        )
 
     login = login_view(
         load_login(settings.config_dir),
@@ -130,6 +151,7 @@ async def read_hub_view(request: Request) -> HubView:
         wiring_gaps=snapshot.wiring_gaps,
         busy=manager.is_busy(),
         login=login,
+        vpn_place=vpn_place,
     )
 
 

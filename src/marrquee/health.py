@@ -29,7 +29,7 @@ from typing import Literal, Protocol
 
 import httpx
 
-from marrquee.docker_client import ContainerSnapshot, DockerEngine
+from marrquee.docker_client import ContainerHealth, ContainerSnapshot, DockerEngine
 from marrquee.links import LinkCard
 
 HubState = Literal["up", "starting", "down", "unknown"]
@@ -45,12 +45,19 @@ class AppHealth:
     module's. There is deliberately no `detail` field: `ContainerSnapshot`'s
     raw technical string never leaves this module, so "no jargon on screen"
     is enforced by the type itself.
+
+    `health` is copied straight through from the snapshot, unlike `state`
+    (which `_state_of` maps): arr images carry no HEALTHCHECK at all, so
+    their tiles are unaffected either way, but the VPN tile needs Docker's
+    own health verdict - not this module's arr-shaped collapse of it - to
+    tell "the tunnel dropped" apart from "still starting up".
     """
 
     app_id: str
     state: HubState
     exists: bool
     finished_at: str | None
+    health: ContainerHealth | None = None
 
 
 def _state_of(result: object) -> tuple[HubState, bool, str | None]:
@@ -98,8 +105,11 @@ async def read_health(engine: DockerEngine, app_ids: Sequence[str]) -> tuple[App
     healths = []
     for app_id, result in zip(app_ids, results, strict=True):
         state, exists, finished_at = _state_of(result)
+        health = result.health if isinstance(result, ContainerSnapshot) else None
         healths.append(
-            AppHealth(app_id=app_id, state=state, exists=exists, finished_at=finished_at)
+            AppHealth(
+                app_id=app_id, state=state, exists=exists, finished_at=finished_at, health=health
+            )
         )
     return tuple(healths)
 

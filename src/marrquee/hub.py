@@ -24,12 +24,21 @@ from datetime import datetime
 from typing import Final, Literal
 
 from marrquee.addresses import app_url
-from marrquee.catalog import CATALOG, CatalogApp, apps_in_order, get_app, unavailable_reason
+from marrquee.catalog import (
+    CATALOG,
+    AppKind,
+    CatalogApp,
+    apps_in_order,
+    get_app,
+    unavailable_reason,
+)
 from marrquee.deploy import AddState, AppAdd, WiringGap
+from marrquee.docker_client import ContainerHealth
 from marrquee.health import AppHealth, HubState, LinkHealth, LinkState
 from marrquee.links import LinkCard, link_address, link_glyph
 from marrquee.login import LoginRecord, LoginStatus, login_status, pending_app_ids, reset_reminder
 from marrquee.questions import QuestionStep, question_steps_for
+from marrquee.vpn import TunnelPlace, tunnel_place_line
 from marrquee.words import (
     HUB_ALL_UP,
     HUB_CHIP_ADD_FAILED,
@@ -43,6 +52,9 @@ from marrquee.words import (
     HUB_LINK_LINE_DOWN,
     HUB_LINKS_ALL_UP,
     HUB_NOTHING_SET_UP,
+    VPN_LINE_CONNECTING,
+    VPN_LINE_NOT_SURE,
+    VPN_LINE_TUNNEL_DOWN,
     WIRING_CHIP_RUNNING,
     app_line_error,
     hub_announce_add_failed,
@@ -98,6 +110,12 @@ _LINK_CHIP_BY_STATE: dict[LinkState, str] = {
 # would open fine - dropping its link would be worse than an honest guess.
 _LINKED_STATES: frozenset[HubState] = frozenset({"up", "unknown"})
 
+# Gluetun's own signal, once its container is running: whether the tunnel
+# itself is proven, still connecting, or has dropped - distinct from
+# `HubState`, since a VPN's container can be "up" while its tunnel is
+# anything but (Docker's own health check tells the two apart).
+TunnelState = Literal["up", "connecting", "down", "unknown"]
+
 
 @dataclass(frozen=True)
 class HubTile:
@@ -108,7 +126,9 @@ class HubTile:
     "is this the one being added" flag. `note` carries a wiring gap's own
     amber sentence, and `actions` says which extra form (if any) the poster
     needs beside its usual link: `retry` for a failed add, `reconnect` for
-    an app whose wiring only partly finished.
+    an app whose wiring only partly finished. `kind` is copied straight
+    from the catalog so the template (and `HubTileOut`) can style the one
+    VPN poster differently without importing the catalog itself.
     """
 
     app_id: str
@@ -123,6 +143,7 @@ class HubTile:
     add_state: AddState | None = None
     note: str = ""
     actions: Literal["none", "retry", "reconnect"] = "none"
+    kind: AppKind = "arr"
 
 
 @dataclass(frozen=True)
@@ -159,7 +180,12 @@ class InstallRow:
 
 @dataclass(frozen=True)
 class HubView:
-    """Everything the Hub page draws, from one deploy's worth of apps."""
+    """Everything the Hub page draws, from one deploy's worth of apps.
+
+    `vpn_tunnel` is `None` when no VPN is installed - the one signal Story 5
+    needs before it can ever let qBittorrent run, read straight off the
+    same tile the poster itself draws so the two can never disagree.
+    """
 
     tiles: tuple[HubTile, ...]
     links: tuple[LinkTile, ...]
@@ -173,6 +199,7 @@ class HubView:
     proxied: bool
     empty: bool
     login: LoginView | None = None
+    vpn_tunnel: TunnelState | None = None
 
 
 LoginBanner = Literal["none", "choose", "reset", "applying", "pending"]
@@ -290,6 +317,7 @@ def hub_view(
     wiring_gaps: Sequence[WiringGap] = (),
     busy: bool = False,
     login: LoginView | None = None,
+    vpn_place: TunnelPlace | None = None,
 ) -> HubView:
     healths_by_id = {health.app_id: health for health in healths}
     gaps_by_id = {gap.app_id: gap for gap in wiring_gaps}
@@ -303,13 +331,19 @@ def hub_view(
     adding_new = adding is not None and adding.app_id not in deployed_ids
     tile_ids = (*app_ids, adding.app_id) if adding_new and adding is not None else tuple(app_ids)
 
-    def _build_tile(app: CatalogApp) -> HubTile:
+    def _build_tile(app: CatalogApp) -> tuple[HubTile, TunnelState | None]:
         if adding_new and adding is not None and app.id == adding.app_id:
-            return _adding_tile(app, adding)
-        tile = _tile(app, healths_by_id.get(app.id), authority=authority, now=now)
-        return _apply_add_overlay(tile, app, adding, gaps_by_id.get(app.id))
+            return _adding_tile(app, adding), None
+        tile, tunnel = _tile(
+            app, healths_by_id.get(app.id), authority=authority, now=now, vpn_place=vpn_place
+        )
+        return _apply_add_overlay(tile, app, adding, gaps_by_id.get(app.id)), tunnel
 
-    tiles = tuple(_build_tile(app) for app in apps_in_order(tile_ids))
+    built_tiles = tuple(_build_tile(app) for app in apps_in_order(tile_ids))
+    tiles = tuple(tile for tile, _ in built_tiles)
+    # At most one app is ever `kind="vpn"` today - the first (only) tunnel
+    # reading found wins, so this stays correct without assuming that.
+    vpn_tunnel = next((tunnel for _, tunnel in built_tiles if tunnel is not None), None)
     regular_tiles = tuple(
         tile
         for tile in tiles
@@ -327,7 +361,7 @@ def hub_view(
         )
         announce = f"{announce} {add_sentence}"
 
-    installable = tuple(app for app in CATALOG if app.id not in deployed_ids)
+    installable = tuple(app for app in CATALOG if app.offered and app.id not in deployed_ids)
     excluded_id = adding.app_id if adding is not None else None
     install_rows = tuple(
         InstallRow(
@@ -359,13 +393,33 @@ def hub_view(
         install_block=install_block,
         busy=busy,
         announce=announce,
-        any_down=any(tile.state == "down" for tile in regular_tiles),
+        any_down=any(
+            _counts_toward_any_down(tile, healths_by_id.get(tile.app_id)) for tile in regular_tiles
+        ),
         docker_unreachable=bool(regular_tiles)
         and all(tile.state == "unknown" for tile in regular_tiles),
         proxied=proxied,
         empty=not regular_tiles,
         login=login,
+        vpn_tunnel=vpn_tunnel,
     )
+
+
+def _counts_toward_any_down(tile: HubTile, health: AppHealth | None) -> bool:
+    """Whether a Down poster belongs in the "something needs attention"
+    count `any_down` drives the Hub's own down-note from.
+
+    A VPN tile reads Down the moment its tunnel drops, even while Gluetun's
+    container is still running and already retrying on its own - the
+    down-note's "start it again from your NAS" would be actively wrong
+    advice there, so only a stopped VPN container (the one case that advice
+    fits) counts.
+    """
+    if tile.state != "down":
+        return False
+    if tile.kind == "vpn" and health is not None and health.state == "up":
+        return False
+    return True
 
 
 def _adding_tile(app: CatalogApp, adding: AppAdd) -> HubTile:
@@ -384,6 +438,7 @@ def _adding_tile(app: CatalogApp, adding: AppAdd) -> HubTile:
             url=None,
             aria=None,
             add_state="starting",
+            kind=app.kind,
         )
     if adding.state == "wiring":
         return HubTile(
@@ -397,6 +452,7 @@ def _adding_tile(app: CatalogApp, adding: AppAdd) -> HubTile:
             url=None,
             aria=None,
             add_state="wiring",
+            kind=app.kind,
         )
 
     # adding.state == "error": a failed add, waiting for "Try again" or
@@ -413,6 +469,7 @@ def _adding_tile(app: CatalogApp, adding: AppAdd) -> HubTile:
         aria=None,
         add_state="error",
         actions="retry",
+        kind=app.kind,
     )
 
 
@@ -478,18 +535,26 @@ def _link_tile(card: LinkCard, health: LinkHealth | None) -> LinkTile:
 
 
 def _tile(
-    app: CatalogApp, health: AppHealth | None, *, authority: str | None, now: datetime
-) -> HubTile:
+    app: CatalogApp,
+    health: AppHealth | None,
+    *,
+    authority: str | None,
+    now: datetime,
+    vpn_place: TunnelPlace | None = None,
+) -> tuple[HubTile, TunnelState | None]:
+    if app.kind == "vpn":
+        return _vpn_tile(app, health, vpn_place, now)
+
     # No matching health reading (a deployed app Docker was never asked
     # about, or whose id it didn't recognise) is honestly "unknown", never
     # a silent "down".
     state: HubState = health.state if health is not None else "unknown"
     chip = _CHIP_BY_STATE[state]
-    # An app with no web page of its own (a reserved catalog kind no
-    # current app sets) never gets a link, whatever Docker says about it.
+    # An app with no web page of its own never gets a link, whatever Docker
+    # says about it.
     url = app_url(authority, app.port) if state in _LINKED_STATES and app.web_page else None
     aria = hub_open_app_aria(app.name, chip) if url is not None else None
-    return HubTile(
+    tile = HubTile(
         app_id=app.id,
         glyph=app.glyph,
         name=app.name,
@@ -499,7 +564,59 @@ def _tile(
         line=_line(app, state, url, health, now),
         url=url,
         aria=aria,
+        kind=app.kind,
     )
+    return tile, None
+
+
+def _vpn_tile(
+    app: CatalogApp, health: AppHealth | None, vpn_place: TunnelPlace | None, now: datetime
+) -> tuple[HubTile, TunnelState]:
+    """The VPN poster: never linked (Gluetun has no web page of its own),
+    and coloured by Gluetun's OWN health check once its container is
+    running - Docker's "running" alone says nothing about whether the
+    tunnel itself is up, only its own `State.Health.Status` does.
+
+    While the container isn't running at all, the ordinary arr-style
+    mapping and lines apply unchanged (a stopped VPN is an ordinary Down,
+    same as any other app) - only a running-but-unproven container gets the
+    tunnel-specific wording below.
+    """
+    state: HubState = health.state if health is not None else "unknown"
+    if health is not None and state == "up":
+        hub_state, line, tunnel = _vpn_running_tile(health.health, vpn_place)
+    else:
+        hub_state = state
+        line = _line(app, state, None, health, now)
+        tunnel = "unknown" if state == "unknown" else "down"
+
+    tile = HubTile(
+        app_id=app.id,
+        glyph=app.glyph,
+        name=app.name,
+        description=app.description,
+        state=hub_state,
+        chip=_CHIP_BY_STATE[hub_state],
+        line=line,
+        url=None,
+        aria=None,
+        kind=app.kind,
+    )
+    return tile, tunnel
+
+
+def _vpn_running_tile(
+    docker_health: ContainerHealth | None, vpn_place: TunnelPlace | None
+) -> tuple[HubState, str, TunnelState]:
+    if docker_health == "healthy":
+        return "up", tunnel_place_line(vpn_place), "up"
+    if docker_health == "starting":
+        return "starting", VPN_LINE_CONNECTING, "connecting"
+    if docker_health == "unhealthy":
+        return "down", VPN_LINE_TUNNEL_DOWN, "down"
+    # No HEALTHCHECK data at all (a changed image) is honestly "unknown",
+    # never a silent "up" the container's own running state can't back up.
+    return "unknown", VPN_LINE_NOT_SURE, "unknown"
 
 
 def _line(

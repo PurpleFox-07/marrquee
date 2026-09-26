@@ -26,7 +26,10 @@ from marrquee.words import (
     storage_check_message,
 )
 
-_KNOWN_APP_IDS = frozenset(app.id for app in CATALOG)
+# Only `offered` ids - the wizard's own initial install can never carry an
+# app (Gluetun) that isn't a choice on the screen that fed it; a non-offered
+# id in the posted list is refused the same way an unknown one is.
+_KNOWN_APP_IDS = frozenset(app.id for app in CATALOG if app.offered)
 
 InstallResultKind = Literal["ok", "invalid_input", "refused"]
 

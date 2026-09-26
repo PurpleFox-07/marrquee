@@ -18,6 +18,7 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 from test_deploy import (
+    _GLUETUN_ANSWERS,
     _FakeClock,
     _fresh_root,
     _happy_engine,
@@ -41,8 +42,11 @@ from marrquee.deploy import (
 from marrquee.docker_client import ComposeResult
 from marrquee.login import SavedLogin, load_login, save_login
 from marrquee.login_apply import FakeLoginApplier, LoginApplyResult
+from marrquee.questions import save_step_answers
 from marrquee.state import InstallState, load_state, save_state, write_json_atomic
 from marrquee.storage import read_marker
+from marrquee.vpn import TunnelPlace
+from marrquee.vpn_control import FakeGluetunControl, GluetunControl, NoGluetunControl
 from marrquee.wiring import WiringStep
 
 # --- A wiring runner that scripts `only_app` and one gap ---------------------
@@ -82,6 +86,7 @@ async def _deployed_to_finale(
     app_ids: tuple[str, ...] = ("prowlarr", "sonarr"),
     *,
     with_login: bool = True,
+    vpn: GluetunControl | None = None,
     **engine_kwargs: object,
 ) -> tuple[DeployManager, _StatefulEngine, Settings]:
     """A manager already at `finale` for `app_ids`, on the same stateful
@@ -117,6 +122,7 @@ async def _deployed_to_finale(
         clock=clock.time,
         sleep=clock.sleep,
         login=FakeLoginApplier(),
+        vpn=vpn if vpn is not None else NoGluetunControl(),
     )
     manager.start()
     history = await _run_to_terminal(manager)
@@ -244,6 +250,34 @@ async def test_the_grown_install_keeps_old_keys_marker_and_compose_list_all_thre
     assert "- marrquee" in radarr_service.split("networks:", 1)[1]
 
 
+async def test_an_add_threads_saved_vpn_answers_into_the_stack_plan(tmp_path: Path) -> None:
+    """`_run_add_steps`'s own `build_stack_plan` call has to pass the saved
+    answers through - adding Gluetun itself needs them to render at all.
+    """
+    place = TunnelPlace(
+        public_ip="185.1.1.1", city="Amsterdam", region="North Holland", country="Netherlands"
+    )
+    manager, engine, settings = await _deployed_to_finale(
+        tmp_path,
+        images={get_app(app_id).image for app_id in ("prowlarr", "sonarr", "gluetun")},
+        vpn=FakeGluetunControl(status="running", place=place),
+        health_frames={"gluetun": ["healthy"]},
+    )
+    save_step_answers(settings.config_dir, "gluetun", _GLUETUN_ANSWERS)
+
+    result = manager.add_app("gluetun")
+    assert result == "started"
+    final = await _finish_add(manager)
+
+    assert final.adding is None
+    assert [app.app_id for app in final.apps] == ["prowlarr", "sonarr", "gluetun"]
+    assert final.apps[-1].state == "done"
+
+    root_path = settings.host_mount / "volume1" / "media"
+    compose_text = (root_path / "marrquee" / "compose.yaml").read_text()
+    assert "\n  gluetun:\n" in compose_text
+
+
 # --- A failed add keeps everything else intact -------------------------------
 
 
@@ -320,6 +354,88 @@ async def test_cancel_removes_only_a_container_it_created_and_shrinks_install(
     root_path = settings.host_mount / "volume1" / "media"
     assert (root_path / "marrquee").exists()  # never deletes a folder
     assert manager.snapshot().adding is None
+
+
+async def test_cancel_of_a_failed_add_rewrites_compose_still_holding_gluetun(
+    tmp_path: Path,
+) -> None:
+    """`cancel_add`'s own `build_stack_plan` call has to pass the saved
+    answers through too - Gluetun (already installed here) still needs its
+    saved VPN answers to render, even though the app actually being
+    cancelled is a different one that never got that far.
+    """
+    place = TunnelPlace(
+        public_ip="185.1.1.1", city="Amsterdam", region="North Holland", country="Netherlands"
+    )
+    save_step_answers(tmp_path / "config", "gluetun", _GLUETUN_ANSWERS)
+    manager, engine, settings = await _deployed_to_finale(
+        tmp_path,
+        ("prowlarr", "gluetun"),
+        images={get_app(app_id).image for app_id in ("prowlarr", "gluetun", "radarr")},
+        vpn=FakeGluetunControl(status="running", place=place),
+        health_frames={"gluetun": ["healthy"]},
+    )
+    engine._compose_results["radarr"] = ComposeResult(  # type: ignore[attr-defined]
+        ok=False, exit_code=1, output="Error: port is already allocated"
+    )
+
+    manager.add_app("radarr")
+    failed = await _finish_add(manager)
+    assert failed.adding is not None and failed.adding.state == "error"
+
+    ok = await manager.cancel_add()
+    assert ok is True
+
+    after_cancel = load_state(settings.config_dir)
+    assert after_cancel is not None
+    assert after_cancel.app_ids == ("prowlarr", "gluetun")
+
+    root_path = settings.host_mount / "volume1" / "media"
+    compose_text = (root_path / "marrquee" / "compose.yaml").read_text()
+    assert "\n  gluetun:\n" in compose_text
+
+
+async def test_cancel_of_a_failed_add_survives_gluetuns_answers_going_bad(
+    tmp_path: Path,
+) -> None:
+    """A DIFFERENT app's failed add is cancelled while Gluetun (already
+    installed) has since been left with unusable saved answers -
+    `cancel_add`'s own `build_stack_plan` call can't succeed, but the
+    cancel itself must still complete: no exception, `adding` cleared,
+    the app still removed from install.json.
+    """
+    place = TunnelPlace(
+        public_ip="185.1.1.1", city="Amsterdam", region="North Holland", country="Netherlands"
+    )
+    save_step_answers(tmp_path / "config", "gluetun", _GLUETUN_ANSWERS)
+    manager, engine, settings = await _deployed_to_finale(
+        tmp_path,
+        ("prowlarr", "gluetun"),
+        images={get_app(app_id).image for app_id in ("prowlarr", "gluetun", "radarr")},
+        vpn=FakeGluetunControl(status="running", place=place),
+        health_frames={"gluetun": ["healthy"]},
+    )
+    engine._compose_results["radarr"] = ComposeResult(  # type: ignore[attr-defined]
+        ok=False, exit_code=1, output="Error: port is already allocated"
+    )
+
+    manager.add_app("radarr")
+    failed = await _finish_add(manager)
+    assert failed.adding is not None and failed.adding.state == "error"
+
+    # Gluetun's saved answers go bad AFTER the successful deploy - a blank
+    # provider is refused by `check_vpn_answers`, so `build_stack_plan`
+    # raises (with no value in its message) the moment cancel tries to
+    # rewrite compose.yaml.
+    save_step_answers(settings.config_dir, "gluetun", {"provider": ""})
+
+    ok = await manager.cancel_add()
+    assert ok is True
+    assert manager.snapshot().adding is None
+
+    after_cancel = load_state(settings.config_dir)
+    assert after_cancel is not None
+    assert after_cancel.app_ids == ("prowlarr", "gluetun")
 
 
 async def test_cancel_never_removes_a_container_it_did_not_create(tmp_path: Path) -> None:

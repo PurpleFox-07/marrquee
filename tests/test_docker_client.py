@@ -27,6 +27,21 @@ from marrquee.docker_client import (
     detect_host_kind,
 )
 
+_HEALTHY = ("HTTP/1.1 200 OK", b'{"State": {"Status": "running", "Health": {"Status": "healthy"}}}')
+_STARTING = (
+    "HTTP/1.1 200 OK",
+    b'{"State": {"Status": "running", "Health": {"Status": "starting"}}}',
+)
+_UNHEALTHY = (
+    "HTTP/1.1 200 OK",
+    b'{"State": {"Status": "running", "Health": {"Status": "unhealthy"}}}',
+)
+_HEALTH_NONE = (
+    "HTTP/1.1 200 OK",
+    b'{"State": {"Status": "running", "Health": {"Status": "none"}}}',
+)
+_NO_HEALTH_BLOCK = ("HTTP/1.1 200 OK", b'{"State": {"Status": "running"}}')
+
 
 async def test_talks_http_over_a_unix_socket_and_reads_the_version(docker_stub):
     """FIRST TEST - the plan's weakest assumption: does our client actually
@@ -279,6 +294,21 @@ async def test_inspect_reports_a_real_finished_at_when_the_container_stopped(doc
     snapshot = await engine.inspect("sonarr")
 
     assert snapshot.finished_at == "2026-09-19T10:05:00Z"
+
+
+async def test_inspect_parses_healthy_starting_unhealthy_none_and_absent_health(docker_stub):
+    """FIRST TEST - the plan's weakest assumption: Docker's inspect reply
+    carries `State.Health.Status` in {starting, healthy, unhealthy}, and a
+    container with no HEALTHCHECK (every arr image today) must parse to
+    `None`, never to a made-up value.
+    """
+    stub, socket_path = docker_stub
+    stub.respond_with_sequence([_HEALTHY, _STARTING, _UNHEALTHY, _HEALTH_NONE, _NO_HEALTH_BLOCK])
+    engine = SocketDockerEngine(socket_path=socket_path)
+
+    results = [(await engine.inspect("gluetun")).health for _ in range(5)]
+
+    assert results == ["healthy", "starting", "unhealthy", None, None]
 
 
 # --- image_present() ------------------------------------------------------
@@ -911,6 +941,101 @@ async def test_the_fake_defaults_remove_container_to_ok() -> None:
     result = await fake.remove_container("radarr")
 
     assert result.ok is True
+
+
+# --- FakeDockerEngine: scripted logs and health frames ---------------------
+
+
+async def test_the_fake_returns_scripted_logs_by_name_else_empty() -> None:
+    fake = FakeDockerEngine(DockerStatus(connected=True), logs={"gluetun": "...AUTH_FAILED..."})
+
+    assert await fake.logs("gluetun") == "...AUTH_FAILED..."
+    assert await fake.logs("sonarr") == ""
+
+
+async def test_the_fake_drains_scripted_frames_then_repeats_the_last_one() -> None:
+    """A VPN that becomes healthy over time is state the fake must model -
+    see the docker-fakes-model-state rule.
+    """
+    starting = ContainerSnapshot(
+        name="gluetun",
+        exists=True,
+        state="running",
+        exit_code=None,
+        image=None,
+        detail=None,
+        health="starting",
+    )
+    healthy = ContainerSnapshot(
+        name="gluetun",
+        exists=True,
+        state="running",
+        exit_code=None,
+        image=None,
+        detail=None,
+        health="healthy",
+    )
+    fake = FakeDockerEngine(DockerStatus(connected=True), frames={"gluetun": [starting, healthy]})
+
+    results = [(await fake.inspect("gluetun")).health for _ in range(4)]
+
+    assert results == ["starting", "healthy", "healthy", "healthy"]
+
+
+async def test_scripted_frames_win_over_containers_even_after_a_recreate() -> None:
+    """Amendment: `frames[name]` always wins over `_containers`, including a
+    snapshot `_model_recreate` itself just wrote - a scripted health-check
+    script must not be shadowed by compose recreating the container.
+    """
+    stale = ContainerSnapshot(
+        name="gluetun", exists=True, state="running", exit_code=None, image=None, detail=None
+    )
+    scripted = ContainerSnapshot(
+        name="gluetun",
+        exists=True,
+        state="running",
+        exit_code=None,
+        image=None,
+        detail=None,
+        health="healthy",
+    )
+    fake = FakeDockerEngine(
+        DockerStatus(connected=True),
+        containers={"gluetun": stale},
+        frames={"gluetun": [scripted]},
+        compose_results={"gluetun": ComposeResult(ok=True, exit_code=0, output="")},
+    )
+
+    await fake.compose_up("marrquee-apps", Path("/tmp/compose.yaml"), "gluetun", recreate=True)
+    result = await fake.inspect("gluetun")
+
+    assert result.health == "healthy"
+
+
+async def test_model_recreate_carries_the_previous_health_forward() -> None:
+    """A real recreate doesn't reset Docker's own health-check history -
+    the container keeps its last reported health until the new health check
+    runs and reports otherwise.
+    """
+    previously_healthy = ContainerSnapshot(
+        name="gluetun",
+        exists=True,
+        state="running",
+        exit_code=None,
+        image=None,
+        detail=None,
+        health="healthy",
+    )
+    fake = FakeDockerEngine(
+        DockerStatus(connected=True),
+        containers={"gluetun": previously_healthy},
+        compose_results={"gluetun": ComposeResult(ok=True, exit_code=0, output="")},
+    )
+
+    await fake.compose_up("marrquee-apps", Path("/tmp/compose.yaml"), "gluetun", recreate=True)
+    result = await fake.inspect("gluetun")
+
+    assert result.health == "healthy"
 
 
 async def test_a_scripted_remove_failure_keeps_the_container_in_place() -> None:

@@ -68,4 +68,5 @@ extend-immutable-calls = [
     "marrquee.deploy.HttpReadinessProbe",
     "marrquee.wiring.NoWiringYet",
     "marrquee.login_apply.NoLoginApplier",
+    "marrquee.vpn_control.NoGluetunControl",
 ]

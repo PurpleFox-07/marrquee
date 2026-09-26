@@ -1252,6 +1252,169 @@ _LOGIN_WORDS: tuple[str, ...] = (
 # end One login section
 # =============================================================================
 
+# =============================================================================
+# VPN - Gluetun's provider list, the questions it asks, and how it reports
+# whether the tunnel is actually protecting a download
+# =============================================================================
+
+VPN_DESCRIPTION = (
+    "Keeps your downloads private: everything your downloader sends goes "
+    "through your VPN company, and nothing gets out if the VPN drops."
+)
+
+VPN_STEP_TITLE = "Your VPN"
+VPN_STEP_LEDE = (
+    "Choose the VPN company you already pay for, then enter its login. "
+    "Marrquee proves the tunnel is really protecting your downloads before it uses it."
+)
+
+VPN_PROVIDER_LABEL = "VPN company"
+VPN_PROVIDER_PLACEHOLDER = "Choose your VPN company"
+VPN_PROVIDER_NEEDS_FILES = "needs extra key files Marrquee can't take yet"
+VPN_GUIDE_LINK = "Where do I find these? Open the guide for your VPN company"
+VPN_GUIDE_INDEX_URL = "https://github.com/qdm12/gluetun-wiki/tree/main/setup/providers"
+
+VPN_TYPE_LABEL = "Connection type"
+VPN_TYPE_OPENVPN = "OpenVPN"
+VPN_TYPE_OPENVPN_HINT = "Works with almost every VPN company."
+VPN_TYPE_WIREGUARD = "WireGuard"
+VPN_TYPE_WIREGUARD_HINT = "Faster, when your VPN company supports it."
+
+VPN_OPENVPN_USER_LABEL = "OpenVPN username"
+VPN_OPENVPN_USER_HINT = (
+    "Most companies show a separate VPN username on their website - it's "
+    "often not your account email."
+)
+VPN_OPENVPN_PASSWORD_LABEL = "OpenVPN password"
+VPN_OPENVPN_PASSWORD_HINT = "From the same page as your username, not your account password."
+
+VPN_WIREGUARD_KEY_LABEL = "WireGuard private key"
+VPN_WIREGUARD_KEY_HINT = "A base64 key, exactly 32 bytes once decoded."
+VPN_WIREGUARD_ADDRESS_LABEL = "WireGuard address"
+VPN_WIREGUARD_ADDRESS_HINT = "Given by your VPN company, like 10.64.0.2/32."
+VPN_WIREGUARD_PSK_LABEL = "WireGuard pre-shared key"
+VPN_WIREGUARD_PSK_HINT = "Optional - only fill this in if your VPN company gave you one."
+
+VPN_COUNTRIES_LABEL = "Server country"
+VPN_COUNTRIES_HINT = "Leave empty and your VPN picks for you. Use English names, like Netherlands."
+
+VPN_PROBLEM_PICK_PROVIDER = "Choose your VPN company before continuing."
+
+
+def vpn_problem_provider_unavailable(label: str) -> str:
+    return f"{label} isn't available yet - {VPN_PROVIDER_NEEDS_FILES}."
+
+
+def vpn_problem_type_unsupported(label: str, type_label: str) -> str:
+    return f"{label} doesn't support {type_label}. Choose the other connection type."
+
+
+VPN_PROBLEM_OPENVPN_USER = "Enter your OpenVPN username."
+VPN_PROBLEM_OPENVPN_PASSWORD = "Enter your OpenVPN password."
+VPN_PROBLEM_WG_KEY = (
+    "That WireGuard private key isn't valid - it should be a base64 key, 32 bytes once decoded."
+)
+VPN_PROBLEM_WG_ADDRESS = "This VPN company needs a WireGuard address, like 10.64.0.2/32."
+VPN_PROBLEM_WG_PSK = (
+    "That WireGuard pre-shared key isn't valid - it should be a base64 key, 32 bytes once decoded."
+)
+VPN_PROBLEM_TOO_LONG = "That's too long - use at most 256 characters."
+
+VPN_LINE_CONNECTING = "Connecting to your VPN company…"
+
+
+def vpn_line_protected_place(place: str) -> str:
+    return f"Protected - your downloads appear to come from {place}"
+
+
+VPN_LINE_PROTECTED = "Protected - your downloads go through your VPN."
+VPN_LINE_TUNNEL_DOWN = (
+    "Your VPN tunnel dropped. Nothing downloads until it reconnects - it keeps trying by itself."
+)
+VPN_LINE_NOT_SURE = "Marrquee can't tell yet whether your VPN is protecting your downloads."
+VPN_NOTE_SLOW = "Still working - your VPN company can take a minute or two to connect."
+
+
+def failure_vpn_refused(company: str) -> str:
+    return (
+        f"{company} refused your VPN login. Check the username and password you "
+        "saved, then press Try again."
+    )
+
+
+def failure_vpn_settings_refused(company: str) -> str:
+    return f"{company} refused these VPN settings. Check them, then press Try again."
+
+
+def failure_vpn_not_connected(minutes: int) -> str:
+    return (
+        f"Your VPN never connected after {minutes} minutes. Check your VPN login "
+        "and settings, then press Try again."
+    )
+
+
+FAILURE_VPN_NO_TUN = (
+    "This machine doesn't offer a VPN tunnel device. Check that /dev/net/tun is "
+    "available, then press Try again."
+)
+
+VPN_SECRETS_MOUNT_COMMENT = (
+    "Your VPN login lives only in this folder, root-only on this machine. Gluetun "
+    "reads it directly - it never appears in this file."
+)
+
+_VPN_WORDS: tuple[str, ...] = (
+    "VPN_DESCRIPTION",
+    "VPN_STEP_TITLE",
+    "VPN_STEP_LEDE",
+    "VPN_PROVIDER_LABEL",
+    "VPN_PROVIDER_PLACEHOLDER",
+    "VPN_PROVIDER_NEEDS_FILES",
+    "VPN_GUIDE_LINK",
+    "VPN_GUIDE_INDEX_URL",
+    "VPN_TYPE_LABEL",
+    "VPN_TYPE_OPENVPN",
+    "VPN_TYPE_OPENVPN_HINT",
+    "VPN_TYPE_WIREGUARD",
+    "VPN_TYPE_WIREGUARD_HINT",
+    "VPN_OPENVPN_USER_LABEL",
+    "VPN_OPENVPN_USER_HINT",
+    "VPN_OPENVPN_PASSWORD_LABEL",
+    "VPN_OPENVPN_PASSWORD_HINT",
+    "VPN_WIREGUARD_KEY_LABEL",
+    "VPN_WIREGUARD_KEY_HINT",
+    "VPN_WIREGUARD_ADDRESS_LABEL",
+    "VPN_WIREGUARD_ADDRESS_HINT",
+    "VPN_WIREGUARD_PSK_LABEL",
+    "VPN_WIREGUARD_PSK_HINT",
+    "VPN_COUNTRIES_LABEL",
+    "VPN_COUNTRIES_HINT",
+    "VPN_PROBLEM_PICK_PROVIDER",
+    "vpn_problem_provider_unavailable",
+    "vpn_problem_type_unsupported",
+    "VPN_PROBLEM_OPENVPN_USER",
+    "VPN_PROBLEM_OPENVPN_PASSWORD",
+    "VPN_PROBLEM_WG_KEY",
+    "VPN_PROBLEM_WG_ADDRESS",
+    "VPN_PROBLEM_WG_PSK",
+    "VPN_PROBLEM_TOO_LONG",
+    "VPN_LINE_CONNECTING",
+    "vpn_line_protected_place",
+    "VPN_LINE_PROTECTED",
+    "VPN_LINE_TUNNEL_DOWN",
+    "VPN_LINE_NOT_SURE",
+    "VPN_NOTE_SLOW",
+    "failure_vpn_refused",
+    "failure_vpn_settings_refused",
+    "failure_vpn_not_connected",
+    "FAILURE_VPN_NO_TUN",
+    "VPN_SECRETS_MOUNT_COMMENT",
+)
+
+# =============================================================================
+# end VPN section
+# =============================================================================
+
 # The full review surface: every public name above, in one tuple. A later
 # feature area adds its own fenced section above this line, then extends
 # this tuple with its own `_..._WORDS` name - never editing an earlier
@@ -1265,4 +1428,5 @@ WORDS_INVENTORY: tuple[str, ...] = (
     *_HUB_LINK_WORDS,
     *_HUB_INSTALL_WORDS,
     *_LOGIN_WORDS,
+    *_VPN_WORDS,
 )

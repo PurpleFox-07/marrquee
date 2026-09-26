@@ -231,9 +231,16 @@ def _links(apps: tuple[AppProgress, ...], authority: str | None) -> tuple[LinkVi
     """Built in every phase, from each app's own port - the template
     reveals these only at the finale, but drawing them once here means the
     script never has to build a link (or an innerHTML) itself.
+
+    An app with no web page of its own (Gluetun, so far) never gets a link,
+    whatever port its catalog entry carries - that port is the control
+    server's, and it opens nothing worth an "Open" button.
     """
     links = []
     for app in apps:
+        catalog_app = _CATALOG_BY_ID.get(app.app_id)
+        if catalog_app is not None and not catalog_app.web_page:
+            continue
         url = app_url(authority, app.port)
         if url is not None:
             links.append(LinkView(label=open_app_label(app.name), url=url))

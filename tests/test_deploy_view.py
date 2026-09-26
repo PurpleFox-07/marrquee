@@ -352,6 +352,26 @@ def test_links_are_built_in_every_phase_not_only_the_finale() -> None:
     )
 
 
+def test_the_vpn_gets_no_open_link_even_once_its_container_is_done() -> None:
+    """The VPN has no web page of its own - a poster that could never open
+    anything would be worse than no poster at all.
+    """
+    state = _install_state(("prowlarr", "gluetun"), "/volume1/media")
+    snapshot = _snapshot(
+        phase="finale",
+        apps=(
+            _progress("prowlarr", "Prowlarr", "done", port=9696),
+            _progress("gluetun", "VPN", "done", port=8000),
+        ),
+    )
+
+    view = deploy_view(state, snapshot, authority="192.168.1.50:7788")
+
+    assert view.links == (
+        LinkView(label=open_app_label("Prowlarr"), url="http://192.168.1.50:9696/"),
+    )
+
+
 # --- No technical string can ever reach a view -------------------------------------
 
 

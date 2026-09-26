@@ -236,7 +236,7 @@ jobs:
   # job's `needs:` either. A red run here is loud (this job still fails, and
   # the whole workflow shows red) but it never holds back `:latest`.
   stack-smoke:
-    name: Real-Docker stack smoke (two arr apps, then add one from the Hub)
+    name: Real-Docker stack smoke (two arr apps, then add one from the Hub, then a VPN with a throwaway login)
     needs: test
     runs-on: ubuntu-latest
     steps:
@@ -759,6 +759,301 @@ jobs:
           echo "::error::Radarr never read Down with a last-seen line within 30 seconds of docker stop"
           exit 1
 
+      # Gluetun's own credential, generated fresh for this run and masked
+      # immediately - deliberately a SEPARATE variable from
+      # MARRQUEE_CI_PASSWORD (the one every arr app shares), so a leak of
+      # one can never be mistaken for a leak of the other two steps down.
+      - name: Generate a throwaway VPN login
+        run: |
+          pw=$(openssl rand -hex 16)
+          echo "::add-mask::$pw"
+          echo "MARRQUEE_CI_VPN_PASSWORD=$pw" >> "$GITHUB_ENV"
+
+      # Gluetun has no wizard or "+" tile of its own - the Hub's own install
+      # endpoint is the only door in. It requires a login to already be
+      # chosen and the deploy manager to be idle, both already true by this
+      # point in the job. A fake ProtonVPN login can never actually connect
+      # - that's the point of this whole job: it proves the tunnel device
+      # and capability land on the container itself, and (a few steps down)
+      # that the failure is reported in plain words instead of a spinner.
+      # The container is created asynchronously by the add run, so `docker
+      # inspect` is retried rather than assumed to be ready the instant the
+      # 202 comes back.
+      - name: Add the VPN with a throwaway login
+        run: |
+          response=$(curl -s -w '\n%{http_code}' -X POST \
+            http://127.0.0.1:7788/api/hub/apps/gluetun/install \
+            -H "Content-Type: application/json" \
+            -d "{\"answers\":{\"provider\":\"protonvpn\",\"vpn_type\":\"openvpn\",\"openvpn_user\":\"marrquee-ci-not-a-user\",\"openvpn_password\":\"${MARRQUEE_CI_VPN_PASSWORD}\"}}")
+          code=$(echo "$response" | tail -n1)
+          body=$(echo "$response" | sed '$d')
+          echo "hub install response (${code}): ${body}"
+          if [ "$code" != "202" ]; then
+            echo "::error::POST /api/hub/apps/gluetun/install returned ${code}, expected 202: ${body}"
+            exit 1
+          fi
+
+          gluetun_ready=false
+          for _ in $(seq 1 30); do
+            if docker inspect gluetun > /dev/null 2>&1; then
+              gluetun_ready=true
+              break
+            fi
+            sleep 2
+          done
+          if [ "$gluetun_ready" != "true" ]; then
+            echo "::error::Gluetun's container never appeared within 60 seconds of the install call"
+            exit 1
+          fi
+
+          cap_add=$(docker inspect -f '{{json .HostConfig.CapAdd}}' gluetun)
+          devices=$(docker inspect -f '{{json .HostConfig.Devices}}' gluetun)
+          echo "gluetun CapAdd: $cap_add"
+          echo "gluetun Devices: $devices"
+          if ! echo "$cap_add" | grep -q "NET_ADMIN"; then
+            echo "::error::Gluetun did not get the tunnel device"
+            exit 1
+          fi
+          if ! echo "$devices" | grep -q '"PathOnHost":"/dev/net/tun"'; then
+            echo "::error::Gluetun did not get the tunnel device"
+            exit 1
+          fi
+
+      # A fake login can never connect - it either shows up as AUTH_FAILED
+      # in Gluetun's own log (vpn_refused) or, if that never surfaces
+      # cleanly against a throwaway ProtonVPN account, times out at
+      # Gluetun's own 120-second budget (vpn_not_connected). Both are
+      # accepted here; what must never happen is the Hub reporting a fake
+      # login as connected.
+      - name: Poll GET /api/hub/status until the VPN's add reports its plain failure (4 minute budget)
+        run: |
+          add_state=""
+          line=""
+          for _ in $(seq 1 120); do
+            status=$(curl -fsS http://127.0.0.1:7788/api/hub/status)
+            gluetun=$(echo "$status" | jq -c '.apps[] | select(.app_id == "gluetun")')
+            state=$(echo "$gluetun" | jq -r '.state')
+            add_state=$(echo "$gluetun" | jq -r '.add_state')
+            line=$(echo "$gluetun" | jq -r '.line')
+            echo "gluetun state: $state / add_state: $add_state"
+            if [ "$state" = "up" ]; then
+              echo "::error::A fake VPN login was reported as connected"
+              exit 1
+            fi
+            if [ "$add_state" = "error" ]; then
+              break
+            fi
+            sleep 2
+          done
+          if [ "$add_state" != "error" ]; then
+            echo "::error::Gluetun's add never reached add_state=error within 4 minutes"
+            exit 1
+          fi
+          echo "GLUETUN_LINE=$line" >> "$GITHUB_ENV"
+
+      # The tile's `line` is `headline + " " + what_to_do` (hub.py's
+      # `_add_failure_line`) - split the two candidate sentences the same
+      # way, inside the container, so this compares against exactly what
+      # the running code would say rather than a copy pasted into the
+      # workflow.
+      - name: Assert the VPN failure is one of the two plain sentences
+        run: |
+          cat > "$RUNNER_TEMP/vpn_expected_lines.py" <<'PY'
+          from marrquee.deploy import DeployManager, _split_failure_text
+          from marrquee.vpn import find_provider
+          from marrquee.words import failure_vpn_not_connected, failure_vpn_refused
+
+          company = find_provider("protonvpn")
+          assert company is not None
+          minutes = round(DeployManager.TUNNEL_NEVER_UP_AFTER_SECONDS / 60)
+
+          headline, what_to_do = _split_failure_text(failure_vpn_refused(company.label))
+          print(f"{headline} {what_to_do}")
+
+          headline, what_to_do = _split_failure_text(failure_vpn_not_connected(minutes))
+          print(f"{headline} {what_to_do}")
+          PY
+
+          docker cp "$RUNNER_TEMP/vpn_expected_lines.py" marrquee-stack-smoke:/tmp/vpn_expected_lines.py
+          expected=$(docker exec marrquee-stack-smoke python /tmp/vpn_expected_lines.py)
+          echo "expected sentences:"
+          echo "$expected"
+          if ! echo "$expected" | grep -qxF "$GLUETUN_LINE"; then
+            echo "::error::the failed VPN tile's line matched neither the vpn_refused nor the vpn_not_connected sentence"
+            exit 1
+          fi
+          echo "::notice::the fake VPN login failed as expected: $GLUETUN_LINE"
+
+      # Gluetun's control server treats every route as private by default -
+      # proven here with no VPN account at all: a request with no key is
+      # refused, and the key Marrquee generated and wrote into its own auth
+      # file is accepted. Run from inside Marrquee's own container (root),
+      # on the same Docker network Gluetun joins, reaching it by container
+      # name the same way an app behind the tunnel would.
+      - name: Assert Gluetun's control server wants Marrquee's key
+        run: |
+          cat > "$RUNNER_TEMP/vpn_control_auth_check.py" <<'PY'
+          import asyncio
+          import json
+
+          import httpx
+
+
+          async def main() -> None:
+              async with httpx.AsyncClient(timeout=5.0) as client:
+                  unauthenticated = await client.get("http://gluetun:8000/v1/vpn/status")
+                  if unauthenticated.status_code != 401:
+                      raise SystemExit(
+                          f"no key: expected 401, got {unauthenticated.status_code}"
+                      )
+
+                  with open("/config/install.json", encoding="utf-8") as handle:
+                      install = json.load(handle)
+                  api_key = install["api_keys"]["gluetun"]
+                  if not api_key:
+                      raise SystemExit("gluetun has no api key in install.json")
+
+                  authenticated = await client.get(
+                      "http://gluetun:8000/v1/vpn/status", headers={"X-API-Key": api_key}
+                  )
+                  if authenticated.status_code != 200:
+                      raise SystemExit(
+                          f"with key: expected 200, got {authenticated.status_code}"
+                      )
+                  body = authenticated.json()
+                  if "status" not in body:
+                      raise SystemExit(f"with key: response carried no status field: {body!r}")
+
+
+          asyncio.run(main())
+          PY
+
+          docker cp "$RUNNER_TEMP/vpn_control_auth_check.py" marrquee-stack-smoke:/tmp/vpn_control_auth_check.py
+          if ! output=$(docker exec marrquee-stack-smoke python /tmp/vpn_control_auth_check.py 2>&1); then
+            echo "$output"
+            MESSAGE="Gluetun's control server auth check failed: ${output}" \
+              python3 -c "import os; text = os.environ['MESSAGE'][:500].replace('%', '%25').replace(chr(13), '%0D').replace(chr(10), '%0A').replace('::', ': :'); print('::error::' + text)"
+            exit 1
+          fi
+          echo "$output"
+
+      # A fake login never proves the tunnel, but the kill switch must hold
+      # regardless - this waits for Gluetun's own restart-on-failure loop to
+      # land on a running container before the pair below, so a missing
+      # container can never make `--network container:gluetun` fail for an
+      # unrelated reason and pass vacuously.
+      - name: Assert Gluetun's container is running before the kill-switch check
+        run: |
+          running=false
+          for _ in $(seq 1 30); do
+            state=$(docker inspect -f '{{.State.Running}}' gluetun 2>/dev/null || echo "false")
+            if [ "$state" = "true" ]; then
+              running=true
+              break
+            fi
+            sleep 2
+          done
+          if [ "$running" != "true" ]; then
+            echo "::error::Gluetun's container was not running before the kill-switch check - it would pass vacuously"
+            exit 1
+          fi
+
+      # Gluetun's firewall only lets traffic out through the tunnel
+      # (FIREWALL_ENABLED_DISABLING_IT_SHOOTS_YOU_IN_YOUR_FOOT="on", written
+      # out explicitly rather than left as an implicit default) - proven
+      # here against a real daemon: a container sharing Gluetun's network
+      # namespace cannot reach the open internet while the tunnel is down,
+      # while the runner's own network can.
+      - name: Assert nothing gets out without the tunnel
+        run: |
+          if ! docker run --rm alpine:3.20 wget -q -T 5 -O /dev/null http://1.1.1.1; then
+            echo "::error::the runner itself could not reach 1.1.1.1 - the kill-switch control case is invalid"
+            exit 1
+          fi
+          if docker run --rm --network container:gluetun alpine:3.20 wget -q -T 5 -O /dev/null http://1.1.1.1; then
+            echo "::error::Traffic left through the kill switch"
+            exit 1
+          fi
+
+      # The VPN login goes into Gluetun's own root-only secret files, never
+      # into compose.yaml (which this very job already proved is readable
+      # by the runner) or the diagnostics endpoint.
+      - name: Assert the VPN login stays out of compose.yaml and diagnostics
+        run: |
+          compose_file="$RUNNER_TEMP/marrquee-smoke/media/marrquee/compose.yaml"
+          diagnostics=$(curl -fsS http://127.0.0.1:7788/api/deploy/diagnostics || true)
+          for needle in "marrquee-ci-not-a-user" "$MARRQUEE_CI_VPN_PASSWORD"; do
+            if grep -qF "$needle" "$compose_file"; then
+              echo "::error::the VPN login appears in compose.yaml"
+              exit 1
+            fi
+            if echo "$diagnostics" | grep -qF "$needle"; then
+              echo "::error::the VPN login appears in the diagnostics endpoint"
+              exit 1
+            fi
+          done
+
+      # The runner mounts its own temp root at /host<that same path> inside
+      # Marrquee's container - so the secrets folder (root-only, written by
+      # the root container) is checked from INSIDE that container, never by
+      # the unprivileged runner, which the folder's own mode must keep out.
+      - name: Assert the VPN secrets folder is root-only
+        run: |
+          secrets_dir="/host${RUNNER_TEMP}/marrquee-smoke/media/marrquee/vpn"
+          dir_perms=$(docker exec marrquee-stack-smoke stat -c '%a %u' "$secrets_dir")
+          echo "vpn secrets folder: $dir_perms"
+          if [ "$dir_perms" != "700 0" ]; then
+            echo "::error::the VPN secrets folder was not 700 root (got: ${dir_perms})"
+            exit 1
+          fi
+
+          files=$(docker exec marrquee-stack-smoke sh -c "ls -A '${secrets_dir}'")
+          if [ -z "$files" ]; then
+            echo "::error::the VPN secrets folder had no files to check"
+            exit 1
+          fi
+          while IFS= read -r name; do
+            file_perms=$(docker exec marrquee-stack-smoke stat -c '%a %u' "${secrets_dir}/${name}")
+            echo "vpn secret file ${name}: ${file_perms}"
+            if [ "$file_perms" != "600 0" ]; then
+              echo "::error::${name} in the VPN secrets folder was not 600 root (got: ${file_perms})"
+              exit 1
+            fi
+          done <<< "$files"
+
+      - name: Cancel the VPN add
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:7788/hub/apps/gluetun/cancel)
+          if [ "$code" != "303" ]; then
+            echo "::error::POST /hub/apps/gluetun/cancel returned ${code}, expected 303"
+            exit 1
+          fi
+
+      - name: Poll GET /api/hub/status until gluetun is fully removed (2 minute budget)
+        run: |
+          for _ in $(seq 1 60); do
+            status=$(curl -fsS http://127.0.0.1:7788/api/hub/status)
+            if ! echo "$status" | jq -e '.apps[] | select(.app_id == "gluetun")' > /dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::gluetun never left /api/hub/status after cancel within 2 minutes"
+          exit 1
+
+      - name: Assert cancel removed Gluetun's container and cleared its secrets
+        run: |
+          if docker inspect gluetun > /dev/null 2>&1; then
+            echo "::error::gluetun's container still exists after cancel"
+            exit 1
+          fi
+          secrets_dir="/host${RUNNER_TEMP}/marrquee-smoke/media/marrquee/vpn"
+          remaining=$(docker exec marrquee-stack-smoke sh -c "ls -A '${secrets_dir}'")
+          if [ -n "$remaining" ]; then
+            echo "::error::the VPN secrets folder still had files after cancel"
+            exit 1
+          fi
+
       # The one place technical detail is allowed to show up, and exactly
       # where a first-time developer needs it: a red run here is debuggable
       # from the workflow's own log, not just "it failed". The same text
@@ -783,7 +1078,7 @@ jobs:
       - name: Clean up every container, network and temp folder this job made
         if: always()
         run: |
-          docker rm -f prowlarr sonarr radarr marrquee-stack-smoke 2>/dev/null || true
+          docker rm -f prowlarr sonarr radarr gluetun marrquee-stack-smoke 2>/dev/null || true
           docker network rm marrquee 2>/dev/null || true
           # Some of what's under here (a container's own /config contents)
           # can be created by the Docker daemon as root, which would block a

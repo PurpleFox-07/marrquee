@@ -7,6 +7,7 @@
 <link rel="stylesheet" href="{{ url_for('static', path='css/poster.css') }}">
 <link rel="stylesheet" href="{{ url_for('static', path='css/hub.css') }}">
 <script defer src="{{ url_for('static', path='js/hub.js') }}"></script>
+<script defer src="{{ url_for('static', path='js/questions.js') }}"></script>
 {% endblock %}
 
 {% block content %}
@@ -89,6 +90,7 @@
         <a
           class="poster hub-poster"
           data-app="{{ tile.app_id }}"
+          data-kind="{{ tile.kind }}"
           data-state="{{ tile.state }}"
           {% if tile.add_state %}data-add-state="{{ tile.add_state }}"{% endif %}
           {% if tile.url %}href="{{ tile.url }}" aria-label="{{ tile.aria }}"{% endif %}

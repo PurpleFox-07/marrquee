@@ -11,12 +11,13 @@ asserted on literally.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
 
 import pytest
 import yaml
 
-from marrquee import compose, words
+from marrquee import compose, vpn, words
 from marrquee.config import Settings
 from marrquee.state import STATE_VERSION, InstallState
 
@@ -25,10 +26,16 @@ from marrquee.state import STATE_VERSION, InstallState
 _PROWLARR_KEY = "1" * 32
 _SONARR_KEY = "2" * 32
 _RADARR_KEY = "3" * 32
+_GLUETUN_KEY = "4" * 32
 
 
 def _fixture_state(app_ids: tuple[str, ...] = ("prowlarr", "sonarr", "radarr")) -> InstallState:
-    all_keys = {"prowlarr": _PROWLARR_KEY, "sonarr": _SONARR_KEY, "radarr": _RADARR_KEY}
+    all_keys = {
+        "prowlarr": _PROWLARR_KEY,
+        "sonarr": _SONARR_KEY,
+        "radarr": _RADARR_KEY,
+        "gluetun": _GLUETUN_KEY,
+    }
     return InstallState(
         version=STATE_VERSION,
         storage_root="/volume1/media",
@@ -42,12 +49,117 @@ def _fixture_state(app_ids: tuple[str, ...] = ("prowlarr", "sonarr", "radarr")) 
     )
 
 
-def _rendered_doc(state: InstallState) -> dict[str, object]:
-    plan = compose.build_stack_plan(state)
+def _gluetun_answers(**overrides: str) -> dict[str, dict[str, str]]:
+    """A minimal, always-valid answer set for Gluetun's own VPN step.
+
+    Every field `check_vpn_answers` looks at is present (blank where the
+    chosen provider/type doesn't need it) - the same shape
+    `check_vpn_answers` itself normalises a real answer into.
+    """
+    answers = {
+        "provider": "mullvad",
+        "vpn_type": "openvpn",
+        "openvpn_user": "ci-user-7f3a",
+        "openvpn_password": "pw-9d1c",
+        "wireguard_private_key": "",
+        "wireguard_addresses": "",
+        "wireguard_preshared_key": "",
+        "server_countries": "",
+    }
+    answers.update(overrides)
+    return {"gluetun": answers}
+
+
+def _rendered_doc(
+    state: InstallState, answers: Mapping[str, Mapping[str, str]] | None = None
+) -> dict[str, object]:
+    plan = compose.build_stack_plan(state, answers)
     text = compose.render_compose(plan)
     doc = yaml.safe_load(text)
     assert isinstance(doc, dict)
     return doc
+
+
+# Captured from the renderer before this story's ServicePlan/render_compose
+# changes landed - the one thing a three-arr-app deploy must never see is a
+# diff caused by Gluetun's own compose branch existing elsewhere in the code.
+_GOLDEN_THREE_APP_COMPOSE = """\
+# This file describes your media server. Marrquee wrote it, and you can read it.
+# Every folder here is a real folder on your drive.
+services:
+  prowlarr:
+    # Your search sources, managed in one place.
+    image: "lscr.io/linuxserver/prowlarr:latest"
+    container_name: prowlarr
+    restart: unless-stopped
+    ports:
+      - "9696:9696"
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: "Etc/UTC"
+      UMASK: "002"
+      PROWLARR__AUTH__APIKEY: "11111111111111111111111111111111"
+      PROWLARR__AUTH__METHOD: "Forms"
+      PROWLARR__AUTH__REQUIRED: "Enabled"
+    volumes:
+      - "/volume1/media/marrquee/apps/prowlarr:/config"
+    networks:
+      - marrquee
+
+  sonarr:
+    # Finds and organizes your TV shows.
+    image: "lscr.io/linuxserver/sonarr:latest"
+    container_name: sonarr
+    restart: unless-stopped
+    ports:
+      - "8989:8989"
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: "Etc/UTC"
+      UMASK: "002"
+      SONARR__AUTH__APIKEY: "22222222222222222222222222222222"
+      SONARR__AUTH__METHOD: "Forms"
+      SONARR__AUTH__REQUIRED: "Enabled"
+    volumes:
+      - "/volume1/media/marrquee/apps/sonarr:/config"
+      # Every app that touches media shares this one /data folder. That's what makes a
+      # finished download show up in your library instantly, instead of being copied
+      # twice.
+      - "/volume1/media/data:/data"
+    networks:
+      - marrquee
+
+  radarr:
+    # Finds and organizes your movies.
+    image: "lscr.io/linuxserver/radarr:latest"
+    container_name: radarr
+    restart: unless-stopped
+    ports:
+      - "7878:7878"
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: "Etc/UTC"
+      UMASK: "002"
+      RADARR__AUTH__APIKEY: "33333333333333333333333333333333"
+      RADARR__AUTH__METHOD: "Forms"
+      RADARR__AUTH__REQUIRED: "Enabled"
+    volumes:
+      - "/volume1/media/marrquee/apps/radarr:/config"
+      # Every app that touches media shares this one /data folder. That's what makes a
+      # finished download show up in your library instantly, instead of being copied
+      # twice.
+      - "/volume1/media/data:/data"
+    networks:
+      - marrquee
+
+networks:
+  marrquee:
+    name: marrquee
+    attachable: true
+"""
 
 
 def _services(doc: dict[str, object]) -> dict[str, dict[str, object]]:
@@ -154,7 +266,7 @@ def test_prowlarr_gets_no_data_mount() -> None:
 # --- consistent identity across every container ------------------------------
 
 
-def test_puid_pgid_tz_and_umask_are_identical_across_every_service() -> None:
+def test_puid_pgid_tz_and_umask_are_identical_across_every_arr_service() -> None:
     doc = _rendered_doc(_fixture_state())
 
     for service in _services(doc).values():
@@ -163,6 +275,16 @@ def test_puid_pgid_tz_and_umask_are_identical_across_every_service() -> None:
         assert env["PGID"] == "1000"
         assert env["TZ"] == "Etc/UTC"
         assert env["UMASK"] == "002"
+
+
+def test_gluetun_carries_the_same_puid_pgid_and_tz_but_no_umask() -> None:
+    doc = _rendered_doc(_fixture_state(("prowlarr", "gluetun")), _gluetun_answers())
+
+    gluetun_env = _environment(_services(doc)["gluetun"])
+    assert gluetun_env["PUID"] == "1000"
+    assert gluetun_env["PGID"] == "1000"
+    assert gluetun_env["TZ"] == "Etc/UTC"
+    assert "UMASK" not in gluetun_env
 
 
 def test_container_names_and_restart_policy_match_the_catalog() -> None:
@@ -196,6 +318,75 @@ def test_a_single_chosen_app_still_joins_the_marrquee_network() -> None:
     doc = _rendered_doc(_fixture_state(("radarr",)))
 
     assert _services(doc)["radarr"]["networks"] == ["marrquee"]
+
+
+# --- Gluetun gets its own compose branch, never faked arr fields -------------
+
+
+def test_gluetun_service_has_cap_add_the_tun_device_no_ports_and_joins_marrquee() -> None:
+    doc = _rendered_doc(_fixture_state(("prowlarr", "gluetun")), _gluetun_answers())
+
+    gluetun = _services(doc)["gluetun"]
+    assert gluetun["cap_add"] == ["NET_ADMIN"]
+    assert gluetun["devices"] == ["/dev/net/tun:/dev/net/tun"]
+    assert "ports" not in gluetun
+    assert gluetun["networks"] == ["marrquee"]
+
+    # The arr services render exactly as before - the vpn branch never
+    # touches them.
+    prowlarr = _services(doc)["prowlarr"]
+    assert "cap_add" not in prowlarr
+    assert "devices" not in prowlarr
+    assert prowlarr["ports"] == ["9696:9696"]
+
+
+def test_no_secret_value_appears_anywhere_in_the_rendered_gluetun_file() -> None:
+    answers = _gluetun_answers()
+    plan = compose.build_stack_plan(_fixture_state(("prowlarr", "gluetun")), answers)
+
+    text = compose.render_compose(plan)
+
+    for value in vpn.secret_values(answers["gluetun"]):
+        assert value not in text
+    assert _GLUETUN_KEY not in text
+
+
+def test_the_kill_switch_is_written_out_as_on() -> None:
+    doc = _rendered_doc(_fixture_state(("prowlarr", "gluetun")), _gluetun_answers())
+
+    gluetun_env = _environment(_services(doc)["gluetun"])
+    assert gluetun_env["FIREWALL_ENABLED_DISABLING_IT_SHOOTS_YOU_IN_YOUR_FOOT"] == "on"
+
+
+def test_the_secrets_volume_is_read_only_and_commented_in_plain_words() -> None:
+    state = _fixture_state(("prowlarr", "gluetun"))
+    answers = _gluetun_answers()
+    doc = _rendered_doc(state, answers)
+
+    gluetun_volumes = _volumes(_services(doc)["gluetun"])
+    assert any(volume.endswith(":/run/secrets:ro") for volume in gluetun_volumes)
+    assert any(volume.endswith(":/gluetun") for volume in gluetun_volumes)
+
+    text = compose.render_compose(compose.build_stack_plan(state, answers))
+    assert words.VPN_SECRETS_MOUNT_COMMENT in _comment_text(text)
+
+
+def test_build_stack_plan_refuses_gluetun_with_no_saved_answers() -> None:
+    state = _fixture_state(("prowlarr", "gluetun"))
+
+    with pytest.raises(ValueError, match="invalid VPN answers") as excinfo:
+        compose.build_stack_plan(state)  # answers=None -> {} -> nothing saved for gluetun
+
+    assert _GLUETUN_KEY not in str(excinfo.value)
+
+
+def test_a_state_without_gluetun_renders_byte_identical_to_before() -> None:
+    """diverges-from-existing: Gluetun's own compose branch must never leak
+    into the rendering of a stack that doesn't include it.
+    """
+    text = compose.render_compose(compose.build_stack_plan(_fixture_state()))
+
+    assert text == _GOLDEN_THREE_APP_COMPOSE
 
 
 # --- the single highest-consequence path bug in the story --------------------

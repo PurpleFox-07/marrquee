@@ -66,8 +66,9 @@ def test_parse_app_ids_never_raises_on_junk() -> None:
     assert wizard.parse_app_ids("not-an-app-at-all") == ()
 
 
-def test_default_app_ids_is_every_catalog_id_in_order() -> None:
-    assert wizard.DEFAULT_APP_IDS == tuple(app.id for app in catalog.CATALOG)
+def test_default_app_ids_is_every_default_ticked_catalog_id_in_order() -> None:
+    assert wizard.DEFAULT_APP_IDS == tuple(app.id for app in catalog.CATALOG if app.default_ticked)
+    assert "gluetun" not in wizard.DEFAULT_APP_IDS
 
 
 # --- platform_warning / WIZARD_STEPS ----------------------------------------
@@ -93,11 +94,13 @@ def test_wizard_steps_are_numbered_one_through_four_in_order() -> None:
 
 
 def test_wizard_steps_matches_the_four_fixed_pills_when_nothing_is_registered() -> None:
+    # Gluetun is the one catalog app with a registered question step, so
+    # "nothing is registered" holds only for subsets that leave it out.
     every_subset = (
         (),
         ("prowlarr",),
         ("prowlarr", "sonarr"),
-        tuple(app.id for app in catalog.CATALOG),
+        tuple(app.id for app in catalog.CATALOG if app.id != "gluetun"),
     )
     for app_ids in every_subset:
         steps = wizard.wizard_steps(app_ids)

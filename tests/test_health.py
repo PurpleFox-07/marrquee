@@ -12,6 +12,7 @@ import httpx
 
 from marrquee import health
 from marrquee.docker_client import (
+    ContainerHealth,
     ContainerSnapshot,
     ContainerState,
     DockerStatus,
@@ -30,6 +31,7 @@ def _snapshot(
     state: ContainerState | None = None,
     detail: str | None = None,
     finished_at: str | None = None,
+    health: ContainerHealth | None = None,
 ) -> ContainerSnapshot:
     return ContainerSnapshot(
         name=name,
@@ -39,6 +41,7 @@ def _snapshot(
         image=None,
         detail=detail,
         finished_at=finished_at,
+        health=health,
     )
 
 
@@ -160,6 +163,27 @@ async def test_finished_at_passes_through_untouched():
 
     assert radarr.finished_at == "2026-09-20T10:00:00.123456Z"
     assert sonarr.finished_at is None
+
+
+async def test_read_health_copies_container_health_through_and_leaves_arr_tiles_unaffected():
+    """arr images carry no HEALTHCHECK, so their tiles can't change: `health`
+    is copied straight through from the snapshot, and `_state_of`'s own
+    state/exists/finished_at mapping (proven above) stays untouched.
+    """
+    engine = FakeDockerEngine(
+        _STATUS,
+        containers={
+            "gluetun": _snapshot("gluetun", exists=True, state="running", health="healthy"),
+            "sonarr": _snapshot("sonarr", exists=True, state="running"),
+        },
+    )
+
+    gluetun, sonarr = await read_health(engine, ["gluetun", "sonarr"])
+
+    assert gluetun.health == "healthy"
+    assert gluetun.state == "up"
+    assert sonarr.health is None
+    assert sonarr.state == "up"
 
 
 async def test_read_health_only_ever_calls_inspect():

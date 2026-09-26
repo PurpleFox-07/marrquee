@@ -26,21 +26,24 @@ from fastapi.testclient import TestClient
 from jinja2 import Environment, FileSystemLoader
 from test_deploy_login import _already_finale_manager
 
+from marrquee import hub as hub_module
 from marrquee import questions as questions_module
 from marrquee import words
-from marrquee.catalog import apps_in_order
+from marrquee.catalog import CATALOG, apps_in_order
 from marrquee.config import Settings
 from marrquee.deploy import AppAdd, AppProgress, DeployManager, DeploySnapshot, Failure, WiringGap
 from marrquee.docker_client import ContainerSnapshot, DockerStatus, FakeDockerEngine
 from marrquee.health import FakeLinkProbe
 from marrquee.hub import LOGIN_HELP_URL
 from marrquee.links import LINK_COUNT_MAX, LinkCard, load_links, save_links
-from marrquee.login import load_login, save_login
+from marrquee.login import LOGIN_STEP, load_login, save_login
 from marrquee.login_apply import FakeLoginApplier
 from marrquee.main import create_app
-from marrquee.questions import QuestionCheck, QuestionField, QuestionStep
+from marrquee.questions import VPN_STEP, QuestionCheck, QuestionField, QuestionStep
 from marrquee.routes.wizard import router as wizard_router
 from marrquee.state import STATE_VERSION, InstallState, load_state, save_state, write_json_atomic
+from marrquee.vpn import VPN_PROVIDERS, TunnelPlace, provider_wiki_url
+from marrquee.vpn_control import FakeGluetunControl
 from marrquee.words import STATUS_CHIP_DONE, app_line_done
 
 _TEMPLATES_DIR = Path(__file__).resolve().parents[1] / "src" / "marrquee" / "templates"
@@ -134,12 +137,15 @@ def _client(
     engine: FakeDockerEngine | None = None,
     *,
     link_probe: FakeLinkProbe | None = None,
+    vpn_control: FakeGluetunControl | None = None,
 ) -> TestClient:
     if engine is None:
         engine = FakeDockerEngine(DockerStatus(connected=True, version="27.3.1"))
     if link_probe is None:
         link_probe = FakeLinkProbe()
-    app = create_app(settings=settings, engine=engine, link_probe=link_probe)
+    app = create_app(
+        settings=settings, engine=engine, link_probe=link_probe, vpn_control=vpn_control
+    )
     return TestClient(app)
 
 
@@ -663,6 +669,63 @@ def test_the_status_endpoints_json_has_no_detail_field_anywhere(tmp_path: Path) 
     assert response.status_code == 200
     assert "detail" not in response.text
     assert "connection refused" not in response.text
+
+
+# --- read_hub_view and the VPN control server ---------------------------------
+
+
+def test_read_hub_view_never_asks_the_control_server_with_no_vpn_installed(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    _write_snapshot(settings, _finale_snapshot(("sonarr",)))
+    engine = FakeDockerEngine(
+        DockerStatus(connected=True, version="27.3.1"),
+        containers=_running_containers(("sonarr",)),
+    )
+    vpn_control = FakeGluetunControl()
+    client = _client(settings, engine, vpn_control=vpn_control)
+
+    client.get("/api/hub/status")
+
+    assert vpn_control.calls == []
+
+
+def test_read_hub_view_asks_the_control_server_with_gluetuns_own_key(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr", "gluetun")))
+    _write_snapshot(settings, _finale_snapshot(("sonarr", "gluetun")))
+    engine = FakeDockerEngine(
+        DockerStatus(connected=True, version="27.3.1"),
+        containers={
+            **_running_containers(("sonarr",)),
+            "gluetun": ContainerSnapshot(
+                name="gluetun",
+                exists=True,
+                state="running",
+                exit_code=None,
+                image=None,
+                detail=None,
+                health="healthy",
+            ),
+        },
+    )
+    place = TunnelPlace(
+        public_ip="185.1.1.1", city="Amsterdam", region="North Holland", country="Netherlands"
+    )
+    vpn_control = FakeGluetunControl(place=place)
+    client = _client(settings, engine, vpn_control=vpn_control)
+
+    response = client.get("/api/hub/status")
+
+    assert vpn_control.calls == [("public_ip", "fake-gluetun-api-key")]
+    payload = response.json()
+    gluetun_tile = next(app for app in payload["apps"] if app["app_id"] == "gluetun")
+    assert (
+        gluetun_tile["line"]
+        == "Protected - your downloads appear to come from Amsterdam, Netherlands"
+    )
 
 
 # --- Link cards: saved, checked, and drawn the same way on the page and the poll -
@@ -1823,3 +1886,196 @@ def test_a_refused_change_reopens_the_login_pane_with_focus_on_the_field(tmp_pat
     assert "nope-nope-1" not in response.text
     match = re.search(r'id="q-marrquee-current_password"[^>]*autofocus', response.text)
     assert match is not None, "expected autofocus on the current-password field"
+
+
+# --- The VPN questions on screen, the guide link and the red poster ---------
+#
+# `_render_question_step` (defined above, beside the password-field test)
+# is reused here rather than redefined.
+
+
+def test_the_choose_login_banner_and_the_gluetun_install_row_render_together(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FIRST TEST - every selector `questions.js` reads (`[data-guide-select]`,
+    `[data-role="question-guide"]`, `data-guide-url`) has to exist on a real
+    render, and the two places that share `partials/app_questions.html` on
+    the very same page - the choose-login banner (`marrquee:login`) and an
+    install row's own question form (`gluetun:vpn`) - have to keep every
+    field id unique between them.
+
+    Gluetun is never actually offered on the Hub (`offered=False` keeps it
+    out of `install_rows`), so this borrows a temporarily-offered catalog
+    entry to put both on one render at once. A saved login that's
+    outstanding against `MARRQUEE_RESET_LOGIN` (banner "reset") draws the
+    same choose-login section as "no login yet" (banner "choose") without
+    blocking the install pane the way "no login yet" does.
+    """
+    settings = Settings(
+        host_mount=tmp_path / "host",
+        config_dir=tmp_path / "config",
+        reset_login="forgot-my-password-2026",
+    )
+    save_state(settings.config_dir, _install_state(("prowlarr",)))
+    _write_snapshot(settings, _finale_snapshot(("prowlarr",)))
+    save_login(settings.config_dir, "owner", "old-password-1", honor_reset=None)
+    offered_catalog = tuple(
+        dataclasses.replace(app, offered=True) if app.id == "gluetun" else app for app in CATALOG
+    )
+    monkeypatch.setattr(hub_module, "CATALOG", offered_catalog)
+    engine = FakeDockerEngine(
+        DockerStatus(connected=True, version="27.3.1"),
+        containers=_running_containers(("prowlarr",)),
+    )
+    client = _client(settings, engine)
+
+    page = client.get("/?panel=install").text
+
+    assert 'id="choose-login"' in page
+    assert 'data-install-form="gluetun"' in page
+    assert 'data-question-step="gluetun:vpn"' in page
+    assert "data-guide-select" in page
+    assert 'data-role="question-guide"' in page
+    assert "data-guide-url=" in page
+
+    ids = re.findall(r'\bid="([^"]+)"', page)
+    assert len(ids) == len(set(ids)), f"expected every element id to be unique, got {ids!r}"
+
+
+def test_the_vpn_step_renders_a_select_with_every_provider() -> None:
+    html = _render_question_step(VPN_STEP)
+
+    assert html.count("<option") == len(VPN_PROVIDERS) + 1
+    # The placeholder option is both disabled and the one selected, since
+    # nothing has been answered yet.
+    placeholder_match = re.search(r'<option\s+value=""[^>]*>', html)
+    assert placeholder_match is not None
+    assert "disabled" in placeholder_match.group(0)
+    assert "selected" in placeholder_match.group(0)
+
+    cyberghost_match = re.search(r'<option\s+value="cyberghost"[^>]*>([^<]*)</option>', html)
+    assert cyberghost_match is not None
+    assert "disabled" in cyberghost_match.group(0)
+    reason = cyberghost_match.group(1).replace("&#39;", "'")
+    assert words.VPN_PROVIDER_NEEDS_FILES in reason
+
+
+def test_a_saved_provider_is_selected_and_the_guide_link_points_at_its_wiki_page() -> None:
+    mullvad = next(provider for provider in VPN_PROVIDERS if provider.value == "mullvad")
+
+    html = _render_question_step(VPN_STEP, answers={"provider": "mullvad"})
+
+    mullvad_match = re.search(r'<option\s+value="mullvad"[^>]*>', html)
+    assert mullvad_match is not None
+    assert "selected" in mullvad_match.group(0)
+
+    guide_match = re.search(r'<a\s+class="question-guide"[^>]*href="([^"]+)"', html, re.DOTALL)
+    assert guide_match is not None
+    assert guide_match.group(1) == provider_wiki_url(mullvad)
+
+
+def test_the_vpn_guide_link_falls_back_to_the_provider_index_with_nothing_chosen() -> None:
+    html = _render_question_step(VPN_STEP)
+
+    guide_match = re.search(r'<a\s+class="question-guide"[^>]*href="([^"]+)"', html, re.DOTALL)
+    assert guide_match is not None
+    assert guide_match.group(1) == words.VPN_GUIDE_INDEX_URL
+
+
+def test_vpn_password_fields_never_carry_a_value_even_with_saved_answers() -> None:
+    html = _render_question_step(
+        VPN_STEP,
+        answers={
+            "provider": "mullvad",
+            "vpn_type": "wireguard",
+            "openvpn_password": "super-secret-password",
+            "wireguard_private_key": "super-secret-key",
+            "wireguard_preshared_key": "super-secret-psk",
+        },
+    )
+
+    assert "super-secret-password" not in html
+    assert "super-secret-key" not in html
+    assert "super-secret-psk" not in html
+
+
+def test_login_step_still_renders_byte_identically_through_the_shared_partial() -> None:
+    """Regression: the new `list` branch in `partials/app_questions.html`
+    sits ahead of the `else` (text/password) branch without changing a
+    single byte of what the shared partial already draws for a step with
+    no `list` field, like the Marrquee-wide login.
+    """
+    html = _render_question_step(LOGIN_STEP)
+
+    assert html == (
+        "\n\n"
+        '<fieldset class="question-step" data-question-step="marrquee:login">\n'
+        "  <legend>Choose one login for your apps</legend>\n"
+        '  <p class="question-step__lede">Every app Marrquee installs asks for this '
+        "username and password. Your browser can remember it, so you only type it "
+        "once per device.</p>\n\n  \n\n  \n  \n  \n  \n"
+        '  <label class="field-label" for="q-marrquee-username">Username</label>\n'
+        "  <input\n"
+        '    class="path-input"\n'
+        '    type="text"\n'
+        '    id="q-marrquee-username"\n'
+        '    name="username"\n'
+        '    value=""\n'
+        "    \n"
+        '    aria-describedby="q-marrquee-username-hint"\n'
+        "  >\n"
+        '  <p class="field-hint" id="q-marrquee-username-hint">3 to 32 characters: '
+        "letters, numbers, dots, dashes or underscores. Capitals become small "
+        "letters.</p>\n  \n  \n  \n  \n  \n"
+        '  <label class="field-label" for="q-marrquee-password">Password</label>\n'
+        "  <input\n"
+        '    class="path-input"\n'
+        '    type="password"\n'
+        '    id="q-marrquee-password"\n'
+        '    name="password"\n'
+        "    \n    \n"
+        '    aria-describedby="q-marrquee-password-hint"\n'
+        "  >\n"
+        '  <p class="field-hint" id="q-marrquee-password-hint">At least 8 characters, '
+        "with no space at the start or end.</p>\n  \n  \n  \n  \n  \n"
+        '  <label class="field-label" for="q-marrquee-password_again">Type it '
+        "again</label>\n"
+        "  <input\n"
+        '    class="path-input"\n'
+        '    type="password"\n'
+        '    id="q-marrquee-password_again"\n'
+        '    name="password_again"\n'
+        "    \n    \n    \n"
+        "  >\n  \n  \n  \n"
+        "</fieldset>"
+    )
+
+
+def test_the_vpn_tile_carries_data_kind_vpn_and_an_arr_tile_carries_data_kind_arr(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("prowlarr", "gluetun")))
+    _write_snapshot(settings, _finale_snapshot(("prowlarr", "gluetun")))
+    engine = FakeDockerEngine(
+        DockerStatus(connected=True, version="27.3.1"),
+        containers={
+            **_running_containers(("prowlarr",)),
+            "gluetun": ContainerSnapshot(
+                name="gluetun",
+                exists=True,
+                state="running",
+                exit_code=None,
+                image=None,
+                detail=None,
+                health="unhealthy",
+            ),
+        },
+    )
+    client = _client(settings, engine)
+
+    posters = _posters(client.get("/").text)
+
+    assert posters["gluetun"]["data-kind"] == "vpn"
+    assert posters["gluetun"]["data-state"] == "down"
+    assert posters["prowlarr"]["data-kind"] == "arr"

@@ -15,7 +15,7 @@ import asyncio
 import os
 import socket
 import struct
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -26,6 +26,14 @@ import httpx
 # The Docker Engine API's container states, straight off `State.Status` in a
 # `GET /containers/{name}/json` reply.
 ContainerState = Literal["created", "running", "restarting", "exited", "paused", "dead", "removing"]
+
+# Docker's own HEALTHCHECK verdict, straight off `State.Health.Status` - only
+# an image that ships a HEALTHCHECK (Gluetun's does; today's arr images
+# don't) ever reports one. Docker's own fourth value, "none", means "no
+# HEALTHCHECK is defined" and is folded into `None` rather than kept as a
+# fourth member here - nothing in this codebase ever needs to tell "no check
+# defined" apart from "the check hasn't reported yet".
+ContainerHealth = Literal["starting", "healthy", "unhealthy"]
 
 _DEFAULT_COMPOSE_BINARY = Path("/usr/local/bin/docker-compose")
 _DEFAULT_TIMEOUT = 2.0
@@ -86,6 +94,10 @@ class ContainerSnapshot:
     `started_at` and `finished_at` come from the same inspect reply's
     `State.StartedAt` / `State.FinishedAt` - no extra call. They are
     optional and defaulted because most callers only need `state`.
+
+    `health` comes from the same reply's `State.Health.Status` - also no
+    extra call, and also optional and defaulted, since most containers carry
+    no HEALTHCHECK at all.
     """
 
     name: str
@@ -96,6 +108,7 @@ class ContainerSnapshot:
     detail: str | None
     started_at: str | None = None
     finished_at: str | None = None
+    health: ContainerHealth | None = None
 
 
 @dataclass(frozen=True)
@@ -487,6 +500,17 @@ def _parse_container_state(raw: object) -> ContainerState | None:
             return None
 
 
+def _parse_container_health(raw: object) -> ContainerHealth | None:
+    """Docker's `"none"` (no HEALTHCHECK defined) and a missing `Health`
+    block both fall through to `None` here - the same "not sure" value.
+    """
+    match raw:
+        case "starting" | "healthy" | "unhealthy":
+            return raw
+        case _:
+            return None
+
+
 def _parse_inspect_payload(name: str, payload: object) -> ContainerSnapshot:
     if not isinstance(payload, dict):
         return ContainerSnapshot(
@@ -502,6 +526,9 @@ def _parse_inspect_payload(name: str, payload: object) -> ContainerSnapshot:
     state_block = state_block if isinstance(state_block, dict) else {}
     exit_code = state_block.get("ExitCode")
 
+    health_block = state_block.get("Health")
+    health_block = health_block if isinstance(health_block, dict) else {}
+
     config_block = payload.get("Config")
     config_block = config_block if isinstance(config_block, dict) else {}
     image = config_block.get("Image")
@@ -515,6 +542,7 @@ def _parse_inspect_payload(name: str, payload: object) -> ContainerSnapshot:
         detail=None,
         started_at=_parse_docker_timestamp(state_block.get("StartedAt")),
         finished_at=_parse_docker_timestamp(state_block.get("FinishedAt")),
+        health=_parse_container_health(health_block.get("Status")),
     )
 
 
@@ -633,12 +661,26 @@ class FakeDockerEngine:
         network_exists: bool = False,
         self_container_id: str | None = "fake-marrquee-container",
         remove_results: Mapping[str, bool] | None = None,
+        logs: Mapping[str, str] | None = None,
+        frames: Mapping[str, Sequence[ContainerSnapshot]] | None = None,
     ) -> None:
         self._status = status
         self._containers = dict(containers) if containers is not None else {}
         self._images = frozenset(images) if images is not None else frozenset()
         self._compose_results = dict(compose_results) if compose_results is not None else {}
         self._remove_results = dict(remove_results) if remove_results is not None else {}
+        self._logs = dict(logs) if logs is not None else {}
+        # A VPN whose health changes tick by tick is state the fake must
+        # model (docker-fakes-model-state) - each name scripted here drains
+        # in order, then repeats its last frame, and always wins over
+        # `_containers` for that name (including a snapshot `_model_recreate`
+        # itself just wrote).
+        self._frames: dict[str, list[ContainerSnapshot]] = (
+            {name: list(sequence) for name, sequence in frames.items()}
+            if frames is not None
+            else {}
+        )
+        self._frame_positions: dict[str, int] = dict.fromkeys(self._frames, 0)
         # `None` (the default) models a real Docker daemon honestly: the
         # stack's network is created by compose's own first successful `up`,
         # not by anything before it - `network_exists` starts False (a
@@ -662,12 +704,25 @@ class FakeDockerEngine:
 
     async def inspect(self, name: str) -> ContainerSnapshot:
         self.calls.append(("inspect", (name,)))
+        if name in self._frames:
+            frame = self._next_frame(name)
+            if frame is not None:
+                return frame
         return self._containers.get(
             name,
             ContainerSnapshot(
                 name=name, exists=False, state=None, exit_code=None, image=None, detail=None
             ),
         )
+
+    def _next_frame(self, name: str) -> ContainerSnapshot | None:
+        frames = self._frames[name]
+        if not frames:
+            return None
+        position = self._frame_positions[name]
+        if position < len(frames) - 1:
+            self._frame_positions[name] = position + 1
+        return frames[position]
 
     async def image_present(self, reference: str) -> bool:
         self.calls.append(("image_present", (reference,)))
@@ -685,7 +740,7 @@ class FakeDockerEngine:
 
     async def logs(self, name: str, tail: int = 50) -> str:
         self.calls.append(("logs", (name, tail)))
-        return ""
+        return self._logs.get(name, "")
 
     async def compose_up(
         self, project: str, compose_file: Path, service: str, *, recreate: bool = False
@@ -744,6 +799,10 @@ class FakeDockerEngine:
             detail=None,
             started_at=f"fake-recreated-{self._recreate_sequence}",
             finished_at=None,
+            # A real recreate doesn't reset Docker's own health-check
+            # history - the container keeps its last reported health until
+            # the new health check runs and reports otherwise.
+            health=previous_container.health if previous_container is not None else None,
         )
 
     async def self_container_id(self) -> str | None:

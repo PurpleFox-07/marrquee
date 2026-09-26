@@ -262,6 +262,51 @@ _EXPECTED_INVENTORY = (
     "REFUSAL_NO_LOGIN",
     "FINALE_SIGN_IN",
     "CROSS_SITE_REFUSED",
+    "VPN_DESCRIPTION",
+    "VPN_STEP_TITLE",
+    "VPN_STEP_LEDE",
+    "VPN_PROVIDER_LABEL",
+    "VPN_PROVIDER_PLACEHOLDER",
+    "VPN_PROVIDER_NEEDS_FILES",
+    "VPN_GUIDE_LINK",
+    "VPN_GUIDE_INDEX_URL",
+    "VPN_TYPE_LABEL",
+    "VPN_TYPE_OPENVPN",
+    "VPN_TYPE_OPENVPN_HINT",
+    "VPN_TYPE_WIREGUARD",
+    "VPN_TYPE_WIREGUARD_HINT",
+    "VPN_OPENVPN_USER_LABEL",
+    "VPN_OPENVPN_USER_HINT",
+    "VPN_OPENVPN_PASSWORD_LABEL",
+    "VPN_OPENVPN_PASSWORD_HINT",
+    "VPN_WIREGUARD_KEY_LABEL",
+    "VPN_WIREGUARD_KEY_HINT",
+    "VPN_WIREGUARD_ADDRESS_LABEL",
+    "VPN_WIREGUARD_ADDRESS_HINT",
+    "VPN_WIREGUARD_PSK_LABEL",
+    "VPN_WIREGUARD_PSK_HINT",
+    "VPN_COUNTRIES_LABEL",
+    "VPN_COUNTRIES_HINT",
+    "VPN_PROBLEM_PICK_PROVIDER",
+    "vpn_problem_provider_unavailable",
+    "vpn_problem_type_unsupported",
+    "VPN_PROBLEM_OPENVPN_USER",
+    "VPN_PROBLEM_OPENVPN_PASSWORD",
+    "VPN_PROBLEM_WG_KEY",
+    "VPN_PROBLEM_WG_ADDRESS",
+    "VPN_PROBLEM_WG_PSK",
+    "VPN_PROBLEM_TOO_LONG",
+    "VPN_LINE_CONNECTING",
+    "vpn_line_protected_place",
+    "VPN_LINE_PROTECTED",
+    "VPN_LINE_TUNNEL_DOWN",
+    "VPN_LINE_NOT_SURE",
+    "VPN_NOTE_SLOW",
+    "failure_vpn_refused",
+    "failure_vpn_settings_refused",
+    "failure_vpn_not_connected",
+    "FAILURE_VPN_NO_TUN",
+    "VPN_SECRETS_MOUNT_COMMENT",
 )
 
 _DEPLOY_ENGINE_WORD_COUNT = 40
@@ -272,6 +317,7 @@ _HUB_WORD_COUNT = 26
 _HUB_LINK_WORD_COUNT = 31
 _HUB_INSTALL_WORD_COUNT = 24
 _LOGIN_WORD_COUNT = 40
+_VPN_WORD_COUNT = 45
 
 
 def test_words_inventory_is_pinned() -> None:
@@ -486,10 +532,9 @@ def test_the_hub_install_section_precedes_the_login_section() -> None:
     assert "WIZARD_STEP_LOGIN" not in install_names
 
 
-def test_the_login_section_is_last() -> None:
-    """One login is the newest section, and words.py is the only file this
-    story touches - so unlike every earlier "is last" test, this slice is
-    closed for good: nothing later in this story appends to it.
+def test_the_login_section_precedes_the_vpn_section() -> None:
+    """One login used to be the newest section - VPN now follows it, so
+    this slice is closed the same move Story 3 made against Story 2.
     """
     login_start = (
         _DEPLOY_ENGINE_WORD_COUNT
@@ -500,15 +545,42 @@ def test_the_login_section_is_last() -> None:
         + _HUB_LINK_WORD_COUNT
         + _HUB_INSTALL_WORD_COUNT
     )
+    login_end = login_start + _LOGIN_WORD_COUNT
 
-    login_names = words.WORDS_INVENTORY[login_start:]
+    login_names = words.WORDS_INVENTORY[login_start:login_end]
 
-    assert login_names == _EXPECTED_INVENTORY[login_start:]
+    assert login_names == _EXPECTED_INVENTORY[login_start:login_end]
     assert login_names[0] == "WIZARD_STEP_LOGIN"
     assert login_names[-1] == "CROSS_SITE_REFUSED"
-    assert len(words.WORDS_INVENTORY) == len(_EXPECTED_INVENTORY)
     assert len(login_names) == _LOGIN_WORD_COUNT
     assert "HUB_INSTALL_LEDE" not in login_names
+    assert "VPN_DESCRIPTION" not in login_names
+
+
+def test_the_vpn_section_is_last() -> None:
+    """VPN is the newest section, and words.py is the only file this story
+    touches - so unlike every earlier "is last" test, this slice is closed
+    for good: nothing later in this story appends to it.
+    """
+    vpn_start = (
+        _DEPLOY_ENGINE_WORD_COUNT
+        + _WIZARD_WORD_COUNT
+        + _WIRING_WORD_COUNT
+        + _DEPLOY_SCREEN_WORD_COUNT
+        + _HUB_WORD_COUNT
+        + _HUB_LINK_WORD_COUNT
+        + _HUB_INSTALL_WORD_COUNT
+        + _LOGIN_WORD_COUNT
+    )
+
+    vpn_names = words.WORDS_INVENTORY[vpn_start:]
+
+    assert vpn_names == _EXPECTED_INVENTORY[vpn_start:]
+    assert vpn_names[0] == "VPN_DESCRIPTION"
+    assert vpn_names[-1] == "VPN_SECRETS_MOUNT_COMMENT"
+    assert len(words.WORDS_INVENTORY) == len(_EXPECTED_INVENTORY)
+    assert len(vpn_names) == _VPN_WORD_COUNT
+    assert "CROSS_SITE_REFUSED" not in vpn_names
 
 
 def test_wizard_headline_tuples_carry_the_gradient_word_in_the_middle() -> None:
@@ -992,3 +1064,33 @@ def test_hub_setup_done_refusal_points_at_the_hub() -> None:
     assert words.HUB_SETUP_DONE_REFUSAL == (
         "Marrquee is already set up. Add more apps from the + on your Hub."
     )
+
+
+def test_vpn_lines_match_content_direction() -> None:
+    assert words.VPN_PROVIDER_PLACEHOLDER == "Choose your VPN company"
+    assert words.VPN_PROVIDER_NEEDS_FILES == "needs extra key files Marrquee can't take yet"
+    assert words.VPN_LINE_CONNECTING == "Connecting to your VPN company…"
+    assert words.vpn_line_protected_place("Amsterdam, Netherlands") == (
+        "Protected - your downloads appear to come from Amsterdam, Netherlands"
+    )
+    assert words.VPN_LINE_PROTECTED == "Protected - your downloads go through your VPN."
+    assert words.VPN_LINE_TUNNEL_DOWN == (
+        "Your VPN tunnel dropped. Nothing downloads until it reconnects - "
+        "it keeps trying by itself."
+    )
+    assert words.VPN_COUNTRIES_HINT == (
+        "Leave empty and your VPN picks for you. Use English names, like Netherlands."
+    )
+
+
+def test_vpn_problem_functions_name_the_company_and_type() -> None:
+    assert "CyberGhost" in words.vpn_problem_provider_unavailable("CyberGhost")
+    message = words.vpn_problem_type_unsupported("ExpressVPN", "WireGuard")
+    assert "ExpressVPN" in message
+    assert "WireGuard" in message
+
+
+def test_vpn_failure_functions_carry_the_companys_own_name() -> None:
+    assert "Mullvad" in words.failure_vpn_refused("Mullvad")
+    assert "Mullvad" in words.failure_vpn_settings_refused("Mullvad")
+    assert "2" in words.failure_vpn_not_connected(2)

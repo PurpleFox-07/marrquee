@@ -45,6 +45,37 @@
     </label>
     {% endfor %}
   </div>
+  {% elif field.kind == "list" %}
+  {% set ns = namespace(selected_url="") %}
+  <label class="field-label" for="{{ field_id }}">{{ field.label }}</label>
+  <select
+    class="path-input question-select"
+    id="{{ field_id }}"
+    name="{{ field.name }}"
+    data-guide-select
+    {% if problem_field == field.name %}autofocus{% endif %}
+    {% if field.hint %}aria-describedby="{{ field_id }}-hint"{% endif %}
+  >
+    {% for option in field.options %}
+    {% if saved == option.value and option.url %}{% set ns.selected_url = option.url %}{% endif %}
+    <option
+      value="{{ option.value }}"
+      {% if option.url %}data-guide-url="{{ option.url }}"{% endif %}
+      {% if option.disabled %}disabled{% endif %}
+      {% if saved == option.value %}selected{% endif %}
+    >{{ option.label }}</option>
+    {% endfor %}
+  </select>
+  {% if field.hint %}<p class="field-hint" id="{{ field_id }}-hint">{{ field.hint }}</p>{% endif %}
+  {% if field.guide_url %}
+  <a
+    class="question-guide"
+    data-role="question-guide"
+    href="{{ ns.selected_url or field.guide_url }}"
+    target="_blank"
+    rel="noopener noreferrer"
+  >{{ field.guide_label }}</a>
+  {% endif %}
   {% else %}
   <label class="field-label" for="{{ field_id }}">{{ field.label }}</label>
   <input

@@ -30,6 +30,11 @@ _WIZARD_CSS_PATH = (
     Path(__file__).resolve().parents[1] / "src" / "marrquee" / "static" / "css" / "wizard.css"
 )
 
+# Gluetun is a real catalog entry but `offered=False` - the wizard's own
+# grid never draws a checkbox for it, so every assertion about "one
+# checkbox per app" means one per *offered* app.
+_OFFERED = tuple(app for app in CATALOG if app.offered)
+
 
 class _CheckboxCollector(HTMLParser):
     """Collects every `<input type="checkbox">` tag's attributes, in DOM order."""
@@ -156,11 +161,20 @@ def test_one_checked_checkbox_per_catalog_app_in_catalog_order_with_description(
     response = client.get("/setup/apps")
 
     checkboxes = _checkbox_inputs(response.text)
-    assert [box["value"] for box in checkboxes] == [app.id for app in CATALOG]
+    assert [box["value"] for box in checkboxes] == [app.id for app in _OFFERED]
     assert all("checked" in box for box in checkboxes)
-    for app in CATALOG:
+    for app in _OFFERED:
         assert app.name in response.text
         assert app.description in response.text
+
+
+def test_gluetun_never_gets_a_checkbox_of_its_own(tmp_path: Path) -> None:
+    client = _client(_settings(tmp_path))
+
+    response = client.get("/setup/apps")
+
+    checkboxes = _checkbox_inputs(response.text)
+    assert "gluetun" not in [box["value"] for box in checkboxes]
 
 
 def test_a_saved_install_ticks_exactly_the_saved_apps(tmp_path: Path) -> None:
@@ -202,6 +216,30 @@ def test_posting_a_subset_redirects_to_the_login_step_with_a_catalog_ordered_csv
     assert response.headers["location"] == "/setup/login?apps=prowlarr,radarr"
 
 
+def test_posting_gluetun_alone_is_treated_the_same_as_posting_nothing(
+    tmp_path: Path,
+) -> None:
+    client = _client(_settings(tmp_path))
+
+    response = client.post("/setup/apps", data={"apps": ["gluetun"]}, follow_redirects=False)
+
+    assert response.status_code == 200
+    assert words.WIZARD_PICK_AT_LEAST_ONE in response.text
+
+
+def test_posting_gluetun_alongside_real_apps_drops_it_from_the_redirect(
+    tmp_path: Path,
+) -> None:
+    client = _client(_settings(tmp_path))
+
+    response = client.post(
+        "/setup/apps", data={"apps": ["gluetun", "radarr"]}, follow_redirects=False
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/setup/login?apps=radarr"
+
+
 def test_posting_nothing_rerenders_at_200_with_refusal_and_every_checkbox(
     tmp_path: Path,
 ) -> None:
@@ -212,7 +250,7 @@ def test_posting_nothing_rerenders_at_200_with_refusal_and_every_checkbox(
     assert response.status_code == 200
     assert words.WIZARD_PICK_AT_LEAST_ONE in response.text
     checkboxes = _checkbox_inputs(response.text)
-    assert [box["value"] for box in checkboxes] == [app.id for app in CATALOG]
+    assert [box["value"] for box in checkboxes] == [app.id for app in _OFFERED]
     assert all("checked" not in box for box in checkboxes)
 
 
@@ -271,7 +309,7 @@ def test_each_checkbox_is_immediately_followed_by_the_card_face_span(tmp_path: P
     matches = re.findall(
         r'<input[^>]*type="checkbox"[^>]*>\s*<span class="app-card__face">', response.text
     )
-    assert len(matches) == len(CATALOG)
+    assert len(matches) == len(_OFFERED)
 
 
 # --- wizard.css structure ----------------------------------------------------

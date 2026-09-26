@@ -417,7 +417,8 @@ def test_stack_smoke_annotation_escapes_percent_cr_lf_and_double_colon() -> None
 
 def test_stack_smoke_job_is_named_for_the_add_flow() -> None:
     assert _stack_smoke_job()["name"] == (
-        "Real-Docker stack smoke (two arr apps, then add one from the Hub)"
+        "Real-Docker stack smoke (two arr apps, then add one from the Hub, "
+        "then a VPN with a throwaway login)"
     )
 
 
@@ -839,7 +840,8 @@ def test_stack_smoke_cycle1_switch_over_never_echoes_the_password() -> None:
 def test_stack_smoke_hub_steps_run_last_after_the_second_deploy_reassert() -> None:
     """Placed after everything that still needs Radarr running, and before
     the failure-only diagnostics dump - stopping Radarr on purpose must
-    never make an earlier assertion read as a regression.
+    never make an earlier assertion read as a regression. The VPN steps run
+    later still, after Radarr is already stopped.
     """
     job = _stack_smoke_job()
     names = [str(step.get("name", "")) for step in _steps(job)]
@@ -847,9 +849,18 @@ def test_stack_smoke_hub_steps_run_last_after_the_second_deploy_reassert() -> No
     reassert_index = names.index(_step_named(job, "second deploy changed nothing")["name"])
     hub_up_index = names.index(_step_named(job, "hub shows every app up")["name"])
     stop_radarr_index = names.index(_step_named(job, "stop radarr")["name"])
+    vpn_add_index = names.index(_step_named(job, "add the vpn", "throwaway login")["name"])
+    vpn_cancel_index = names.index(_step_named(job, "cancel the vpn add")["name"])
     dump_index = names.index(_step_named(job, "dump diagnostics")["name"])
 
-    assert reassert_index < hub_up_index < stop_radarr_index < dump_index
+    assert (
+        reassert_index
+        < hub_up_index
+        < stop_radarr_index
+        < vpn_add_index
+        < vpn_cancel_index
+        < dump_index
+    )
 
 
 def test_stack_smoke_hub_up_step_checks_the_page_the_status_endpoint_and_a_real_link() -> None:
@@ -900,7 +911,7 @@ def test_stack_smoke_always_cleans_up_containers_network_and_temp_files() -> Non
 
     assert step.get("if") == "always()"
     run = step["run"]
-    for name in ("prowlarr", "sonarr", "radarr", "marrquee-stack-smoke"):
+    for name in ("prowlarr", "sonarr", "radarr", "gluetun", "marrquee-stack-smoke"):
         assert name in run
     assert "docker network rm marrquee" in run
     # `sudo`, not a plain `rm -rf`: some of what's under the temp folder can
@@ -908,3 +919,254 @@ def test_stack_smoke_always_cleans_up_containers_network_and_temp_files() -> Non
     # cleanup as the unprivileged runner user.
     assert "sudo rm -rf" in run
     assert '"$RUNNER_TEMP/marrquee-smoke"' in run
+
+
+# --- stack-smoke: Gluetun on a real daemon - tunnel device, control-server
+# auth, the kill switch and a plain failure for a throwaway login ----------
+
+
+def test_stack_smoke_generates_a_masked_throwaway_vpn_login_before_adding_it() -> None:
+    """A second throwaway credential, separate from the one every arr app
+    shares - so a leak of one can never be mistaken for a leak of the other.
+    """
+    job = _stack_smoke_job()
+
+    login_step = _step_named(job, "throwaway", "vpn", "login")
+    run = login_step["run"]
+    assert "openssl rand -hex 16" in run
+    assert "::add-mask::" in run
+    assert "MARRQUEE_CI_VPN_PASSWORD=" in run
+    assert "$GITHUB_ENV" in run
+
+    add_step = _step_named(job, "add the vpn", "throwaway login")
+    assert "${MARRQUEE_CI_VPN_PASSWORD}" in add_step["run"]
+
+    steps = _steps(job)
+    assert steps.index(login_step) < steps.index(add_step)
+
+
+def test_stack_smoke_adds_the_vpn_through_the_hub_install_endpoint() -> None:
+    step = _step_named(_stack_smoke_job(), "add the vpn", "throwaway login")
+    run = step["run"]
+
+    assert "/api/hub/apps/gluetun/install" in run
+    assert "protonvpn" in run
+    assert "openvpn" in run
+    assert "marrquee-ci-not-a-user" in run
+    assert '"202"' in run
+    assert "::error::" in run
+
+
+def test_stack_smoke_vpn_add_step_waits_for_the_container_then_checks_the_tunnel_device() -> None:
+    """The FIRST assertion this chunk owns: the tunnel device and capability
+    really do land on the container Gluetun's compose branch describes.
+    Bounded, because the container is created asynchronously by the add run
+    - a bare `docker inspect` right after the 202 would race it.
+    """
+    step = _step_named(_stack_smoke_job(), "add the vpn", "throwaway login")
+    run = step["run"]
+
+    assert "seq 1 " in run
+    assert "while true" not in run
+    assert "docker inspect gluetun" in run
+    assert "gluetun_ready" in run
+    assert "HostConfig.CapAdd" in run
+    assert "NET_ADMIN" in run
+    assert "HostConfig.Devices" in run
+    assert "/dev/net/tun" in run
+    assert "::error::Gluetun did not get the tunnel device" in run
+
+
+def test_stack_smoke_vpn_login_steps_never_echo_the_password() -> None:
+    """The generation step's own `echo "...=$pw" >> "$GITHUB_ENV"` line is not
+    a leak - it's redirected straight to the environment file, never printed
+    to the log, and `$pw` is masked from that point on regardless. What must
+    never happen is a LATER step echoing the password once it's a named
+    variable.
+    """
+    step = _step_named(_stack_smoke_job(), "add the vpn", "throwaway login")
+    for line in step["run"].splitlines():
+        stripped = line.strip()
+        if stripped.startswith("echo") or "::error::" in stripped:
+            assert "MARRQUEE_CI_VPN_PASSWORD" not in stripped, (
+                f"the VPN password appears in an echoed line: {line!r}"
+            )
+
+
+def test_stack_smoke_polls_hub_status_until_the_vpn_add_fails_with_a_plain_sentence() -> None:
+    step = _step_named(_stack_smoke_job(), "poll", "vpn's add", "plain failure")
+    run = step["run"]
+
+    assert "/api/hub/status" in run
+    assert 'app_id == "gluetun"' in run
+    assert ".add_state" in run
+    assert '"$add_state" = "error"' in run
+    assert '"$state" = "up"' in run
+    assert "::error::A fake VPN login was reported as connected" in run
+    assert "seq 1 " in run
+    assert "while true" not in run
+    assert "GLUETUN_LINE=" in run
+    assert "$GITHUB_ENV" in run
+
+
+def test_stack_smoke_asserts_the_vpn_failure_line_against_words_read_inside_the_container() -> None:
+    """The tile's `line` is `headline + " " + what_to_do` (hub.py's
+    `_add_failure_line`) - split the two candidate sentences the same way
+    inside the container, so this compares against exactly what the running
+    code would say rather than a copy pasted into the workflow.
+    """
+    step = _step_named(_stack_smoke_job(), "vpn failure is one of the two")
+    run = step["run"]
+
+    assert "_split_failure_text" in run
+    assert "failure_vpn_refused" in run
+    assert "failure_vpn_not_connected" in run
+    assert "find_provider" in run
+    assert "TUNNEL_NEVER_UP_AFTER_SECONDS" in run
+    assert "$GLUETUN_LINE" in run
+    assert "::error::" in run
+    assert "::notice::" in run
+
+
+def test_stack_smoke_asserts_the_control_server_requires_the_api_key() -> None:
+    """ "All routes are now private by default" (gluetun-wiki) - proven here
+    with no VPN account at all: a request with no key is refused, and the
+    key Marrquee generated and wrote into its own auth file is accepted.
+    """
+    step = _step_named(_stack_smoke_job(), "control server wants marrquee's key")
+    run = step["run"]
+
+    assert "http://gluetun:8000/v1/vpn/status" in run
+    assert "401" in run
+    assert "X-API-Key" in run
+    assert "install.json" in run
+    assert "api_keys" in run
+    assert "200" in run
+    assert "::error::" in run
+
+
+def test_stack_smoke_waits_for_gluetun_running_before_the_kill_switch_check() -> None:
+    """Without this wait, `--network container:gluetun` could fail for an
+    unrelated reason (no such container yet) and the kill-switch check would
+    pass vacuously.
+    """
+    job = _stack_smoke_job()
+    step = _step_named(job, "gluetun's container is running", "kill-switch")
+    run = step["run"]
+
+    assert ".State.Running" in run
+    assert "seq 1 " in run
+    assert "while true" not in run
+    assert "::error::" in run
+
+    steps = _steps(job)
+    kill_switch_step = _step_named(job, "nothing gets out without the tunnel")
+    assert steps.index(step) < steps.index(kill_switch_step)
+
+
+def test_stack_smoke_kill_switch_pair_blocks_traffic_without_the_tunnel() -> None:
+    step = _step_named(_stack_smoke_job(), "nothing gets out without the tunnel")
+    run = step["run"]
+
+    assert "1.1.1.1" in run
+    assert "--network container:gluetun" in run
+    assert "wget" in run
+    assert "::error::Traffic left through the kill switch" in run
+    assert "::error::the runner itself could not reach 1.1.1.1" in run
+
+
+def test_stack_smoke_vpn_login_never_leaks_into_compose_or_diagnostics() -> None:
+    step = _step_named(_stack_smoke_job(), "vpn login stays out of compose")
+    run = step["run"]
+
+    assert "compose.yaml" in run
+    assert "/api/deploy/diagnostics" in run
+    assert "marrquee-ci-not-a-user" in run
+    assert "MARRQUEE_CI_VPN_PASSWORD" in run
+    assert "::error::" in run
+
+
+def test_stack_smoke_vpn_login_leak_check_never_echoes_the_password() -> None:
+    step = _step_named(_stack_smoke_job(), "vpn login stays out of compose")
+    for line in step["run"].splitlines():
+        stripped = line.strip()
+        if stripped.startswith("echo") or "::error::" in stripped:
+            assert "MARRQUEE_CI_VPN_PASSWORD" not in stripped, (
+                f"the VPN password appears in an echoed line: {line!r}"
+            )
+
+
+def test_stack_smoke_asserts_the_vpn_secrets_folder_is_root_only() -> None:
+    step = _step_named(_stack_smoke_job(), "vpn secrets folder is root-only")
+    run = step["run"]
+
+    assert "/marrquee/vpn" in run
+    assert "stat -c '%a %u'" in run
+    assert '"700 0"' in run
+    assert '"600 0"' in run
+    assert "::error::" in run
+
+
+def test_stack_smoke_cancels_the_vpn_add() -> None:
+    step = _step_named(_stack_smoke_job(), "cancel the vpn add")
+    run = step["run"]
+
+    assert "/hub/apps/gluetun/cancel" in run
+    assert '"303"' in run
+    assert "::error::" in run
+
+
+def test_stack_smoke_polls_until_gluetun_leaves_hub_status_after_cancel() -> None:
+    step = _step_named(_stack_smoke_job(), "poll", "gluetun is fully removed")
+    run = step["run"]
+
+    assert "/api/hub/status" in run
+    assert 'app_id == "gluetun"' in run
+    assert "seq 1 " in run
+    assert "while true" not in run
+    assert "::error::" in run
+
+
+def test_stack_smoke_cancel_removes_the_container_and_clears_the_secrets_folder() -> None:
+    step = _step_named(_stack_smoke_job(), "cancel removed gluetun's container")
+    run = step["run"]
+
+    assert "docker inspect gluetun" in run
+    assert "ls -A" in run
+    assert "::error::gluetun's container still exists after cancel" in run
+    assert "::error::" in run
+
+
+def test_stack_smoke_vpn_steps_run_in_order_add_then_control_then_kill_switch_then_cancel() -> None:
+    job = _stack_smoke_job()
+    names = [str(step.get("name", "")) for step in _steps(job)]
+
+    login_index = names.index(_step_named(job, "throwaway", "vpn", "login")["name"])
+    add_index = names.index(_step_named(job, "add the vpn", "throwaway login")["name"])
+    poll_index = names.index(_step_named(job, "poll", "vpn's add", "plain failure")["name"])
+    words_index = names.index(_step_named(job, "vpn failure is one of the two")["name"])
+    control_index = names.index(_step_named(job, "control server wants marrquee's key")["name"])
+    running_index = names.index(
+        _step_named(job, "gluetun's container is running", "kill-switch")["name"]
+    )
+    kill_switch_index = names.index(_step_named(job, "nothing gets out without the tunnel")["name"])
+    leak_index = names.index(_step_named(job, "vpn login stays out of compose")["name"])
+    perms_index = names.index(_step_named(job, "vpn secrets folder is root-only")["name"])
+    cancel_index = names.index(_step_named(job, "cancel the vpn add")["name"])
+    removed_index = names.index(_step_named(job, "poll", "gluetun is fully removed")["name"])
+    cleared_index = names.index(_step_named(job, "cancel removed gluetun's container")["name"])
+
+    assert (
+        login_index
+        < add_index
+        < poll_index
+        < words_index
+        < control_index
+        < running_index
+        < kill_switch_index
+        < leak_index
+        < perms_index
+        < cancel_index
+        < removed_index
+        < cleared_index
+    )

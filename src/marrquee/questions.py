@@ -1,12 +1,12 @@
 """The per-app question registry: what an app needs to ask before it can be
 added, and how a posted answer is checked.
 
-`QUESTION_STEPS` ships empty in this story - no catalog app has a question
-of its own yet. It exists now so the wizard and the Hub's "+" panel can
-both draw from `question_steps_for`/`find_step` instead of each inventing
-its own per-app form, and so a later story (the VPN details a downloader
-needs, the Plex account claim) adds one registry entry rather than a new
-screen in two places.
+`QUESTION_STEPS` carries Gluetun's VPN step, the first registered entry -
+built here rather than in `vpn.py` so that module can stay a leaf (no
+import of this one, so there's no cycle). The wizard and the Hub's "+"
+panel both draw from `question_steps_for`/`find_step` instead of each
+inventing its own per-app form, so a later app's question (the Plex account
+claim) adds one registry entry rather than a new screen in two places.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from marrquee import vpn, words
 from marrquee.catalog import apps_in_order
 from marrquee.state import write_json_atomic
 from marrquee.words import QUESTION_PICK_ONE
@@ -27,22 +28,24 @@ _ANSWERS_VERSION = 1
 
 _STEP_ID_PATTERN = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 
-FieldKind = Literal["text", "password", "choice"]
+FieldKind = Literal["text", "password", "choice", "list"]
 
 
 @dataclass(frozen=True)
 class QuestionOption:
-    """One radio choice inside a `choice` field."""
+    """One choice inside a `choice` or `list` field."""
 
     value: str
     label: str
     hint: str = ""
+    url: str = ""
+    disabled: bool = False
 
 
 @dataclass(frozen=True)
 class QuestionField:
-    """One control on a question step - a text box, a password box, or a
-    set of radio choices.
+    """One control on a question step - a text box, a password box, a set
+    of radio choices, or a dropdown list.
     """
 
     name: str
@@ -51,6 +54,8 @@ class QuestionField:
     hint: str = ""
     options: tuple[QuestionOption, ...] = ()
     default: str = ""
+    guide_label: str = ""
+    guide_url: str = ""
 
 
 @dataclass(frozen=True)
@@ -95,12 +100,116 @@ class QuestionStep:
             raise ValueError(f"duplicate field names in step {self.step_id!r}: {names!r}")
 
 
-# Ships empty - no catalog app has a question yet. Read only through
-# `question_steps_for`/`find_step`, both of which look up this name from
-# the module's own globals at call time, so a test can monkeypatch
-# `marrquee.questions.QUESTION_STEPS` and have both functions see the
-# replacement. No other module may import this name directly.
-QUESTION_STEPS: tuple[QuestionStep, ...] = ()
+# --- The VPN step: the only place `vpn.py`'s answer rules meet the shared
+# question-answering machinery ------------------------------------------------
+
+
+def _check_vpn_step(answers: Mapping[str, str]) -> QuestionCheck:
+    result = vpn.check_vpn_answers(answers)
+    return QuestionCheck(
+        ok=result.ok, answers=result.answers, problem=result.problem, field=result.field
+    )
+
+
+def _provider_option(provider: vpn.VpnProvider) -> QuestionOption:
+    label = provider.label
+    if provider.unavailable is not None:
+        label = f"{provider.label} - {provider.unavailable}"
+    return QuestionOption(
+        value=provider.value,
+        label=label,
+        url=vpn.provider_wiki_url(provider),
+        disabled=provider.unavailable is not None,
+    )
+
+
+_VPN_PROVIDER_OPTIONS: tuple[QuestionOption, ...] = (
+    QuestionOption(value="", label=words.VPN_PROVIDER_PLACEHOLDER, disabled=True),
+    *(_provider_option(provider) for provider in vpn.VPN_PROVIDERS),
+)
+
+_VPN_FIELDS: tuple[QuestionField, ...] = (
+    QuestionField(
+        name="provider",
+        label=words.VPN_PROVIDER_LABEL,
+        kind="list",
+        options=_VPN_PROVIDER_OPTIONS,
+        guide_label=words.VPN_GUIDE_LINK,
+        guide_url=words.VPN_GUIDE_INDEX_URL,
+    ),
+    QuestionField(
+        name="vpn_type",
+        label=words.VPN_TYPE_LABEL,
+        kind="choice",
+        options=(
+            QuestionOption(
+                value="openvpn", label=words.VPN_TYPE_OPENVPN, hint=words.VPN_TYPE_OPENVPN_HINT
+            ),
+            QuestionOption(
+                value="wireguard",
+                label=words.VPN_TYPE_WIREGUARD,
+                hint=words.VPN_TYPE_WIREGUARD_HINT,
+            ),
+        ),
+        default="openvpn",
+    ),
+    QuestionField(
+        name="openvpn_user",
+        label=words.VPN_OPENVPN_USER_LABEL,
+        kind="text",
+        hint=words.VPN_OPENVPN_USER_HINT,
+    ),
+    QuestionField(
+        name="openvpn_password",
+        label=words.VPN_OPENVPN_PASSWORD_LABEL,
+        kind="password",
+        hint=words.VPN_OPENVPN_PASSWORD_HINT,
+    ),
+    QuestionField(
+        name="wireguard_private_key",
+        label=words.VPN_WIREGUARD_KEY_LABEL,
+        kind="password",
+        hint=words.VPN_WIREGUARD_KEY_HINT,
+    ),
+    QuestionField(
+        name="wireguard_addresses",
+        label=words.VPN_WIREGUARD_ADDRESS_LABEL,
+        kind="text",
+        hint=words.VPN_WIREGUARD_ADDRESS_HINT,
+    ),
+    QuestionField(
+        name="wireguard_preshared_key",
+        label=words.VPN_WIREGUARD_PSK_LABEL,
+        kind="password",
+        hint=words.VPN_WIREGUARD_PSK_HINT,
+    ),
+    QuestionField(
+        name="server_countries",
+        label=words.VPN_COUNTRIES_LABEL,
+        kind="text",
+        hint=words.VPN_COUNTRIES_HINT,
+    ),
+)
+
+# Not built in `vpn.py`: a `QuestionStep` has to import this module (for
+# `QuestionStep`/`QuestionField`/`QuestionCheck` themselves), and `vpn.py`
+# stays a leaf so nothing about the deploy engine or the compose builder
+# can leak back into what a VPN answer *is*.
+VPN_STEP = QuestionStep(
+    app_id=vpn.VPN_APP_ID,
+    step_id="vpn",
+    title=words.VPN_STEP_TITLE,
+    lede=words.VPN_STEP_LEDE,
+    fields=_VPN_FIELDS,
+    check=_check_vpn_step,
+)
+
+
+# Read only through `question_steps_for`/`find_step`, both of which look up
+# this name from the module's own globals at call time, so a test can
+# monkeypatch `marrquee.questions.QUESTION_STEPS` and have both functions
+# see the replacement. No other module may import this name directly.
+QUESTION_STEPS: tuple[QuestionStep, ...] = (VPN_STEP,)
 
 
 def question_steps_for(app_ids: Iterable[str]) -> tuple[QuestionStep, ...]:
@@ -127,19 +236,20 @@ def check_step(
     """Turn a posted form into a `QuestionCheck` for `step`, never raising.
 
     Only `step`'s own field names ever reach `step.check` - anything else
-    in `posted` is dropped. `text` and `choice` values are stripped;
-    `password` never is, and a blank `password` keeps whatever was already
-    saved for that field instead of overwriting it with nothing.
+    in `posted` is dropped. `text`, `choice` and `list` values are
+    stripped; `password` never is, and a blank `password` keeps whatever
+    was already saved for that field instead of overwriting it with
+    nothing.
     """
     cleaned: dict[str, str] = {}
     for field in step.fields:
         raw = posted.get(field.name, "")
         if not isinstance(raw, str):
             raw = ""
-        value = raw.strip() if field.kind in ("text", "choice") else raw
+        value = raw.strip() if field.kind in ("text", "choice", "list") else raw
         if field.kind == "password" and value == "":
             value = saved.get(field.name, value)
-        if field.kind == "choice":
+        if field.kind in ("choice", "list"):
             allowed = {option.value for option in field.options}
             if value not in allowed:
                 return QuestionCheck(

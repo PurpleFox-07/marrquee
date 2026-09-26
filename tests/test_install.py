@@ -124,6 +124,22 @@ def test_install_apps_refuses_an_unknown_app_id_and_saves_nothing(tmp_path: Path
     assert load_state(settings.config_dir) is None
 
 
+def test_install_apps_refuses_gluetun_the_same_way_as_an_unknown_app(tmp_path: Path) -> None:
+    """Gluetun is a real catalog entry, but it isn't `offered` - the initial
+    install save must refuse it exactly like a made-up id, never silently
+    add the VPN tunnel to a fresh install nothing asked for.
+    """
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+
+    result = install_apps(settings, str(root), ["sonarr", "gluetun"])
+
+    assert not result.ok
+    assert result.kind == "invalid_input"
+    assert result.message == REFUSAL_UNKNOWN_APP
+    assert load_state(settings.config_dir) is None
+
+
 def test_install_apps_refuses_a_missing_path_and_saves_nothing(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
 

@@ -365,19 +365,20 @@
   }
 
   // A radio's own value only counts when it's the one checked in its
-  // group - every other input (text, password) is read as-is.
+  // group - every other input (text, password) and every select is read
+  // as-is.
   function collectAnswers(form) {
     var answers = {};
-    var inputs = form.querySelectorAll("input[name]");
-    for (var i = 0; i < inputs.length; i += 1) {
-      var input = inputs[i];
-      if (input.type === "radio") {
-        if (input.checked) {
-          answers[input.name] = input.value;
+    var fields = form.querySelectorAll("input[name], select[name]");
+    for (var i = 0; i < fields.length; i += 1) {
+      var field = fields[i];
+      if (field.type === "radio") {
+        if (field.checked) {
+          answers[field.name] = field.value;
         }
         continue;
       }
-      answers[input.name] = input.value;
+      answers[field.name] = field.value;
     }
     return answers;
   }

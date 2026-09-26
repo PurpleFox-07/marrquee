@@ -22,7 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette.datastructures import FormData
 
 from marrquee import words
-from marrquee.catalog import CATALOG, get_app, unavailable_reason
+from marrquee.catalog import CATALOG, CatalogApp, get_app, unavailable_reason
 from marrquee.config import Settings
 from marrquee.deploy import DeployManager
 from marrquee.docker_client import DockerEngine, detect_host_kind
@@ -94,13 +94,24 @@ async def _platform_warning(request: Request) -> str | None:
     return platform_warning(detect_host_kind(status))
 
 
+def _offered_apps() -> tuple[CatalogApp, ...]:
+    """The catalog apps the wizard's own grid may tick.
+
+    Gluetun is a real catalog entry (so its question step and its bring-up
+    both happen in catalog order) but `offered=False` keeps it out of every
+    screen that lets an owner choose it directly - whatever needs it adds
+    it as a companion instead.
+    """
+    return tuple(app for app in CATALOG if app.offered)
+
+
 async def _apps_context(
     request: Request, *, selected: tuple[str, ...], refusal: str | None
 ) -> dict[str, object]:
     return {
         "steps": WIZARD_STEPS,
         "current_step": 1,
-        "apps": CATALOG,
+        "apps": _offered_apps(),
         "selected": selected,
         "refusal": refusal,
         "warning": await _platform_warning(request),
@@ -147,7 +158,8 @@ async def post_setup_apps(request: Request) -> Response:
     templates: Jinja2Templates = request.app.state.templates
     form = await request.form()
     submitted = [value for value in form.getlist("apps") if isinstance(value, str)]
-    selected = parse_app_ids(submitted)
+    offered_ids = {app.id for app in _offered_apps()}
+    selected = tuple(app_id for app_id in parse_app_ids(submitted) if app_id in offered_ids)
 
     if not selected:
         context = await _apps_context(request, selected=(), refusal=words.WIZARD_PICK_AT_LEAST_ONE)

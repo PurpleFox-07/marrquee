@@ -26,6 +26,7 @@ from marrquee.routes.deploy import router as deploy_router
 from marrquee.routes.hub import router as hub_router
 from marrquee.routes.wizard import router as wizard_router
 from marrquee.same_origin import SameOriginGuard
+from marrquee.vpn_control import GluetunControl, HttpGluetunControl
 from marrquee.wiring import WiringRunner
 from marrquee.wiring.engine import WiringEngine
 
@@ -46,6 +47,7 @@ def create_app(
     wiring: WiringRunner | None = None,
     link_probe: LinkProbe | None = None,
     login_applier: LoginApplier | None = None,
+    vpn_control: GluetunControl | None = None,
 ) -> FastAPI:
     """Build the Marrquee app.
 
@@ -62,16 +64,19 @@ def create_app(
     `DeployManager`'s own default stays the honest `NoLoginApplier`.
     `link_probe=None` builds a real `HttpLinkProbe`, the same pattern as
     `probe` - a Hub test passes a `FakeLinkProbe` so no test ever reaches
-    the network to check a link card.
-
-    On startup, the built app re-enters any deploy that was still running
-    when Marrquee last stopped - every step downstream is idempotent, so
-    this is always a repeat, never a rollback.
+    the network to check a link card. `vpn_control=None` builds one real
+    `HttpGluetunControl()`, handed to a freshly-built `DeployManager` as
+    `vpn=` AND kept on `app.state.vpn_control` for the Hub's own status read
+    (Story 5) - the same single instance either way, so a test that passes
+    its own `manager=` still needs to pass `vpn_control=` too if the Hub
+    route under test should see that same fake.
     """
     if settings is None:
         settings = Settings.from_env()
     if engine is None:
         engine = SocketDockerEngine(settings.docker_socket, compose_binary=settings.compose_binary)
+    if vpn_control is None:
+        vpn_control = HttpGluetunControl()
     if manager is None:
         manager = DeployManager(
             settings,
@@ -79,6 +84,7 @@ def create_app(
             probe=probe if probe is not None else HttpReadinessProbe(),
             wiring=wiring if wiring is not None else WiringEngine(),
             login=login_applier if login_applier is not None else HttpLoginApplier(),
+            vpn=vpn_control,
         )
     if link_probe is None:
         link_probe = HttpLinkProbe()
@@ -94,6 +100,7 @@ def create_app(
     app.state.docker_engine = engine
     app.state.deploy = manager
     app.state.link_probe = link_probe
+    app.state.vpn_control = vpn_control
     app.state.templates = Jinja2Templates(directory=_TEMPLATES_DIR)
 
     app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")

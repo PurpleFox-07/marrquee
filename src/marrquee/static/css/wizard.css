@@ -219,6 +219,33 @@
   font-family: var(--font-sans);
 }
 
+/* A `list` field's dropdown carries `.path-input` for its box look; this
+ * adds only what a native <select> needs on top of that: prose type (not
+ * the mono stack `.path-input` implies on its own), no native chrome so it
+ * matches every other box exactly, and room on the right for the arrow
+ * that chrome still draws there. */
+.question-select {
+  font-family: var(--font-sans);
+  appearance: none;
+  padding-right: var(--space-8);
+}
+
+/* The "open the guide for your VPN company" link beside a `list` field -
+ * matches `.hub-footer-link`, the established in-page text link. */
+.question-guide {
+  display: inline-block;
+  margin-top: var(--space-2);
+  padding-block: var(--space-3);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  text-decoration: underline;
+}
+
+.question-guide:focus-visible {
+  outline: 2px solid var(--spotlight);
+  outline-offset: 2px;
+}
+
 /* --- Panels: the folder box and the time zone box share one look ----------- */
 
 .panel {

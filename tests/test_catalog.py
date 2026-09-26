@@ -23,31 +23,48 @@ from marrquee.catalog import (
 from marrquee.words import PROWLARR_DESCRIPTION, RADARR_DESCRIPTION, SONARR_DESCRIPTION
 
 
-def test_catalog_holds_exactly_the_three_cycle_1_apps_in_deploy_order() -> None:
+def test_catalog_holds_the_three_arr_apps_and_gluetun_in_deploy_order() -> None:
     ids = [app.id for app in CATALOG]
 
-    assert ids == ["prowlarr", "sonarr", "radarr"]
+    assert ids == ["prowlarr", "sonarr", "radarr", "gluetun"]
     orders = [app.order for app in CATALOG]
     assert orders == sorted(orders)
     assert "qbittorrent" not in ids
-    assert "gluetun" not in ids
 
 
-def test_the_catalog_is_unchanged_in_value() -> None:
-    """Every catalog entry keeps its old values - the new fields only ever
-    change behaviour when a caller sets them explicitly.
+def test_the_three_arr_apps_are_unchanged_in_value() -> None:
+    """Every arr catalog entry keeps its old values - the new fields only
+    ever change behaviour when a caller sets them explicitly.
     """
-    assert len(CATALOG) == 3
-    for app in CATALOG:
+    arr_apps = [app for app in CATALOG if app.id != "gluetun"]
+    assert len(arr_apps) == 3
+    for app in arr_apps:
         assert app.default_ticked is True
         assert app.web_page is True
         assert app.rules == ()
+        assert app.kind == "arr"
+        assert app.offered is True
 
 
-def test_the_three_arr_apps_take_the_login() -> None:
+def test_gluetun_is_a_vpn_app_never_offered_and_not_ticked_by_default() -> None:
+    gluetun = get_app("gluetun")
+
+    assert gluetun.kind == "vpn"
+    assert gluetun.offered is False
+    assert gluetun.default_ticked is False
+    assert gluetun.web_page is False
+    assert gluetun.login_kind == "none"
+    assert gluetun.image == "qmcgaw/gluetun:v3"
+    assert gluetun.port == 8000
+    assert gluetun.env_prefix == "GLUETUN"
+    assert gluetun.media_folders == ()
+    assert gluetun.needs_data_mount is False
+
+
+def test_the_three_arr_apps_take_the_login_and_gluetun_takes_none() -> None:
     kinds = {app.id: app.login_kind for app in CATALOG}
 
-    assert kinds == {"prowlarr": "arr", "sonarr": "arr", "radarr": "arr"}
+    assert kinds == {"prowlarr": "arr", "sonarr": "arr", "radarr": "arr", "gluetun": "none"}
 
 
 def test_login_kind_default_is_none_the_fail_safe_value() -> None:
@@ -69,6 +86,8 @@ def test_login_kind_default_is_none_the_fail_safe_value() -> None:
     )
 
     assert app.login_kind == "none"
+    assert app.kind == "arr"
+    assert app.offered is True
 
 
 def _with_rules(app_id: str, rules: tuple[AppRule, ...]) -> CatalogApp:

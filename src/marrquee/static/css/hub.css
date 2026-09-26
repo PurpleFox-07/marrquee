@@ -68,6 +68,18 @@
   border-color: var(--border);
 }
 
+/* A dropped VPN tunnel is an alarm, not an ordinary "start it again from
+ * your NAS" Down poster - it keeps trying to reconnect on its own, so it
+ * gets a red ring instead of the dim every other Down poster wears. */
+.hub-poster[data-kind="vpn"][data-state="down"] {
+  border-color: var(--error);
+  box-shadow: 0 0 0 var(--space-1) color-mix(in srgb, var(--error) 14%, transparent);
+}
+
+.hub-poster[data-kind="vpn"][data-state="down"]::before {
+  filter: none;
+}
+
 /* A failed add's own tile - no art dim, unlike a Down poster: the failure
  * headline and the Try again / Cancel buttons already say enough. */
 .poster[data-add-state="error"] {

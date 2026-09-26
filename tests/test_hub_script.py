@@ -258,6 +258,18 @@ def test_the_script_composes_no_hub_links_url() -> None:
     assert "/hub/links" not in script
 
 
+def test_the_install_collector_reads_select_values_too() -> None:
+    """A `list` field (the VPN provider dropdown) is a `<select>`, not an
+    `<input>` - `collectAnswers` has to query both, or a provider choice
+    would silently never reach `POST /api/hub/apps/{id}/install`.
+    """
+    script = _HUB_JS_PATH.read_text()
+    match = re.search(r"function collectAnswers\([^)]*\)\s*\{.*?\n  \}", script, re.DOTALL)
+    assert match is not None, "expected a collectAnswers function in hub.js"
+
+    assert "select[name]" in match.group(0)
+
+
 def test_the_script_never_removes_href_from_a_link_card() -> None:
     script = _HUB_JS_PATH.read_text()
     match = re.search(r"function paintLink\([^)]*\)\s*\{.*?\n  \}", script, re.DOTALL)
