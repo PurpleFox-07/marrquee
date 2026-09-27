@@ -41,10 +41,23 @@ from marrquee.hardlinks import HardlinkResult
 from marrquee.health import AppHealth, HubState, LinkHealth, LinkState
 from marrquee.links import LinkCard, link_address, link_glyph
 from marrquee.login import LoginRecord, LoginStatus, login_status, pending_app_ids, reset_reminder
+from marrquee.plex import (
+    ExistingPlex,
+    FolderState,
+    PlexServers,
+    existing_plex_web_url,
+    link_matches_plex,
+)
 from marrquee.questions import QuestionStep, question_steps_for
 from marrquee.recyclarr import SyncRecord, SyncState, SyncStatus
+from marrquee.storage import host_media_path
 from marrquee.vpn import VPN_APP_ID, TunnelPlace, tunnel_place_line
 from marrquee.words import (
+    EXISTING_PLEX_LINE_DOWN,
+    EXISTING_PLEX_LIST_FAILED,
+    EXISTING_PLEX_NO_SERVERS,
+    EXISTING_PLEX_NOTE_CANT_SEE,
+    EXISTING_PLEX_SIGN_IN_AGAIN,
     HUB_ALL_UP,
     HUB_CHIP_ADD_FAILED,
     HUB_CHIP_ADDING,
@@ -73,6 +86,7 @@ from marrquee.words import (
     VPN_LINE_TUNNEL_DOWN,
     WIRING_CHIP_RUNNING,
     app_line_error,
+    existing_plex_description,
     hub_announce_add_failed,
     hub_announce_adding,
     hub_install_busy,
@@ -180,7 +194,13 @@ class HubTile:
     `sync_state` is Recyclarr's own poster state (`None` for every other
     app) - `actions="sync"` stays set through every one of its up states,
     syncing included, so the grid's own shape never flips; the CSS alone
-    hides the button while a sync is running.
+    hides the button while a sync is running. `managed` is `False` only for
+    the owner's own, already-running Plex (`kind="media_server"`,
+    `CatalogApp.managed=False`): the one poster Marrquee never deployed and
+    never asks Docker about, which is what tells the template to draw
+    `data-managed="false"` and what keeps it out of `any_down` and
+    `docker_unreachable` - a Down reading there is Plex's own `/identity`
+    disagreeing, not Docker's "start it again from your NAS" story.
     """
 
     app_id: str
@@ -200,6 +220,7 @@ class HubTile:
     can_change_seeding: bool = False
     can_change_vpn: bool = False
     sync_state: SyncState | None = None
+    managed: bool = True
 
 
 @dataclass(frozen=True)
@@ -251,6 +272,18 @@ class InstallRow:
 
 
 @dataclass(frozen=True)
+class ExistingPlexView:
+    """Everything the Manage pane needs about the owner's own Plex - never
+    the token, which stays inside `plex.py`'s own `ExistingPlex` record and
+    never reaches this view model (or `HubStatusOut`'s JSON) at all.
+    """
+
+    name: str
+    folders: Mapping[str, FolderState]
+    host_media_root: str
+
+
+@dataclass(frozen=True)
 class HubView:
     """Everything the Hub page draws, from one deploy's worth of apps.
 
@@ -273,6 +306,11 @@ class HubView:
     (`None` while it's quiet) - the one place that sentence is computed,
     read alike by the page and by `GET /api/hub/status`, so the two can
     never disagree about it.
+
+    `existing_plex_view` is `None` unless the owner's own Plex is installed
+    - the Manage pane's own data, built once here rather than re-read by
+    the route, and deliberately never the `ExistingPlex` record itself
+    (which carries the server's token).
     """
 
     tiles: tuple[HubTile, ...]
@@ -292,6 +330,7 @@ class HubView:
     vpn_pane: Literal["add", "change"] | None = None
     without_vpn_offer: bool = False
     drive_note: str | None = None
+    existing_plex_view: ExistingPlexView | None = None
 
 
 LoginBanner = Literal["none", "choose", "reset", "applying", "pending"]
@@ -357,8 +396,35 @@ def login_view(
 
 
 PanelMode = Literal[
-    "closed", "choose", "install", "link", "edit", "login", "seeding", "vpn", "without-vpn"
+    "closed",
+    "choose",
+    "install",
+    "link",
+    "edit",
+    "login",
+    "seeding",
+    "vpn",
+    "without-vpn",
+    "plex-servers",
+    "plex",
 ]
+
+
+@dataclass(frozen=True)
+class PlexServerOffer:
+    """One of the owner's own Plex servers, exactly as the servers pane
+    should draw it - the address and the token both stay inside `plex.py`'s
+    own `PlexServerChoice`, never reaching this view model at all.
+
+    `replace_link` is the one saved link card (if any) that already points
+    at this same server, ticked by default so accepting the offer removes
+    the stale card the moment the connection succeeds.
+    """
+
+    machine_id: str
+    name: str
+    online: bool
+    replace_link: LinkCard | None
 
 
 @dataclass(frozen=True)
@@ -372,7 +438,12 @@ class HubPanel:
     whatever the owner just typed (valid or not) after a refusal. `edit` is
     the card being edited - its `id` is what the edit and remove forms'
     `action` targets - and stays `None` everywhere else, including a `link`
-    refusal (a new card has no id yet).
+    refusal (a new card has no id yet). `plex_servers`/`plex_problem` are
+    the `plex-servers` pane's own data - a plain sentence when there's
+    nothing to offer (signed out, plex.tv unreachable, or an empty
+    account), the list otherwise. The `plex` (Manage) pane reuses `error`
+    for a busy or refused Disconnect, the same way the `link`/`edit` panes
+    already do.
     """
 
     mode: PanelMode
@@ -380,6 +451,8 @@ class HubPanel:
     label: str
     url: str
     error: str | None
+    plex_servers: tuple[PlexServerOffer, ...] = ()
+    plex_problem: str | None = None
 
 
 @dataclass(frozen=True)
@@ -491,6 +564,8 @@ def hub_view(
     sync_late_after: timedelta = SYNC_LATE_AFTER,
     answers: Mapping[str, Mapping[str, str]] = {},
     graphics_chip: bool = False,
+    existing_plex: ExistingPlex | None = None,
+    storage_root: str | None = None,
 ) -> HubView:
     healths_by_id = {health.app_id: health for health in healths}
     gaps_by_id = {gap.app_id: gap for gap in wiring_gaps}
@@ -517,6 +592,7 @@ def hub_view(
             healths_by_id=healths_by_id,
             sync=recyclarr,
             sync_late_after=sync_late_after,
+            existing_plex=existing_plex,
         )
         return _apply_add_overlay(tile, app, adding, gaps_by_id.get(app.id)), tunnel
 
@@ -599,6 +675,12 @@ def hub_view(
     running_without_vpn_ = running_without_vpn(app_ids, adding)
     has_qbittorrent_row = any(row.app.id == "qbittorrent" for row in install_rows)
 
+    # Docker's own silence never speaks for an app Docker was never asked
+    # about - the owner's own Plex reads Down or Up from `/identity` alone,
+    # so it's excluded here the same way `_counts_toward_any_down` excludes
+    # it from `any_down`.
+    docker_asked_tiles = tuple(tile for tile in regular_tiles if tile.managed)
+
     return HubView(
         tiles=tiles,
         links=link_tiles,
@@ -612,8 +694,8 @@ def hub_view(
             for tile in regular_tiles
             if tile.app_id not in exempt_ids
         ),
-        docker_unreachable=bool(regular_tiles)
-        and all(tile.state == "unknown" for tile in regular_tiles),
+        docker_unreachable=bool(docker_asked_tiles)
+        and all(tile.state == "unknown" for tile in docker_asked_tiles),
         proxied=proxied,
         empty=not regular_tiles,
         login=login,
@@ -628,6 +710,20 @@ def hub_view(
             and not without_vpn
         ),
         drive_note=_drive_note(drive),
+        existing_plex_view=_existing_plex_view(existing_plex, storage_root),
+    )
+
+
+def _existing_plex_view(
+    existing_plex: ExistingPlex | None, storage_root: str | None
+) -> ExistingPlexView | None:
+    if existing_plex is None:
+        return None
+    host_media_root = (
+        str(host_media_path(storage_root, "movies").parent) if storage_root is not None else ""
+    )
+    return ExistingPlexView(
+        name=existing_plex.name, folders=existing_plex.folders, host_media_root=host_media_root
     )
 
 
@@ -709,7 +805,14 @@ def _counts_toward_any_down(tile: HubTile, health: AppHealth | None) -> bool:
     advice there, so only a stopped VPN container (the one case that advice
     fits) counts. A paused downloader is the same idea one hop over: its
     container never stopped either, so it never belongs in this count.
+
+    An unmanaged tile (the owner's own Plex) never counts either: Marrquee
+    never started it, so "start it again from your NAS" is never the right
+    advice for it - its own Manage pane is where a Down reading gets
+    explained.
     """
+    if not tile.managed:
+        return False
     if tile.paused:
         return False
     if tile.state != "down":
@@ -918,7 +1021,14 @@ def _tile(
     healths_by_id: Mapping[str, AppHealth] | None = None,
     sync: SyncStatus | None = None,
     sync_late_after: timedelta = SYNC_LATE_AFTER,
+    existing_plex: ExistingPlex | None = None,
 ) -> tuple[HubTile, TunnelState | None]:
+    # Goes before every other dispatch: an unmanaged app (only the owner's
+    # own Plex today) has no container for `_line`'s generic "up but no
+    # link" branch to reason about - `require_port` would raise the moment
+    # it tried, since `existing-plex` is `port=None` by design.
+    if not app.managed:
+        return _existing_plex_tile(app, health, existing_plex, authority=authority), None
     if app.kind == "vpn":
         return _vpn_tile(app, health, vpn_place, now, present)
     if app.kind == "sync":
@@ -966,6 +1076,48 @@ def _tile(
         can_change_seeding=app.kind == "downloader",
     )
     return tile, None
+
+
+def _existing_plex_tile(
+    app: CatalogApp,
+    health: AppHealth | None,
+    record: ExistingPlex | None,
+    *,
+    authority: str | None,
+) -> HubTile:
+    """The owner's own, already-running Plex.
+
+    `health` comes from `health.read_existing_plex_health` (`/identity`),
+    never Docker, so a missing reading here is honestly "down" rather than
+    "unknown" - unlike every other app, there's no "Docker didn't answer"
+    case for this poster at all. Its link is built from the record (never
+    `app.port`, which is `None`) and stays live in every state, since a NAS
+    that can't reach it right now says nothing about whether the owner's
+    own browser still can.
+    """
+    state: HubState = health.state if health is not None else "down"
+    chip = _CHIP_BY_STATE[state]
+    url = existing_plex_web_url(record, authority) if record is not None else None
+    aria = hub_open_app_aria(app.name, chip) if url is not None else None
+    description = existing_plex_description(record.name) if record is not None else app.description
+    cant_see = record is not None and any(
+        folder_state == "not_seen" for folder_state in record.folders.values()
+    )
+    return HubTile(
+        app_id=app.id,
+        glyph=app.glyph,
+        name=app.name,
+        description=description,
+        state=state,
+        chip=chip,
+        line="" if state == "up" else EXISTING_PLEX_LINE_DOWN,
+        url=url,
+        aria=aria,
+        kind=app.kind,
+        note=EXISTING_PLEX_NOTE_CANT_SEE if cant_see else "",
+        actions="reconnect" if cant_see else "none",
+        managed=False,
+    )
 
 
 def _vpn_tile(
@@ -1241,8 +1393,64 @@ def hub_panel(panel: str | None, link_id: str | None, links: Sequence[LinkCard])
         return HubPanel(mode="vpn", edit=None, label="", url="", error=None)
     if panel == "without-vpn":
         return HubPanel(mode="without-vpn", edit=None, label="", url="", error=None)
+    if panel == "plex-servers":
+        # The server list itself comes from plex.tv, which this function
+        # never calls - `get_hub` fills `plex_servers`/`plex_problem` in
+        # once it has fetched them, through `plex_servers_panel` below.
+        return HubPanel(mode="plex-servers", edit=None, label="", url="", error=None)
+    if panel == "plex":
+        # Whether the owner's own Plex is actually connected
+        # (`HubView.existing_plex_view`) is, likewise, a question this
+        # function never sees the answer to - `get_hub` closes it back
+        # down when there's no connected Plex to manage.
+        return HubPanel(mode="plex", edit=None, label="", url="", error=None)
     if panel == "edit":
         card = next((link for link in links if link.id == link_id), None)
         if card is not None:
             return HubPanel(mode="edit", edit=card, label=card.label, url=card.url, error=None)
     return _CLOSED_PANEL
+
+
+def plex_servers_panel(
+    servers: PlexServers, links: Sequence[LinkCard], *, problem: str | None = None
+) -> HubPanel:
+    """The `plex-servers` pane's own panel, built from a `PlexServers`
+    answer already in hand and the saved link cards - never touches
+    plex.tv itself, so both a plain `GET /?panel=plex-servers` and a
+    refused `POST /plex/connect` can build this from whatever they already
+    fetched, instead of asking plex.tv a second time.
+
+    `problem` overrides whatever `servers.state` would otherwise say - a
+    posted `machine_id` plex.tv no longer recognises, or an address that
+    didn't answer, are both refusals a route only discovers after this
+    same list was already fetched.
+    """
+    if problem is not None:
+        plex_problem = problem
+    elif servers.state == "signed_out":
+        plex_problem = EXISTING_PLEX_SIGN_IN_AGAIN
+    elif servers.state == "unreachable":
+        plex_problem = EXISTING_PLEX_LIST_FAILED
+    elif not servers.servers:
+        plex_problem = EXISTING_PLEX_NO_SERVERS
+    else:
+        plex_problem = None
+
+    offers = tuple(
+        PlexServerOffer(
+            machine_id=choice.machine_id,
+            name=choice.name,
+            online=choice.online,
+            replace_link=next((link for link in links if link_matches_plex(link, choice)), None),
+        )
+        for choice in servers.servers
+    )
+    return HubPanel(
+        mode="plex-servers",
+        edit=None,
+        label="",
+        url="",
+        error=None,
+        plex_servers=offers,
+        plex_problem=plex_problem,
+    )

@@ -34,6 +34,7 @@ from typing import ClassVar, Literal, Protocol, cast
 import httpx
 
 from marrquee.catalog import (
+    EXISTING_PLEX_APP_ID,
     JELLYFIN_APP_ID,
     PLEX_APP_ID,
     RECYCLARR_APP_ID,
@@ -64,6 +65,7 @@ from marrquee.jellyfin import (
     jellyfin_base_url,
     load_jellyfin,
 )
+from marrquee.links import load_links, save_links
 from marrquee.login import SavedLogin, load_login, pending_app_ids, record_applied
 from marrquee.login_apply import LoginApplier, NoLoginApplier
 from marrquee.plex import (
@@ -71,10 +73,13 @@ from marrquee.plex import (
     HttpPlexTv,
     PlexServer,
     PlexTv,
+    clear_existing_plex,
     clear_plex_claim,
+    load_existing_plex,
     load_plex_account,
     plex_base_url,
     plex_host_address,
+    save_existing_plex,
     write_plex_claim,
 )
 from marrquee.qbittorrent import write_qbit_conf
@@ -115,6 +120,7 @@ from marrquee.wiring.steps import app_base_url
 from marrquee.without_vpn import clear_without_vpn, without_vpn_confirmed
 from marrquee.words import (
     FAILURE_DOCKER_UNREACHABLE,
+    FAILURE_EXISTING_PLEX_UNREACHABLE,
     FAILURE_JELLYFIN_NOT_OURS,
     FAILURE_JELLYFIN_PORT_TAKEN,
     FAILURE_JELLYFIN_SETUP_REFUSED,
@@ -184,6 +190,7 @@ FailureCode = Literal[
     "jellyfin_port_taken",
     "jellyfin_not_ours",
     "jellyfin_setup_refused",
+    "existing_plex_unreachable",
 ]
 
 # An add's own tiny state machine - never "done": once wiring finishes, the
@@ -206,6 +213,11 @@ AddStart = Literal[
 # The login run's own start-refusal table - "choose", "change" and "retry"
 # all share it, since all three ultimately call `apply_login()`.
 LoginStart = Literal["started", "busy", "not_ready", "no_login", "nothing_to_do"]
+# `disconnect`'s own refusal table. "not_disconnectable" is a managed app
+# (every real, deployed app) - only the owner's own, connected-but-never-
+# deployed Plex can ever be disconnected. "needed" is another already-
+# installed app whose own rule would stop holding the moment this one goes.
+DisconnectOutcome = Literal["done", "busy", "not_installed", "not_disconnectable", "needed"]
 
 _DEPLOY_FILE_NAME = "deploy.json"
 _DIAGNOSTICS_FILE_NAME = "last-failure.txt"
@@ -302,6 +314,19 @@ class WiringGap:
 
     app_id: str
     failed_lines: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class Disconnect:
+    """The result of `DeployManager.disconnect` - never raises, and every
+    refusal happens before anything on disk is touched.
+
+    `needed_by` is set only for `outcome == "needed"`: the name of the
+    other already-installed app whose own rule needs this one to stay.
+    """
+
+    outcome: DisconnectOutcome
+    needed_by: str | None
 
 
 @dataclass(frozen=True)
@@ -763,6 +788,10 @@ class DeployManager:
         brought = apps_in_order((*current.with_apps, current.app_id))
         if current.compose_ran:
             for removed_app in reversed(brought):
+                if not removed_app.managed:
+                    # Never had a container - not even a stale, copied-forward
+                    # `compose_ran` flag says otherwise.
+                    continue
                 result = await self._engine.remove_container(removed_app.id)
                 if not result.ok:
                     failed = replace(current, line=hub_cancel_failed(removed_app.name))
@@ -798,6 +827,13 @@ class DeployManager:
                     # would find it - only Plex's short-lived claim code
                     # needs clearing here.
                     clear_plex_claim(self._settings, root)
+            if any(removed_app.id == EXISTING_PLEX_APP_ID for removed_app in brought):
+                # Never inside the `storage_root` block above: the record
+                # lives in config_dir, not on the storage root, so it must
+                # go even for a cancel that never saved a storage root at
+                # all (impossible for existing-plex itself, but not for a
+                # companion sharing this same cancel).
+                clear_existing_plex(self._settings.config_dir)
 
         if current.moves:
             first_mover = get_app(current.moves[0])
@@ -898,6 +934,51 @@ class DeployManager:
         self._emit(replace(snapshot, adding=adding))
         self._task = asyncio.create_task(self._run_change_vpn())
         return "started"
+
+    # --- Disconnecting an unmanaged app (the owner's own Plex) -------------
+
+    async def disconnect(self, app_id: str) -> Disconnect:
+        """Take an unmanaged app off the Hub - only ever the owner's own
+        Plex, never a real, deployed one: no container to remove, no Plex
+        call, nothing on the daemon touched at all. Every refusal is
+        checked before the first `await`, the same nothing-can-slip-in-
+        between shape `add_app` already uses.
+        """
+        if self._is_running() or self._snapshot.adding is not None:
+            return Disconnect("busy", None)
+
+        snapshot = self.snapshot()
+        present_ids = tuple(progress.app_id for progress in snapshot.apps)
+        if app_id not in present_ids:
+            return Disconnect("not_installed", None)
+
+        app = get_app(app_id)
+        if app.managed:
+            return Disconnect("not_disconnectable", None)
+
+        # Whether some OTHER already-installed app's own rule would stop
+        # holding the moment this one is gone - Seerr needing a media
+        # server present is the case this protects.
+        remaining_ids = tuple(pid for pid in present_ids if pid != app_id)
+        for other in apps_in_order(remaining_ids):
+            if unavailable_reason(other, remaining_ids) is not None:
+                return Disconnect("needed", other.name)
+
+        install = load_state(self._settings.config_dir)
+        if install is None:
+            return Disconnect("not_installed", None)
+
+        shrunk = with_app_removed(install, app_id)
+        save_state(self._settings.config_dir, shrunk)
+        if shrunk.storage_root is not None:
+            root = PurePosixPath(shrunk.storage_root)
+            write_marker(self._settings, root, shrunk.app_ids, shrunk.puid, shrunk.pgid)
+        clear_existing_plex(self._settings.config_dir)
+
+        new_apps = tuple(progress for progress in snapshot.apps if progress.app_id != app_id)
+        new_gaps = tuple(gap for gap in snapshot.wiring_gaps if gap.app_id != app_id)
+        await self._publish(self._replace_finale(adding=None, apps=new_apps, wiring_gaps=new_gaps))
+        return Disconnect("done", None)
 
     # --- Choosing, changing or retrying the one saved login --------------
 
@@ -1254,6 +1335,8 @@ class DeployManager:
         marker = read_marker(self._settings, root)
         owned_ids = frozenset(marker.app_ids) if marker is not None else frozenset()
         for app in catalog_apps:
+            if not app.managed:
+                continue  # never Marrquee's to create, so never Marrquee's to clash with
             if app.id in owned_ids:
                 continue  # a container we created on an earlier attempt at this same root
             existing = await self._engine.inspect(app.id)
@@ -1309,6 +1392,13 @@ class DeployManager:
         *,
         recreate: bool = False,
     ) -> Failure | None:
+        if not app.managed:
+            # The owner's own Plex: never Marrquee's to start, so never
+            # Marrquee's key, image, compose or network to touch either -
+            # this has to be the very first thing checked, before even the
+            # ordinary (unused) API key every app still gets minted.
+            return await self._bring_up_existing_plex(app, report)
+
         api_key = install.api_keys.get(app.id)
         if api_key is None:
             headline, what_to_do = _split_failure_text(
@@ -1419,6 +1509,36 @@ class DeployManager:
                 await report("starting", line, note)
 
             await self._sleep(self.POLL_INTERVAL_SECONDS)
+
+    # --- The owner's own Plex: no container, only a health check -----------
+
+    async def _bring_up_existing_plex(
+        self, app: CatalogApp, report: Callable[[AppState, str, str | None], Awaitable[None]]
+    ) -> Failure | None:
+        """The unmanaged "bring-up": the saved address already proved it
+        can reach this Plex once, so all that's left is proving it still
+        answers as the same Plex - no image check, no `compose_up`, no
+        network join and no readiness loop, because none of those were
+        ever ours to run for a container we never created.
+        """
+        record = load_existing_plex(self._settings.config_dir)
+        if record is None:
+            return self._existing_plex_failure(technical="no saved connection to the owner's Plex")
+        identity = await self._plex_server.identity(record.base_url)
+        if identity is not None and identity.machine_id == record.machine_id:
+            await report("done", app_line_done(app.name), None)
+            return None
+        seen = identity.machine_id if identity is not None else "nothing"
+        return self._existing_plex_failure(technical=f"{record.base_url}: identity answered {seen}")
+
+    def _existing_plex_failure(self, *, technical: str) -> Failure:
+        headline, what_to_do = _split_failure_text(FAILURE_EXISTING_PLEX_UNREACHABLE)
+        return Failure(
+            code="existing_plex_unreachable",
+            headline=headline,
+            what_to_do=what_to_do,
+            technical=technical,
+        )
 
     async def _app_ready(self, app: CatalogApp, api_key: str, present: Iterable[str]) -> bool:
         """Whether `app` has finished booting and will accept its key.
@@ -2103,7 +2223,7 @@ class DeployManager:
             return
 
         current = self._current_adding()
-        if current is not None:
+        if current is not None and app.managed:
             self._emit(self._replace_finale(adding=replace(current, compose_ran=True)))
 
         report = self._add_reporter()
@@ -2185,6 +2305,9 @@ class DeployManager:
         await self._run_wiring_for_add(
             app, grown, record_diagnostics, also_ids=companions, wire_ids=mover_ids or (app.id,)
         )
+
+        if app.id == EXISTING_PLEX_APP_ID:
+            self._drop_replaced_link()
 
         if movers:
             # A successful move is the one thing that turns the badge off -
@@ -2292,6 +2415,26 @@ class DeployManager:
         new_apps = tuple(progresses_by_id[app_id] for app_id in ordered_ids)
 
         await self._publish(self._replace_finale(adding=None, apps=new_apps))
+
+    def _drop_replaced_link(self) -> None:
+        """Remove the link card a successful existing-Plex connect chose
+        to replace - never inside `_run_wiring_for_add`, which a plain
+        reconnect also calls, and only reached once the bring-up above has
+        already succeeded, so a failed connect never touches it. No await
+        lands between the load and the two saves, so a second reader can
+        never see the link gone but the record still pointing at it (or
+        the reverse).
+        """
+        config_dir = self._settings.config_dir
+        record = load_existing_plex(config_dir)
+        if record is None or record.replaces_link is None:
+            return
+        try:
+            kept = [link for link in load_links(config_dir) if link.id != record.replaces_link]
+            save_links(config_dir, kept)
+            save_existing_plex(config_dir, replace(record, replaces_link=None))
+        except OSError as error:
+            logger.warning("could not remove the replaced link card: %s", error)
 
     async def _run_reconnect(self, app: CatalogApp, install: InstallState) -> None:
         record_diagnostics = self._diagnostics_recorder()
@@ -2624,15 +2767,22 @@ class DeployManager:
         """The one place every diagnostics write, snapshot failure and log
         line in this class goes through - keys first, then the saved login
         password, then the saved VPN login, then the owner's Plex account
-        token, then Jellyfin's own saved API key (all read fresh, never
-        cached, and never passed in by a caller that might get them stale).
+        token AND the owner's own, already-running Plex's server token,
+        then Jellyfin's own saved API key (all read fresh, never cached,
+        and never passed in by a caller that might get them stale).
         """
         saved = load_login(self._settings.config_dir).login
         passwords = (saved.password,) if saved is not None else ()
         vpn_answers = load_answers(self._settings.config_dir).get(VPN_APP_ID, {})
         plex_account = load_plex_account(self._settings.config_dir)
-        plex_values = (
-            (plex_account.token,) if plex_account is not None and plex_account.token else ()
+        existing_plex = load_existing_plex(self._settings.config_dir)
+        plex_values = tuple(
+            token
+            for token in (
+                plex_account.token if plex_account is not None else None,
+                existing_plex.token if existing_plex is not None else None,
+            )
+            if token
         )
         jellyfin_record = load_jellyfin(self._settings.config_dir)
         jellyfin_values = (jellyfin_record.api_key,) if jellyfin_record is not None else ()
@@ -3130,6 +3280,7 @@ def _failure_from_payload(payload: dict[str, object]) -> Failure:
                     "jellyfin_port_taken",
                     "jellyfin_not_ours",
                     "jellyfin_setup_refused",
+                    "existing_plex_unreachable",
                 ),
             ),
         ),

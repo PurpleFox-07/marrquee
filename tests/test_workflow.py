@@ -3013,3 +3013,286 @@ def test_stack_smoke_jellyfin_login_step_passes_secrets_only_through_docker_exec
         '-e JELLYFIN_OLD_PASSWORD="$MARRQUEE_CI_PASSWORD" marrquee-stack-smoke '
         "python3 /tmp/ci_jellyfin_login_change.py" in run
     )
+
+
+# --- Chunk 6: connecting your own Plex is refused while Jellyfin holds the
+# one media-server slot, and the folder-visibility probe leaves a real
+# bind-mounted folder exactly as it found it. --------------------------------
+
+
+def test_stack_smoke_existing_plex_step_names_avoid_forbidden_needles() -> None:
+    """Same reasoning as every other story's own naming test: a name that
+    collides with an earlier step's own name (or the generic "developer
+    test" phrase) would silently resolve `_step_named` to that earlier
+    step instead of this one's.
+    """
+    job = _stack_smoke_job()
+    forbidden = (
+        "developer test",
+        "recyclarr",
+        "sync turns amber",
+        "stop radarr",
+        "start radarr again",
+        "cancel",
+        "clean up",
+        "dump diagnostics",
+        "plex runs on the host network",
+        "link code stays root-only",
+        "throwaway",
+        "graphics chip check",
+        "jellyfin is set up",
+        "changes jellyfin's admin",
+    )
+    for needles in [("connecting your own plex",), ("plex folder check",)]:
+        name = str(_step_named(job, *needles)["name"]).lower()
+        for phrase in forbidden:
+            assert phrase not in name, f"step {name!r} contains the forbidden phrase {phrase!r}"
+
+
+def test_stack_smoke_existing_plex_steps_run_after_jellyfin_login_and_before_dump() -> None:
+    job = _stack_smoke_job()
+    names = [str(step.get("name", "")) for step in _steps(job)]
+
+    jf_login_index = names.index(_step_named(job, "changes jellyfin's admin")["name"])
+    own_plex_index = names.index(_step_named(job, "connecting your own plex")["name"])
+    folder_check_index = names.index(_step_named(job, "plex folder check")["name"])
+    dump_index = names.index(_step_named(job, "dump diagnostics")["name"])
+
+    assert jf_login_index < own_plex_index < folder_check_index < dump_index
+
+
+def test_stack_smoke_every_new_existing_plex_step_emits_error_on_failure() -> None:
+    job = _stack_smoke_job()
+    for needles in [("connecting your own plex",), ("plex folder check",)]:
+        step = _step_named(job, *needles)
+        assert "::error::" in step["run"], f"step {step['name']!r} never emits ::error::"
+
+
+_CURL_ASSIGNMENT_RE = re.compile(r"(\w+)=\$\(curl\b")
+
+
+def _assert_every_curl_assignment_is_guarded(run: str) -> None:
+    """Every `name=$(curl ...)` line is its own `if ! ...; then` guard - a
+    bare assignment under `set -euo pipefail` still aborts the step on a
+    real curl failure, but silently, with no `::error::` a reader (or
+    GitHub's own public annotations API) could ever see.
+    """
+    for line in run.splitlines():
+        stripped = line.strip()
+        match = _CURL_ASSIGNMENT_RE.search(stripped)
+        if match is None:
+            continue
+        assert stripped.startswith("if ! "), (
+            f"a curl call assigned to {match.group(1)!r} is not wrapped in its own "
+            f"`if ! ...` guard: {stripped!r}"
+        )
+
+
+def test_stack_smoke_existing_plex_step_guards_every_curl_assignment() -> None:
+    run = _step_named(_stack_smoke_job(), "connecting your own plex")["run"]
+    _assert_every_curl_assignment_is_guarded(run)
+    assert "set -euo pipefail" in run
+    assert "while true" not in run
+
+
+def test_stack_smoke_plex_folder_check_step_guards_its_own_substitutions() -> None:
+    run = _step_named(_stack_smoke_job(), "plex folder check")["run"]
+    assert "set -euo pipefail" in run
+    assert "while true" not in run
+    assert 'if ! before=$(ls -A "$root/data/media/movies"); then' in run
+    assert 'if ! after=$(ls -A "$root/data/media/movies"); then' in run
+    assert (
+        "if ! marker_output=$(docker exec marrquee-stack-smoke python3 "
+        '/tmp/ci_plex_folder_marker.py) || [ -z "$marker_output" ]; then' in run
+    )
+    assert "command -v find > /dev/null" in run
+    find_index = run.index("command -v find")
+    leftover_index = run.index('leftover=$(find "$root/data/media/movies"')
+    assert find_index < leftover_index
+
+
+def test_stack_smoke_existing_plex_steps_never_echo_a_token() -> None:
+    for step_needle in ("connecting your own plex", "plex folder check"):
+        run = _step_named(_stack_smoke_job(), step_needle)["run"]
+        for line in run.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("echo"):
+                assert "token" not in stripped.lower(), f"a token-shaped word was echoed: {line!r}"
+
+
+def test_stack_smoke_existing_plex_pinned_lines_are_unique_anchors() -> None:
+    """Every line pinned below names `existing-plex` or `plex-check`
+    outright - Plex, Jellyfin and qBittorrent's own steps share plenty of
+    identical-looking lines (`command -v grep`, a `case` arm's exact
+    wording), so a pin that didn't name one of these two on its own line
+    could silently match a copy sitting in a completely different step.
+    """
+    own_plex_run = _step_named(_stack_smoke_job(), "connecting your own plex")["run"]
+    folder_check_run = _step_named(_stack_smoke_job(), "plex folder check")["run"]
+
+    pinned = [
+        (own_plex_run, "grep -F -q 'existing-plex' \"$compose_file\""),
+        (
+            own_plex_run,
+            'echo "::error::existing-plex leaked into the real compose.yaml"; exit 1 ;;',
+        ),
+        (
+            own_plex_run,
+            'docker cp "$RUNNER_TEMP/ci_existing_plex_refused.py" '
+            "marrquee-stack-smoke:/tmp/ci_existing_plex_refused.py",
+        ),
+        (
+            own_plex_run,
+            "if docker exec marrquee-stack-smoke test -e /config/existing_plex.json; then",
+        ),
+        (folder_check_run, "find \"$root/data/media/movies\" -name 'marrquee-plex-check-*'"),
+    ]
+    anchor_re = re.compile(r"existing[_-]plex|plex[_-]check")
+    for run, line in pinned:
+        assert anchor_re.search(line) is not None, line
+        assert line in run, f"expected pinned line missing from its own step: {line!r}"
+
+
+def test_stack_smoke_existing_plex_install_row_and_json_endpoint_refusals_are_pinned() -> None:
+    run = _step_named(_stack_smoke_job(), "connecting your own plex")["run"]
+
+    assert 'data-install-row="existing-plex".*?</li>' in run
+    assert "PLEX_EXCLUDES_JELLYFIN, hub_install_unavailable" in run
+    assert (
+        "if ! json_response=$(curl -s -w '\\n%{http_code}' -X POST "
+        "http://127.0.0.1:7788/api/hub/apps/existing-plex/install "
+        "-H 'Content-Type: application/json' "
+        '-d \'{"answers":{}}\') || [ -z "$json_response" ]; then' in run
+    )
+    _assert_post_loop_verdict(
+        run,
+        'if [ "$json_code" != "409" ]; then',
+        "POST /api/hub/apps/existing-plex/install returned",
+    )
+
+
+def test_stack_smoke_existing_plex_sign_in_and_connect_posts_are_pinned() -> None:
+    run = _step_named(_stack_smoke_job(), "connecting your own plex")["run"]
+
+    assert (
+        "if ! sign_in_response=$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' "
+        '-X POST http://127.0.0.1:7788/plex/sign-in --data-urlencode "then=connect") '
+        '|| [ -z "$sign_in_response" ]; then' in run
+    )
+    _assert_post_loop_verdict(
+        run,
+        'if [ "$sign_in_response" != "303 http://127.0.0.1:7788/" ]; then',
+        "POST /plex/sign-in (then=connect) returned",
+    )
+    assert (
+        "if ! connect_code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "
+        'http://127.0.0.1:7788/plex/connect --data-urlencode "machine_id=ci-none") '
+        '|| [ -z "$connect_code" ]; then' in run
+    )
+    _assert_post_loop_verdict(
+        run, 'if [ "$connect_code" != "303" ]; then', "POST /plex/connect returned"
+    )
+
+
+def test_stack_smoke_existing_plex_record_check_has_its_positive_control_first() -> None:
+    run = _step_named(_stack_smoke_job(), "connecting your own plex")["run"]
+
+    positive_index = run.index("docker exec marrquee-stack-smoke test -e /config/install.json")
+    negative_index = run.index(
+        "docker exec marrquee-stack-smoke test -e /config/existing_plex.json"
+    )
+    assert positive_index < negative_index
+    assert "the positive control failed" in run
+
+
+def test_stack_smoke_existing_plex_compose_check_runs_grep_then_positive_control_then_case() -> (
+    None
+):
+    run = _step_named(_stack_smoke_job(), "connecting your own plex")["run"]
+
+    grep_tool_index = run.index("command -v grep > /dev/null")
+    positive_control_index = run.index("grep -F -q 'jellyfin:' \"$compose_file\"")
+    case_index = run.index('case "$existing_plex_leaked" in')
+    assert grep_tool_index < positive_control_index < case_index
+
+    case_block = _text_between(run, 'case "$existing_plex_leaked" in', "esac")
+    arms = _shell_case_arms(case_block)
+    assert arms == {
+        "1": "",
+        "0": 'echo "::error::existing-plex leaked into the real compose.yaml"; exit 1',
+        "*": (
+            "echo \"::error::couldn't check compose.yaml for a leaked existing-plex service "
+            '(grep exit ${existing_plex_leaked})"; exit 1'
+        ),
+    }
+
+
+def test_stack_smoke_existing_plex_deploy_app_list_check_is_pinned() -> None:
+    run = _step_named(_stack_smoke_job(), "connecting your own plex")["run"]
+
+    assert (
+        'if ! deploy_body=$(curl -fsS http://127.0.0.1:7788/api/deploy) || [ -z "$deploy_body" ]; '
+        "then" in run
+    )
+    assert "jq -e 'all(.apps[]; .app_id != \"existing-plex\")'" in run
+
+
+def test_stack_smoke_plex_folder_check_marker_verdicts_are_pinned() -> None:
+    run = _step_named(_stack_smoke_job(), "plex folder check")["run"]
+    body = _heredoc_body(run, "ci_plex_folder_marker.py")
+
+    assert 'print(f"created={created}")' in body
+    assert 'print(f"removed={removed}")' in body
+    assert 'print(f"sentinel_survived={sentinel_survived}")' in body
+
+    assert 'echo "$marker_output" | grep -qF "created=True"' in run
+    assert 'echo "$marker_output" | grep -qF "removed=True"' in run
+    assert 'echo "$marker_output" | grep -qF "sentinel_survived=True"' in run
+    assert 'if [ "$after" != "$before" ]; then' in run
+
+
+def test_stack_smoke_plex_folder_check_verdicts_are_computed_not_hardcoded() -> None:
+    """Each of `created`/`removed`/`sentinel_survived` must come from a real
+    filesystem check, never a bare `True` a mutation could plant in its
+    place and still print a line the grep above happily matches - pinned
+    both as an exact source line (the honest expression) and structurally
+    (an `ast.parse` of the scoped heredoc body, so a literal boolean swapped
+    in for any of the three assignments is caught even if its own line
+    still LOOKED like an assignment).
+    """
+    run = _step_named(_stack_smoke_job(), "plex folder check")["run"]
+    body = _heredoc_body(run, "ci_plex_folder_marker.py")
+
+    assert "created = (movies / marker_name).is_dir()" in body
+    assert "removed = not (movies / marker_name).exists()" in body
+    assert "sentinel_survived = sentinel.exists()" in body
+
+    tree = ast.parse(body)
+    literal_bool_assignments = {
+        node.targets[0].id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id in ("created", "removed", "sentinel_survived")
+        and isinstance(node.value, ast.Constant)
+        and isinstance(node.value.value, bool)
+    }
+    assert literal_bool_assignments == set(), (
+        f"these verdicts are hardcoded booleans instead of real checks: {literal_bool_assignments}"
+    )
+
+
+def test_stack_smoke_dump_diagnostics_step_gained_no_existing_plex_container_log() -> None:
+    """existing-plex has no container of its own - the failure dump's own
+    list of `docker logs` targets, and the cleanup step's own container
+    list, must both stay exactly what they were.
+    """
+    job = _stack_smoke_job()
+    dump_run = _step_named(job, "dump diagnostics")["run"]
+    cleanup_run = _step_named(job, "clean up every container")["run"]
+
+    assert "existing-plex" not in dump_run
+    assert "docker logs plex" in dump_run
+    assert "docker logs jellyfin" in dump_run
+    assert "existing-plex" not in cleanup_run

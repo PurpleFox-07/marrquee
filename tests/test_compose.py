@@ -35,6 +35,10 @@ _QBIT_KEY = "qbt_" + "5" * 28
 # every app to have one (see the story's Investigation), so the fixture
 # carries it purely to keep that unrelated invariant satisfied.
 _RECYCLARR_KEY = "6" * 32
+# existing-plex has an API key too, minted the same as any other app's, even
+# though nothing ever reads it - it never reaches a compose service, since
+# it is never `managed`.
+_EXISTING_PLEX_KEY = "8" * 32
 
 
 def _fixture_state(app_ids: tuple[str, ...] = ("prowlarr", "sonarr", "radarr")) -> InstallState:
@@ -45,6 +49,7 @@ def _fixture_state(app_ids: tuple[str, ...] = ("prowlarr", "sonarr", "radarr")) 
         "gluetun": _GLUETUN_KEY,
         "qbittorrent": _QBIT_KEY,
         "recyclarr": _RECYCLARR_KEY,
+        "existing-plex": _EXISTING_PLEX_KEY,
     }
     return InstallState(
         version=STATE_VERSION,
@@ -878,6 +883,27 @@ def test_choosing_one_app_yields_a_valid_file_with_one_service() -> None:
     doc = _rendered_doc(_fixture_state(("radarr",)))
 
     assert set(_services(doc)) == {"radarr"}
+
+
+def test_compose_leaves_the_existing_plex_out() -> None:
+    """`existing-plex` is `managed=False`: Marrquee connects to the owner's
+    own Plex but never deploys it, so it must never get a compose service of
+    its own, even sitting right beside an app that does.
+    """
+    doc = _rendered_doc(_fixture_state(("sonarr", "existing-plex")))
+
+    assert set(_services(doc)) == {"sonarr"}
+
+
+def test_service_plan_refuses_an_unmanaged_app() -> None:
+    """A defensive backstop: `_service_plan` must never be reached for an
+    unmanaged app - `build_stack_plan`'s own filter is the only thing that
+    should keep that true, and this proves the backstop fires if it doesn't.
+    """
+    state = _fixture_state(("existing-plex",))
+
+    with pytest.raises(ValueError, match="existing-plex"):
+        compose._service_plan(get_app("existing-plex"), state, PurePosixPath("/volume1/media"), {})
 
 
 def test_generated_at_comes_from_the_saved_state_not_the_wall_clock() -> None:

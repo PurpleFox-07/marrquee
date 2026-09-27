@@ -20,8 +20,16 @@ from pathlib import Path, PurePosixPath
 from typing import Final, Protocol
 
 from marrquee.catalog import CATALOG, CatalogApp, apps_in_order
+from marrquee.config import Settings
 from marrquee.jellyfin import HttpJellyfinServer, JellyfinServer, jellyfin_base_url, load_jellyfin
-from marrquee.plex import HttpPlexServer, PlexServer, load_plex_account, plex_base_url
+from marrquee.plex import (
+    ExistingPlex,
+    HttpPlexServer,
+    PlexServer,
+    load_existing_plex,
+    load_plex_account,
+    plex_base_url,
+)
 from marrquee.qbittorrent import QBIT_BASE_PREFERENCES
 from marrquee.questions import load_answers, uses_graphics_chip
 from marrquee.seeding import seeding_preferences
@@ -31,7 +39,11 @@ from marrquee.vpn_control import GluetunControl, NoGluetunControl
 from marrquee.wiring import WiringStep, WiringStepState
 from marrquee.wiring.arr_client import ArrClient, HttpArrClient
 from marrquee.wiring.jellyfin_steps import ensure_jellyfin_graphics, ensure_jellyfin_libraries
-from marrquee.wiring.plex_steps import ensure_plex_direct_play, ensure_plex_libraries
+from marrquee.wiring.plex_steps import (
+    ensure_existing_plex_libraries,
+    ensure_plex_direct_play,
+    ensure_plex_libraries,
+)
 from marrquee.wiring.qbit_client import HttpQbitClient, QbitClient
 from marrquee.wiring.steps import (
     StepOutcome,
@@ -48,6 +60,7 @@ from marrquee.words import (
     WIRING_CHIP_ERROR,
     WIRING_CHIP_RUNNING,
     WIRING_CHIP_SKIPPED,
+    WIRING_EXISTING_PLEX_MISSING,
     WIRING_JELLYFIN_NOT_SET_UP,
     WIRING_LINE_JELLYFIN_GRAPHICS,
     WIRING_LINE_PLEX_DIRECT_PLAY,
@@ -95,7 +108,10 @@ class WiringContext:
     `jellyfin_base_url`/`jellyfin_key` are each resolved once per run, only
     when a Plex or Jellyfin task is actually planned - all four stay None
     otherwise, and a plan with neither task never reads `plex`/`jellyfin`
-    at all.
+    at all. `existing_plex` is the owner's own Plex's saved record, loaded
+    the same way - only when an existing-Plex task is planned. `settings`
+    and `config_dir` are what that task needs to probe a folder and save
+    its own updated record back.
     """
 
     client: ArrClient
@@ -110,6 +126,9 @@ class WiringContext:
     jellyfin: JellyfinServer | None = None
     jellyfin_base_url: str | None = None
     jellyfin_key: str | None = None
+    existing_plex: ExistingPlex | None = None
+    settings: Settings | None = None
+    config_dir: Path | None = None
 
 
 class WiringTask(Protocol):
@@ -452,6 +471,60 @@ class JellyfinGraphicsTask:
         return await ensure_jellyfin_graphics(ctx.jellyfin, ctx.jellyfin_base_url, ctx.jellyfin_key)
 
 
+def _existing_plex_precheck(ctx: WiringContext) -> StepOutcome | None:
+    """The two things this run needs before it can even ask the owner's own
+    Plex a question - mirrors `_plex_precheck`/`_jellyfin_precheck`. Neither
+    check ever talks to that Plex, so neither is ever transient.
+    """
+    if ctx.plex is None or ctx.settings is None:
+        return StepOutcome(
+            state="error",
+            note=wiring_failure_unreachable("Plex"),
+            technical="no plex server or settings",
+            changed=False,
+            transient=False,
+        )
+    if ctx.existing_plex is None or ctx.config_dir is None:
+        return StepOutcome(
+            state="error",
+            note=WIRING_EXISTING_PLEX_MISSING,
+            technical="no saved existing-plex record",
+            changed=False,
+            transient=False,
+        )
+    return None
+
+
+@dataclass(frozen=True)
+class ExistingPlexLibrariesTask:
+    """The owner's own, already-running Plex gains "Movies (Marrquee)" and
+    "TV Shows (Marrquee)", each only where that Plex can actually see the
+    folder - proven fresh every run, since what it can see may change
+    between one wiring run and the next.
+    """
+
+    key: str
+    line: str
+    involved: tuple[str, ...]
+
+    @property
+    def about(self) -> tuple[str, ...]:
+        return self.involved
+
+    async def apply(self, ctx: WiringContext) -> StepOutcome:
+        outcome = _existing_plex_precheck(ctx)
+        if outcome is not None:
+            return outcome
+        assert ctx.plex is not None
+        assert ctx.settings is not None
+        assert ctx.existing_plex is not None
+        assert ctx.config_dir is not None
+        root = PurePosixPath(ctx.state.storage_root or "")
+        return await ensure_existing_plex_libraries(
+            ctx.plex, ctx.existing_plex, ctx.settings, root, ctx.config_dir
+        )
+
+
 @dataclass(frozen=True)
 class ExplainTask:
     """A step whose outcome is always `skipped`, with a fixed plain-language note.
@@ -600,6 +673,15 @@ def plan_wiring(
                 )
             )
 
+    if "existing-plex" in state.app_ids:
+        tasks.append(
+            ExistingPlexLibrariesTask(
+                key="libraries:existing-plex",
+                line=wiring_line_libraries("Plex"),
+                involved=("existing-plex",),
+            )
+        )
+
     if only_app is None:
         return tuple(tasks)
     return tuple(task for task in tasks if only_app in task.about)
@@ -625,6 +707,7 @@ class WiringEngine:
         plex_address: Callable[[], Awaitable[str | None]] | None = None,
         jellyfin: JellyfinServer | None = None,
         jellyfin_address: Callable[[], Awaitable[str | None]] | None = None,
+        settings: Settings | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         clock: Callable[[], float] = time.monotonic,
         ready_timeout: float = 180.0,
@@ -641,6 +724,7 @@ class WiringEngine:
         self._plex_address = plex_address
         self._jellyfin = jellyfin if jellyfin is not None else HttpJellyfinServer()
         self._jellyfin_address = jellyfin_address
+        self._settings = settings
         self._sleep = sleep
         self._clock = clock
         self._ready_timeout = ready_timeout
@@ -709,6 +793,13 @@ class WiringEngine:
                 if record is not None:
                     resolved_jellyfin_key = record.api_key
 
+        # Same shape again - an install with no existing-Plex never reads
+        # existing_plex.json at all, the same zero-cost guarantee Plex and
+        # Jellyfin above already make for their own apps.
+        resolved_existing_plex: ExistingPlex | None = None
+        if any("existing-plex" in task.about for task in tasks) and self._config_dir is not None:
+            resolved_existing_plex = load_existing_plex(self._config_dir)
+
         ctx = WiringContext(
             client=self._client,
             state=state,
@@ -722,6 +813,9 @@ class WiringEngine:
             jellyfin=self._jellyfin,
             jellyfin_base_url=resolved_jellyfin_base_url,
             jellyfin_key=resolved_jellyfin_key,
+            existing_plex=resolved_existing_plex,
+            settings=self._settings,
+            config_dir=self._config_dir,
         )
         ready_apps: set[str] = set()
         total = len(tasks)

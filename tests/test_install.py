@@ -184,6 +184,24 @@ def test_install_apps_refuses_gluetun_the_same_way_as_an_unknown_app(tmp_path: P
     assert load_state(settings.config_dir) is None
 
 
+def test_install_apps_refuses_the_existing_plex_the_same_way_as_an_unknown_app(
+    tmp_path: Path,
+) -> None:
+    """`existing-plex` is `offered=True` but `managed=False`: it is
+    connected from the Hub only, so a fresh install's initial save must
+    refuse it exactly like a made-up id.
+    """
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+
+    result = install_apps(settings, str(root), ["sonarr", "existing-plex"])
+
+    assert not result.ok
+    assert result.kind == "invalid_input"
+    assert result.message == REFUSAL_UNKNOWN_APP
+    assert load_state(settings.config_dir) is None
+
+
 def test_install_apps_accepts_gluetun_when_posted_alongside_qbittorrent(tmp_path: Path) -> None:
     """Gluetun is still never `offered`, but posting qBittorrent - the
     offered app that actually needs it - must never be refused just

@@ -23,10 +23,29 @@ from typing import Final, Literal
 from fastapi import APIRouter, Request
 from fastapi.responses import RedirectResponse, Response
 
-from marrquee.catalog import PLEX_APP_ID, get_app, unavailable_reason
+from marrquee import words
+from marrquee.catalog import EXISTING_PLEX_APP_ID, PLEX_APP_ID, get_app, unavailable_reason
 from marrquee.config import Settings
 from marrquee.deploy import DeployManager
-from marrquee.plex import PlexPin, PlexTv, plex_auth_url, plex_client_id, save_plex_sign_in
+from marrquee.docker_client import DockerEngine
+from marrquee.hub import HubPanel, plex_servers_panel
+from marrquee.links import LINK_ID_RE, LinkCard, load_links
+from marrquee.plex import (
+    ExistingPlex,
+    PlexPin,
+    PlexServer,
+    PlexServers,
+    PlexTv,
+    account_plex_servers,
+    clear_existing_plex,
+    find_connection,
+    link_matches_plex,
+    plex_auth_url,
+    plex_client_id,
+    plex_host_address,
+    save_existing_plex,
+    save_plex_sign_in,
+)
 from marrquee.questions import PLEX_ACCOUNT_FIELD, save_step_answers
 from marrquee.wizard import parse_app_ids
 
@@ -41,8 +60,13 @@ _MAX_PENDING_SIGN_INS: Final = 20
 # capped at `PLEX_PIN_TTL_SECONDS`) is not a real attack surface, unlike
 # plex.tv's own small, sequential-looking pin `id`.
 _STATE_TOKEN_BYTES: Final = 32
+# plex.tv's own `clientIdentifier` is a UUID hex string - this is a generous
+# ceiling on the POSTED `machine_id`, never a shape check, so an oversized
+# value is refused before it's ever compared against the freshly-fetched
+# server list.
+_MACHINE_ID_MAX_LENGTH: Final = 64
 
-PlexSignInThen = Literal["hub", "wizard"]
+PlexSignInThen = Literal["hub", "wizard", "connect"]
 
 
 @dataclass(frozen=True)
@@ -131,11 +155,14 @@ async def post_plex_sign_in(request: Request) -> Response:
         then = "hub"
     elif then_raw == "wizard":
         then = "wizard"
+    elif then_raw == "connect":
+        then = "connect"
     else:
         return RedirectResponse("/", status_code=303)
 
     manager: DeployManager = request.app.state.deploy
-    if then == "wizard" and manager.snapshot().phase == "finale":
+    snapshot = manager.snapshot()
+    if then == "wizard" and snapshot.phase == "finale":
         # Mirrors `routes/wizard._hub_exists` - a stale wizard tab must never
         # resurrect the wizard, or worse, start a sign-in plex.tv would come
         # back to a screen that no longer exists.
@@ -144,6 +171,12 @@ async def post_plex_sign_in(request: Request) -> Response:
     installed = _installed_ids(request)
     if then == "hub" and (
         PLEX_APP_ID in installed or unavailable_reason(get_app(PLEX_APP_ID), installed) is not None
+    ):
+        return RedirectResponse("/", status_code=303)
+    if then == "connect" and (
+        snapshot.phase != "finale"
+        or EXISTING_PLEX_APP_ID in installed
+        or unavailable_reason(get_app(EXISTING_PLEX_APP_ID), installed) is not None
     ):
         return RedirectResponse("/", status_code=303)
 
@@ -193,9 +226,141 @@ async def get_plex_signed_in(request: Request) -> Response:
     # one - `check_step`'s `sign_in` field trusts a saved answer alone, so
     # the two must never disagree about whether the sign-in actually holds.
     save_plex_sign_in(settings.config_dir, token, name)
+
+    if pending.then == "connect":
+        # Never `save_step_answers` here - that write is what the new-Plex
+        # row's own `needs_sign_in` question reads, and saving it for a
+        # connect would flip that row to "Add Plex" the moment the owner
+        # only meant to connect their existing one.
+        return RedirectResponse("/?panel=plex-servers#hub-panel", status_code=303)
+
     save_step_answers(settings.config_dir, PLEX_APP_ID, {PLEX_ACCOUNT_FIELD: name})
 
     if pending.then == "wizard":
         apps_csv = ",".join(pending.apps)
         return RedirectResponse(f"/setup/questions/plex/sign-in?apps={apps_csv}", status_code=303)
     return RedirectResponse("/?panel=install#hub-panel", status_code=303)
+
+
+# --- Picking a server and connecting to it, without JavaScript --------------
+
+
+def _form_value(form: object, key: str) -> str:
+    value = form.get(key)  # type: ignore[attr-defined]
+    return value if isinstance(value, str) else ""
+
+
+async def _plex_connect_refusal(
+    request: Request, servers: PlexServers, links: list[LinkCard], problem: str
+) -> Response:
+    """Re-render the live Hub with the `plex-servers` pane still open, the
+    server list already in hand (never re-fetched), and `problem` in place
+    of whatever `servers.state` would otherwise say - nothing is ever saved
+    on this path.
+    """
+    from marrquee.routes.hub import _hub_response, read_hub_view
+
+    view = await read_hub_view(request)
+    panel = plex_servers_panel(servers, links, problem=problem)
+    return _hub_response(request, view, panel, status_code=200)
+
+
+@router.post("/plex/connect")
+async def post_plex_connect(request: Request) -> Response:
+    settings: Settings = request.app.state.settings
+    manager: DeployManager = request.app.state.deploy
+    form = await request.form()
+    machine_id = _form_value(form, "machine_id")
+    replace_link_id = _form_value(form, "replace_link")
+
+    installed = _installed_ids(request)
+    if (
+        manager.snapshot().phase != "finale"
+        or EXISTING_PLEX_APP_ID in installed
+        or unavailable_reason(get_app(EXISTING_PLEX_APP_ID), installed) is not None
+        or not machine_id
+        or len(machine_id) > _MACHINE_ID_MAX_LENGTH
+    ):
+        return RedirectResponse("/", status_code=303)
+
+    plex_tv: PlexTv = request.app.state.plex_tv
+    servers = await account_plex_servers(plex_tv, settings.config_dir)
+    links = list(load_links(settings.config_dir))
+    choice = next((server for server in servers.servers if server.machine_id == machine_id), None)
+    if choice is None:
+        return await _plex_connect_refusal(request, servers, links, words.EXISTING_PLEX_LIST_FAILED)
+
+    engine: DockerEngine = request.app.state.docker_engine
+    plex_server: PlexServer = request.app.state.plex_server
+    host_address = await plex_host_address(engine, await engine.self_container_id())
+    candidate = await find_connection(plex_server, choice, host_address)
+    if candidate is None:
+        return await _plex_connect_refusal(
+            request, servers, links, words.existing_plex_unreachable(choice.name)
+        )
+
+    # The browser posts only an id - the address and the token above are
+    # both re-read on the server, from plex.tv's own answer and the
+    # candidate `find_connection` just proved, never from anything the
+    # form carried.
+    replaces_link: str | None = None
+    if replace_link_id and LINK_ID_RE.match(replace_link_id):
+        link = next((card for card in links if card.id == replace_link_id), None)
+        if link is not None and link_matches_plex(link, choice):
+            replaces_link = replace_link_id
+
+    save_existing_plex(
+        settings.config_dir,
+        ExistingPlex(
+            machine_id=choice.machine_id,
+            name=choice.name,
+            base_url=candidate.base_url,
+            port=candidate.port,
+            on_this_nas=candidate.on_this_nas,
+            token=choice.token,
+            folders=dict.fromkeys(get_app(EXISTING_PLEX_APP_ID).library_folders, "unchecked"),
+            sections={},
+            replaces_link=replaces_link,
+        ),
+    )
+    result = manager.add_app(EXISTING_PLEX_APP_ID)
+    if result == "started":
+        return RedirectResponse("/", status_code=303)
+
+    # A deferred import: `routes/api.py` itself imports `read_hub_view` from
+    # `routes/hub.py`, so importing its helper back at module load time
+    # would be a real cycle - by the time this function actually runs, both
+    # modules are already fully loaded.
+    from marrquee.routes.api import _add_start_refusal_message
+
+    clear_existing_plex(settings.config_dir)
+    message = _add_start_refusal_message(result, get_app(EXISTING_PLEX_APP_ID), manager)
+    return await _plex_connect_refusal(request, servers, links, message)
+
+
+# --- Managing and disconnecting an already-connected Plex -------------------
+
+
+async def _plex_manage_refusal(request: Request, message: str) -> Response:
+    """Re-render the live Hub with the Manage pane still open and `message`
+    shown - Disconnect's own busy/needed refusals, neither of which change
+    anything on disk.
+    """
+    from marrquee.routes.hub import _hub_response, read_hub_view
+
+    view = await read_hub_view(request)
+    panel = HubPanel(mode="plex", edit=None, label="", url="", error=message)
+    return _hub_response(request, view, panel, status_code=200)
+
+
+@router.post("/plex/disconnect")
+async def post_plex_disconnect(request: Request) -> Response:
+    manager: DeployManager = request.app.state.deploy
+    result = await manager.disconnect(EXISTING_PLEX_APP_ID)
+    if result.outcome == "busy":
+        return await _plex_manage_refusal(request, words.EXISTING_PLEX_DISCONNECT_BUSY)
+    if result.outcome == "needed":
+        return await _plex_manage_refusal(
+            request, words.existing_plex_disconnect_needed(result.needed_by or "")
+        )
+    return RedirectResponse("/", status_code=303)

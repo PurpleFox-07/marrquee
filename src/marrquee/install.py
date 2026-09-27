@@ -47,12 +47,14 @@ def api_key_for(app: CatalogApp) -> str:
     return new_api_key()
 
 
-# Only `offered` ids - the wizard's own initial install can never carry an
-# app (Gluetun) that isn't a choice on the screen that fed it; a non-offered
-# id in the posted list is refused the same way an unknown one is - UNLESS
-# it's the companion a posted offered app needs (Gluetun, riding in with
+# Only `offered` AND `managed` ids - the wizard's own initial install can
+# never carry an app (Gluetun) that isn't a choice on the screen that fed
+# it, nor one (the owner's own existing Plex) that is connected from the
+# Hub instead of deployed here; a non-offered or unmanaged id in the posted
+# list is refused the same way an unknown one is - UNLESS it's the
+# companion a posted offered app needs (Gluetun, riding in with
 # qBittorrent): `_unknown_app_ids` below is what draws that line.
-_OFFERED_APP_IDS = frozenset(app.id for app in CATALOG if app.offered)
+_OFFERED_APP_IDS = frozenset(app.id for app in CATALOG if app.offered and app.managed)
 
 
 def _unknown_app_ids(app_ids: list[str]) -> list[str]:

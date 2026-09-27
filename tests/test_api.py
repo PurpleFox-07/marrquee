@@ -40,7 +40,14 @@ from marrquee.graphics_chip import GRAPHICS_DEVICE_NODE
 from marrquee.hardlinks import HardlinkMonitor, HardlinkResult, save_hardlink_result
 from marrquee.login import load_login, save_login
 from marrquee.main import create_app
-from marrquee.plex import FakePlexServer, FakePlexTv
+from marrquee.plex import (
+    ExistingPlex,
+    FakePlexServer,
+    FakePlexTv,
+    PlexIdentity,
+    PlexServer,
+    save_existing_plex,
+)
 from marrquee.questions import QuestionCheck, QuestionField, QuestionStep, load_answers
 from marrquee.recyclarr import RecyclarrControl, SyncRecord, SyncStatus
 from marrquee.routes.api import _event_stream
@@ -133,6 +140,7 @@ def _client(
     vpn_control: FakeGluetunControl | None = None,
     hardlinks: HardlinkMonitor | None = None,
     recyclarr: RecyclarrControl | None = None,
+    plex_server: PlexServer | None = None,
 ) -> TestClient:
     app = create_app(
         settings=settings,
@@ -141,6 +149,7 @@ def _client(
         vpn_control=vpn_control,
         hardlinks=hardlinks,
         recyclarr=recyclarr,
+        plex_server=plex_server,
     )
     return TestClient(app)
 
@@ -198,6 +207,9 @@ def test_catalog_route_lists_apps_in_deploy_order_with_port_only(tmp_path: Path)
     assert apps_by_id["recyclarr"]["port"] is None
     assert apps_by_id["plex"]["port"] == 32400
     assert apps_by_id["jellyfin"]["port"] == 8096
+    # existing-plex is `offered=True` but `managed=False`: it is connected
+    # from the Hub only, never listed as a catalog choice.
+    assert "existing-plex" not in apps_by_id
 
 
 # --- The resting state: honest before any deploy has run ---------------------
@@ -511,6 +523,70 @@ def test_hub_status_carries_kind_per_tile_and_the_vpn_tunnel_signal(tmp_path: Pa
     kinds = {app["app_id"]: app["kind"] for app in payload["apps"]}
     assert kinds == {"sonarr": "arr", "gluetun": "vpn"}
     assert payload["vpn_tunnel"] == "up"
+
+
+def test_hub_status_carries_managed_false_only_for_the_existing_plex_tile(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+    save_state(settings.config_dir, _install_state(("sonarr", "existing-plex"), root))
+    finished = DeploySnapshot(
+        run_id="run-1",
+        phase="finale",
+        apps=(
+            AppProgress(
+                app_id="sonarr",
+                name="Sonarr",
+                state="done",
+                chip="chip",
+                line="Ready",
+                note=None,
+                port=8989,
+            ),
+            AppProgress(
+                app_id="existing-plex",
+                name="Plex",
+                state="done",
+                chip="chip",
+                line="Ready",
+                note=None,
+                port=None,
+            ),
+        ),
+        headline="Now showing",
+        detail=None,
+        failure=None,
+        started_at="2026-09-19T00:00:00+00:00",
+        finished_at="2026-09-19T00:05:00+00:00",
+        wiring=(),
+    )
+    write_json_atomic(settings.config_dir / "deploy.json", dataclasses.asdict(finished))
+    record = ExistingPlex(
+        machine_id="m1",
+        name="Den",
+        base_url="http://192.168.1.20:32400",
+        port=32400,
+        on_this_nas=False,
+        token="tok-super-secret-999",
+        folders={"movies": "added", "tv": "added"},
+        sections={"movies": "5", "tv": "6"},
+        replaces_link=None,
+    )
+    save_existing_plex(settings.config_dir, record)
+    engine = FakeDockerEngine(
+        DockerStatus(connected=True), containers={"sonarr": _running_container("sonarr")}
+    )
+    plex_server = FakePlexServer(identities_by_url={record.base_url: PlexIdentity(True, "m1")})
+    manager = DeployManager(settings, engine, plex_server=plex_server)
+    client = _client(settings, manager, engine=engine, plex_server=plex_server)
+
+    response = client.get("/api/hub/status")
+
+    assert response.status_code == 200
+    by_id = {app["app_id"]: app for app in response.json()["apps"]}
+    assert by_id["sonarr"]["managed"] is True
+    assert by_id["existing-plex"]["managed"] is False
+    assert by_id["existing-plex"]["state"] == "up"
+    assert ("inspect", ("existing-plex",)) not in engine.calls
 
 
 def test_hub_status_vpn_tunnel_is_none_with_no_vpn_installed(tmp_path: Path) -> None:

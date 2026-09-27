@@ -169,7 +169,10 @@ def build_stack_plan(
         raise ValueError("cannot build a stack plan before a storage root is chosen")
 
     root = PurePosixPath(state.storage_root)
-    apps = apps_in_order(state.app_ids)
+    # An unmanaged app (the owner's own existing Plex) is never deployed, so
+    # it never joins the stack this file describes - neither as a service
+    # of its own nor as something else's network companion.
+    apps = tuple(app for app in apps_in_order(state.app_ids) if app.managed)
     for app in apps:
         if app.network_via is not None and app.network_via not in state.app_ids:
             if without_vpn and get_app(app.network_via).kind == "vpn":
@@ -196,6 +199,15 @@ def _service_plan(
     root: PurePosixPath,
     answers: Mapping[str, Mapping[str, str]],
 ) -> ServicePlan:
+    # `build_stack_plan` already filters its own apps to `managed` ones -
+    # this is a backstop against a second caller reaching this function
+    # directly for an app Marrquee never deploys (the owner's own existing
+    # Plex, say), which would otherwise fall into the media_server branch
+    # below and render a service for a container that was never Marrquee's
+    # to make.
+    if not app.managed:
+        raise ValueError(f"{app.id} is unmanaged and has no compose service")
+
     # Checked before the arr-only api_keys lookup below: neither Gluetun nor
     # qBittorrent has an API key handed to it through the `*__AUTH__*`
     # environment those apps get - faking either would be exactly the "arr

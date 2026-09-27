@@ -113,6 +113,7 @@
           data-kind="{{ tile.kind }}"
           data-state="{{ tile.state }}"
           data-paused="{{ 'true' if tile.paused else 'false' }}"
+          data-managed="{{ 'true' if tile.managed else 'false' }}"
           {% if tile.add_state %}data-add-state="{{ tile.add_state }}"{% endif %}
           {% if tile.sync_state %}data-sync-state="{{ tile.sync_state }}"{% endif %}
           {% if tile.url %}href="{{ tile.url }}" aria-label="{{ tile.aria }}"{% endif %}
@@ -130,6 +131,9 @@
           <p data-role="line">{{ tile.line }}</p>
           <p class="hub-note" data-role="note">{{ tile.note }}</p>
         </a>
+        {% if not tile.managed %}
+        <a class="hub-tile-link" href="/?panel=plex#hub-panel" data-panel-open="plex" aria-label="{{ words.EXISTING_PLEX_MANAGE_ARIA }}">{{ words.EXISTING_PLEX_MANAGE }}</a>
+        {% endif %}
         {% if tile.can_change_seeding %}
         <a class="hub-tile-link" href="/?panel=seeding#hub-panel" data-panel-open="seeding">{{ words.HUB_CHANGE_SEEDING }}</a>
         {% endif %}
@@ -287,7 +291,7 @@
           data-install-row="{{ row.app.id }}"
           data-available="{{ 'false' if row.unavailable else 'true' }}"
         >
-          <span class="install-row__name">{{ row.app.name }}</span>
+          <span class="install-row__name">{{ words.EXISTING_PLEX_ROW_TITLE if not row.app.managed else row.app.name }}</span>
           <p class="install-row__desc">{{ row.app.description_without_vpn if row.without_vpn else row.app.description }}</p>
           {% if row.without_vpn %}
           <p class="install-row__note" data-role="without-vpn-note">{{ words.WITHOUT_VPN_ROW_NOTE }}</p>
@@ -297,6 +301,12 @@
           {% endif %}
           {% if row.unavailable %}
           <p class="install-row__reason">{{ words.hub_install_unavailable(row.unavailable) }}</p>
+          {% elif not row.app.managed %}
+          <form method="post" action="/plex/sign-in" class="install-row__sign-in">
+            <input type="hidden" name="then" value="connect">
+            <button type="submit" class="btn-primary" data-sign-in="plex">{{ words.PLEX_SIGN_IN_BUTTON }}</button>
+          </form>
+          <p class="install-row__hint">{{ words.EXISTING_PLEX_SIGN_IN_HINT }}</p>
           {% elif row.needs_sign_in %}
           <form method="post" action="/plex/sign-in" class="install-row__sign-in">
             <input type="hidden" name="then" value="hub">
@@ -497,6 +507,67 @@
         {% set problem_field = seeding_form.problem_field %}
         {% include "partials/app_questions.html" %}
         <button type="submit" class="btn-primary">{{ words.HUB_SEEDING_SAVE }}</button>
+      </form>
+      {% endif %}
+    </div>
+
+    <div data-panel-pane="plex-servers">
+      <a class="btn-ghost" href="/?panel=install#hub-panel" data-panel-choice="install">{{ words.HUB_PANEL_BACK }}</a>
+      <h2>{{ words.EXISTING_PLEX_PICK_TITLE }}</h2>
+      <p>{{ words.EXISTING_PLEX_PICK_LEDE }}</p>
+      {% if panel.plex_problem %}
+      <div class="refusal-banner" role="alert" data-role="plex-problem">
+        <p>{{ panel.plex_problem }}</p>
+        {% if panel.plex_problem == words.EXISTING_PLEX_SIGN_IN_AGAIN %}
+        <form method="post" action="/plex/sign-in">
+          <input type="hidden" name="then" value="connect">
+          <button type="submit" class="btn-primary" data-sign-in="plex">{{ words.PLEX_SIGN_IN_BUTTON }}</button>
+        </form>
+        {% endif %}
+      </div>
+      {% endif %}
+      <ul class="plex-server-list">
+        {% for server in panel.plex_servers %}
+        <li class="plex-server" data-plex-server="{{ server.machine_id }}">
+          <p class="plex-server__name">{{ server.name }}</p>
+          {% if not server.online %}
+          <p class="plex-server__hint">{{ words.EXISTING_PLEX_OFFLINE_HINT }}</p>
+          {% endif %}
+          <form method="post" action="/plex/connect">
+            <input type="hidden" name="machine_id" value="{{ server.machine_id }}">
+            {% if server.replace_link %}
+            <label>
+              <input type="checkbox" name="replace_link" value="{{ server.replace_link.id }}" checked>
+              {{ words.existing_plex_replace_link(server.replace_link.label) }}
+            </label>
+            {% endif %}
+            <button type="submit" class="btn-primary">{{ words.EXISTING_PLEX_CONNECT_BUTTON }}</button>
+          </form>
+        </li>
+        {% endfor %}
+      </ul>
+    </div>
+
+    <div data-panel-pane="plex">
+      {% if view.existing_plex_view %}
+      {% set existing_plex_view = view.existing_plex_view %}
+      <h2>{{ existing_plex_view.name }}</h2>
+      {% if panel.mode == 'plex' and panel.error %}
+      <div class="refusal-banner" role="alert">
+        <p>{{ panel.error }}</p>
+      </div>
+      {% endif %}
+      {% if existing_plex_view.folders.values() | select("equalto", "not_seen") | list %}
+      <p>{{ words.existing_plex_cant_see_help(existing_plex_view.host_media_root) }}</p>
+      {% else %}
+      <p>{{ words.EXISTING_PLEX_FOLDER_OK }}</p>
+      {% endif %}
+      <form method="post" action="/hub/apps/existing-plex/reconnect">
+        <button type="submit" class="btn-primary">{{ words.EXISTING_PLEX_CHECK_AGAIN }}</button>
+      </form>
+      <form method="post" action="/plex/disconnect" data-role="disconnect-form">
+        <p>{{ words.EXISTING_PLEX_DISCONNECT_NOTE }}</p>
+        <button type="submit" class="btn-ghost">{{ words.EXISTING_PLEX_DISCONNECT }}</button>
       </form>
       {% endif %}
     </div>

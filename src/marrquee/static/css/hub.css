@@ -80,6 +80,14 @@
   filter: none;
 }
 
+/* The owner's own Plex keeps a working link even while its own light reads
+ * Down - a NAS-side probe failing says nothing about whether the owner's
+ * browser can still reach it, so its art is never dimmed the way an
+ * ordinary Down poster's is. */
+.hub-poster[data-managed="false"][data-state="down"]::before {
+  filter: none;
+}
+
 /* A failed add's own tile - no art dim, unlike a Down poster: the failure
  * headline and the Try again / Cancel buttons already say enough. */
 .poster[data-add-state="error"] {
@@ -394,7 +402,9 @@
 .hub-panel[data-panel-mode="login"] [data-panel-pane="login"],
 .hub-panel[data-panel-mode="seeding"] [data-panel-pane="seeding"],
 .hub-panel[data-panel-mode="vpn"] [data-panel-pane="vpn"],
-.hub-panel[data-panel-mode="without-vpn"] [data-panel-pane="without-vpn"] {
+.hub-panel[data-panel-mode="without-vpn"] [data-panel-pane="without-vpn"],
+.hub-panel[data-panel-mode="plex-servers"] [data-panel-pane="plex-servers"],
+.hub-panel[data-panel-mode="plex"] [data-panel-pane="plex"] {
   display: block;
 }
 
@@ -495,6 +505,56 @@
   color: var(--text-secondary);
   font-size: var(--text-xs);
   margin-top: var(--space-2);
+}
+
+/* --- The servers pane: one surface card per owned Plex server, the same
+ * card look every other choice list on this panel already uses. -------- */
+
+.plex-server-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: var(--space-3);
+}
+
+.plex-server {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-4);
+}
+
+.plex-server__name {
+  margin: 0;
+  font-size: var(--text-base);
+  font-weight: var(--weight-bold);
+  color: var(--text-primary);
+}
+
+.plex-server__hint {
+  margin: var(--space-1) 0 0;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.plex-server label {
+  display: block;
+  margin: var(--space-2) 0;
+  font-size: var(--text-sm);
+  color: var(--text-primary);
+}
+
+.plex-server input[type="checkbox"] {
+  accent-color: var(--spotlight);
+}
+
+/* Disconnect only removes Marrquee's own record - a plain ghost action,
+ * tinted the same red every other destructive form action on this panel
+ * already uses. */
+[data-role="disconnect-form"] .btn-ghost {
+  color: var(--error);
+  border-color: var(--error);
 }
 
 /* --- The amber "Running without VPN" badge, right under the lede -----------

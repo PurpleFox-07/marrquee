@@ -449,7 +449,10 @@ def plan_folders(app_ids: Iterable[str]) -> tuple[PurePosixPath, ...]:
     planned += [PurePosixPath("data", "media", media) for media in library_only_types]
 
     planned.append(PurePosixPath("marrquee"))
-    planned += [PurePosixPath("marrquee", "apps", app.id) for app in apps]
+    # An unmanaged app (the owner's own existing Plex) is never deployed, so
+    # it never gets a config folder of its own - only its shared
+    # `data/media` library folders above are planned for it.
+    planned += [PurePosixPath("marrquee", "apps", app.id) for app in apps if app.managed]
     return tuple(planned)
 
 

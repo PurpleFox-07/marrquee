@@ -27,13 +27,25 @@ from starlette.datastructures import FormData
 
 from marrquee import words
 from marrquee.addresses import authority_from_headers, proxy_suspected
-from marrquee.catalog import JELLYFIN_APP_ID, RECYCLARR_APP_ID, get_app, unavailable_reason
+from marrquee.catalog import (
+    EXISTING_PLEX_APP_ID,
+    JELLYFIN_APP_ID,
+    RECYCLARR_APP_ID,
+    get_app,
+    unavailable_reason,
+)
 from marrquee.config import Settings
 from marrquee.deploy import AddStart, DeployManager, DeploySnapshot
 from marrquee.docker_client import DockerEngine
 from marrquee.graphics_chip import GraphicsChipCheck
 from marrquee.hardlinks import HardlinkMonitor
-from marrquee.health import LinkProbe, read_health, read_link_health
+from marrquee.health import (
+    AppHealth,
+    LinkProbe,
+    read_existing_plex_health,
+    read_health,
+    read_link_health,
+)
 from marrquee.hub import (
     HUB_ADD_POLL_MS,
     HUB_POLL_MS,
@@ -47,6 +59,7 @@ from marrquee.hub import (
     hub_panel,
     hub_view,
     login_view,
+    plex_servers_panel,
     running_without_vpn,
     vpn_prefill,
 )
@@ -69,6 +82,7 @@ from marrquee.login import (
     password_matches,
     save_login,
 )
+from marrquee.plex import PlexServer, PlexTv, account_plex_servers, load_existing_plex
 from marrquee.questions import SEEDING_STEP, VPN_STEP, check_step, load_answers, save_step_answers
 from marrquee.recyclarr import RecyclarrControl, SyncStatus
 from marrquee.state import load_state
@@ -130,9 +144,16 @@ async def read_hub_view(request: Request) -> HubView:
     link_probe: LinkProbe = request.app.state.link_probe
     monitor: HardlinkMonitor = request.app.state.hardlinks
     recyclarr: RecyclarrControl = request.app.state.recyclarr
+    plex_server: PlexServer = request.app.state.plex_server
+    vpn_control: GluetunControl = request.app.state.vpn_control
 
     snapshot = manager.snapshot()
     app_ids = tuple(app.app_id for app in snapshot.apps)
+    # An unmanaged app (only the owner's own Plex today) has no container
+    # for Docker to be asked about - its own health comes from
+    # `read_existing_plex_health` instead, joined into the same gather
+    # below rather than a second Docker read.
+    managed_ids = tuple(app_id for app_id in app_ids if get_app(app_id).managed)
     links = load_links(settings.config_dir)
 
     # Probed only when Jellyfin could still be added AND isn't ruled out by
@@ -153,28 +174,39 @@ async def read_hub_view(request: Request) -> HubView:
             return None
         return await recyclarr.status()
 
-    # Gluetun's own key only exists once the VPN is actually installed - a
-    # deploy with no VPN never touches its control server at all, the same
-    # "ask nothing you don't need to" rule `read_link_health` already
-    # follows for a Hub with no saved links.
+    async def _no_vpn_place() -> TunnelPlace | None:
+        return None
+
+    async def _no_existing_plex_health() -> AppHealth | None:
+        return None
+
+    # Gluetun's own key only exists once the VPN is actually installed, and
+    # `existing_plex_record` only once the owner's own Plex is - a deploy
+    # with neither never touches Gluetun's control server or Plex's
+    # `/identity` at all, the same "ask nothing you don't need to" rule
+    # `read_link_health` already follows for a Hub with no saved links.
+    # Both stay real, always-present members of the one `gather` below
+    # (never a second or third copy of it) so a hung Gluetun or Plex answer
+    # never adds its own wait on top of the Docker read.
     install = load_state(settings.config_dir)
     vpn_key = install.api_keys.get("gluetun") if install is not None else None
-    vpn_place: TunnelPlace | None
-    if "gluetun" in app_ids and vpn_key:
-        vpn_control: GluetunControl = request.app.state.vpn_control
-        healths, link_healths, vpn_place, recyclarr_status = await asyncio.gather(
-            read_health(engine, app_ids),
-            read_link_health(link_probe, links),
-            vpn_control.public_ip(vpn_key),
-            _sync_status(),
-        )
-    else:
-        vpn_place = None
-        healths, link_healths, recyclarr_status = await asyncio.gather(
-            read_health(engine, app_ids),
-            read_link_health(link_probe, links),
-            _sync_status(),
-        )
+    existing_plex_record = (
+        load_existing_plex(settings.config_dir) if EXISTING_PLEX_APP_ID in app_ids else None
+    )
+
+    healths, link_healths, existing_plex_health, vpn_place, recyclarr_status = await asyncio.gather(
+        read_health(engine, managed_ids),
+        read_link_health(link_probe, links),
+        (
+            read_existing_plex_health(plex_server, existing_plex_record)
+            if EXISTING_PLEX_APP_ID in app_ids
+            else _no_existing_plex_health()
+        ),
+        (vpn_control.public_ip(vpn_key) if "gluetun" in app_ids and vpn_key else _no_vpn_place()),
+        _sync_status(),
+    )
+    if existing_plex_health is not None:
+        healths = (*healths, existing_plex_health)
 
     login = login_view(
         load_login(settings.config_dir),
@@ -203,6 +235,8 @@ async def read_hub_view(request: Request) -> HubView:
         recyclarr=recyclarr_status,
         answers=load_answers(settings.config_dir),
         graphics_chip=chip,
+        existing_plex=existing_plex_record,
+        storage_root=install.storage_root if install is not None else None,
     )
 
 
@@ -229,7 +263,22 @@ async def get_hub(request: Request) -> Response:
         panel = hub_panel(None, None, links)
     if panel.mode == "without-vpn" and not view.without_vpn_offer:
         panel = hub_panel(None, None, links)
+    if panel.mode == "plex" and view.existing_plex_view is None:
+        panel = hub_panel(None, None, links)
+    if panel.mode == "plex-servers":
+        panel = await _plex_servers_panel(request)
     return _hub_response(request, view, panel)
+
+
+async def _plex_servers_panel(request: Request) -> HubPanel:
+    """`GET /?panel=plex-servers`'s own fetch - kept out of `read_hub_view`
+    entirely, so the Hub's own live poll never calls plex.tv on the
+    owner's behalf.
+    """
+    settings: Settings = request.app.state.settings
+    plex_tv: PlexTv = request.app.state.plex_tv
+    servers = await account_plex_servers(plex_tv, settings.config_dir)
+    return plex_servers_panel(servers, load_links(settings.config_dir))
 
 
 def _qbittorrent_installed(snapshot: DeploySnapshot) -> bool:

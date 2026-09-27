@@ -466,6 +466,38 @@ _EXPECTED_INVENTORY = (
     "WIRING_LINE_JELLYFIN_GRAPHICS",
     "JELLYFIN_NOTE_GRAPHICS",
     "WIRING_JELLYFIN_NOT_SET_UP",
+    "EXISTING_PLEX_DESCRIPTION",
+    "existing_plex_description",
+    "EXISTING_PLEX_EXCLUDES_PLEX",
+    "EXCLUDED_BY_EXISTING_PLEX",
+    "FAILURE_EXISTING_PLEX_UNREACHABLE",
+    "EXISTING_PLEX_DISCONNECT_BUSY",
+    "existing_plex_disconnect_needed",
+    "EXISTING_PLEX_LIBRARY_MOVIES",
+    "EXISTING_PLEX_LIBRARY_TV",
+    "EXISTING_PLEX_NOTE_ADDED",
+    "EXISTING_PLEX_NOTE_CANT_SEE",
+    "EXISTING_PLEX_TOKEN_REFUSED",
+    "WIRING_EXISTING_PLEX_MISSING",
+    "EXISTING_PLEX_LINE_DOWN",
+    "EXISTING_PLEX_ROW_TITLE",
+    "EXISTING_PLEX_SIGN_IN_HINT",
+    "EXISTING_PLEX_PICK_TITLE",
+    "EXISTING_PLEX_PICK_LEDE",
+    "EXISTING_PLEX_CONNECT_BUTTON",
+    "EXISTING_PLEX_OFFLINE_HINT",
+    "existing_plex_replace_link",
+    "existing_plex_unreachable",
+    "EXISTING_PLEX_NO_SERVERS",
+    "EXISTING_PLEX_LIST_FAILED",
+    "EXISTING_PLEX_SIGN_IN_AGAIN",
+    "EXISTING_PLEX_MANAGE",
+    "EXISTING_PLEX_MANAGE_ARIA",
+    "EXISTING_PLEX_FOLDER_OK",
+    "existing_plex_cant_see_help",
+    "EXISTING_PLEX_CHECK_AGAIN",
+    "EXISTING_PLEX_DISCONNECT",
+    "EXISTING_PLEX_DISCONNECT_NOTE",
 )
 
 _DEPLOY_ENGINE_WORD_COUNT = 40
@@ -483,6 +515,7 @@ _DRIVE_WORD_COUNT = 27
 _RECYCLARR_WORD_COUNT = 24
 _PLEX_WORD_COUNT = 23
 _JELLYFIN_WORD_COUNT = 21
+_EXISTING_PLEX_WORD_COUNT = 32
 
 
 def test_words_inventory_is_pinned() -> None:
@@ -890,9 +923,9 @@ def test_the_plex_section_precedes_the_jellyfin_section() -> None:
     assert "JELLYFIN_DESCRIPTION" not in plex_names
 
 
-def test_the_jellyfin_section_is_last() -> None:
-    """Jellyfin is the newest section. Later chunks in this story bump
-    `_JELLYFIN_WORD_COUNT` as they append more words to it.
+def test_the_jellyfin_section_precedes_the_existing_plex_section() -> None:
+    """Jellyfin used to be the newest section - "Your own Plex" now follows
+    it, the same bounded-slice move every earlier story made.
     """
     jellyfin_start = (
         _DEPLOY_ENGINE_WORD_COUNT
@@ -910,14 +943,90 @@ def test_the_jellyfin_section_is_last() -> None:
         + _RECYCLARR_WORD_COUNT
         + _PLEX_WORD_COUNT
     )
+    jellyfin_end = jellyfin_start + _JELLYFIN_WORD_COUNT
 
-    jellyfin_names = words.WORDS_INVENTORY[jellyfin_start:]
+    jellyfin_names = words.WORDS_INVENTORY[jellyfin_start:jellyfin_end]
 
-    assert jellyfin_names == _EXPECTED_INVENTORY[jellyfin_start:]
+    assert jellyfin_names == _EXPECTED_INVENTORY[jellyfin_start:jellyfin_end]
     assert jellyfin_names[0] == "JELLYFIN_DESCRIPTION"
-    assert len(words.WORDS_INVENTORY) == len(_EXPECTED_INVENTORY)
     assert len(jellyfin_names) == _JELLYFIN_WORD_COUNT
     assert "PLEX_DESCRIPTION" not in jellyfin_names
+    assert "EXISTING_PLEX_DESCRIPTION" not in jellyfin_names
+
+
+def test_the_existing_plex_section_is_last() -> None:
+    """ "Your own Plex" is the newest section. Later chunks in this story
+    bump `_EXISTING_PLEX_WORD_COUNT` as they append more words to it.
+    """
+    existing_plex_start = (
+        _DEPLOY_ENGINE_WORD_COUNT
+        + _WIZARD_WORD_COUNT
+        + _WIRING_WORD_COUNT
+        + _DEPLOY_SCREEN_WORD_COUNT
+        + _HUB_WORD_COUNT
+        + _HUB_LINK_WORD_COUNT
+        + _HUB_INSTALL_WORD_COUNT
+        + _LOGIN_WORD_COUNT
+        + _VPN_WORD_COUNT
+        + _QBIT_WORD_COUNT
+        + _VPN_CHANGE_WORD_COUNT
+        + _DRIVE_WORD_COUNT
+        + _RECYCLARR_WORD_COUNT
+        + _PLEX_WORD_COUNT
+        + _JELLYFIN_WORD_COUNT
+    )
+
+    existing_plex_names = words.WORDS_INVENTORY[existing_plex_start:]
+
+    assert existing_plex_names == _EXPECTED_INVENTORY[existing_plex_start:]
+    assert existing_plex_names[0] == "EXISTING_PLEX_DESCRIPTION"
+    assert len(words.WORDS_INVENTORY) == len(_EXPECTED_INVENTORY)
+    assert len(existing_plex_names) == _EXISTING_PLEX_WORD_COUNT
+    assert "JELLYFIN_DESCRIPTION" not in existing_plex_names
+
+
+def test_existing_plex_words_never_call_it_a_media_server() -> None:
+    """The same Alignment rule as Plex's and Jellyfin's sections: only the
+    whole setup is ever called a "media server".
+    """
+    assert "media server" not in words.EXISTING_PLEX_DESCRIPTION.lower()
+    assert "media server" not in words.existing_plex_description("Den").lower()
+    assert "media server" not in words.EXISTING_PLEX_EXCLUDES_PLEX.lower()
+    assert "media server" not in words.EXCLUDED_BY_EXISTING_PLEX.lower()
+    assert "media server" not in words.FAILURE_EXISTING_PLEX_UNREACHABLE.lower()
+    assert "media server" not in words.EXISTING_PLEX_DISCONNECT_BUSY.lower()
+    assert "media server" not in words.existing_plex_disconnect_needed("Seerr").lower()
+
+
+def test_existing_plex_failure_words_match_content_direction() -> None:
+    assert "Try again" in words.FAILURE_EXISTING_PLEX_UNREACHABLE
+    assert "Cancel" in words.FAILURE_EXISTING_PLEX_UNREACHABLE
+    assert words.EXISTING_PLEX_DISCONNECT_BUSY == (
+        "Marrquee is busy right now. Try again when it's finished."
+    )
+    assert words.existing_plex_disconnect_needed("Seerr") == (
+        "Seerr uses your Plex. Plex has to stay connected while Seerr is installed."
+    )
+
+
+def test_existing_plex_library_titles_carry_marrquee_in_the_name() -> None:
+    assert words.EXISTING_PLEX_LIBRARY_MOVIES == "Movies (Marrquee)"
+    assert words.EXISTING_PLEX_LIBRARY_TV == "TV Shows (Marrquee)"
+
+
+def test_existing_plex_wiring_words_never_call_it_a_media_server() -> None:
+    assert "media server" not in words.EXISTING_PLEX_NOTE_ADDED.lower()
+    assert "media server" not in words.EXISTING_PLEX_NOTE_CANT_SEE.lower()
+    assert "media server" not in words.EXISTING_PLEX_TOKEN_REFUSED.lower()
+    assert "media server" not in words.WIRING_EXISTING_PLEX_MISSING.lower()
+
+
+def test_existing_plex_wiring_words_match_content_direction() -> None:
+    assert "Movies (Marrquee)" in words.EXISTING_PLEX_NOTE_ADDED
+    assert "TV Shows (Marrquee)" in words.EXISTING_PLEX_NOTE_ADDED
+    assert "no libraries were added" in words.EXISTING_PLEX_NOTE_CANT_SEE
+    assert "Disconnect it and connect it again" in words.EXISTING_PLEX_TOKEN_REFUSED
+    assert "Disconnect it and connect it again" in words.WIRING_EXISTING_PLEX_MISSING
 
 
 def test_drive_reason_and_todo_words_name_the_folder_and_match_content_direction() -> None:

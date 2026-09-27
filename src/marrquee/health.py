@@ -29,8 +29,10 @@ from typing import Literal, Protocol
 
 import httpx
 
+from marrquee.catalog import EXISTING_PLEX_APP_ID
 from marrquee.docker_client import ContainerHealth, ContainerSnapshot, DockerEngine
 from marrquee.links import LinkCard
+from marrquee.plex import ExistingPlex, PlexServer
 
 HubState = Literal["up", "starting", "down", "unknown"]
 LinkState = Literal["up", "down"]
@@ -112,6 +114,27 @@ async def read_health(engine: DockerEngine, app_ids: Sequence[str]) -> tuple[App
             )
         )
     return tuple(healths)
+
+
+async def read_existing_plex_health(server: PlexServer, record: ExistingPlex | None) -> AppHealth:
+    """The owner's own Plex reads its health from `/identity`, never
+    Docker - Marrquee never started this container, so `read_health` never
+    asks about it at all.
+
+    Never raises: no saved record, no answer from `/identity`, or a machine
+    id that doesn't match the one Marrquee connected to are all the same
+    honest "down" - the same "down means down, never a guess" rule
+    `_state_of` applies to a real container's own missing answer. `exists`
+    stays `True` throughout: there's no Docker container to be "gone",
+    so the only meaningful reading here is up or down.
+    """
+    if record is None:
+        return AppHealth(app_id=EXISTING_PLEX_APP_ID, state="down", exists=True, finished_at=None)
+    identity = await server.identity(record.base_url)
+    up = identity is not None and identity.machine_id == record.machine_id
+    return AppHealth(
+        app_id=EXISTING_PLEX_APP_ID, state="up" if up else "down", exists=True, finished_at=None
+    )
 
 
 @dataclass(frozen=True)

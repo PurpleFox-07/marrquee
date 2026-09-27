@@ -14,6 +14,7 @@ import pytest
 
 from marrquee.catalog import (
     CATALOG,
+    EXISTING_PLEX_APP_ID,
     JELLYFIN_APP_ID,
     MEDIA_SERVER_APP_IDS,
     PLEX_APP_ID,
@@ -31,6 +32,9 @@ from marrquee.catalog import (
     unavailable_reason,
 )
 from marrquee.words import (
+    EXCLUDED_BY_EXISTING_PLEX,
+    EXISTING_PLEX_DESCRIPTION,
+    EXISTING_PLEX_EXCLUDES_PLEX,
     JELLYFIN_DESCRIPTION,
     JELLYFIN_EXCLUDES_PLEX,
     PLEX_DESCRIPTION,
@@ -57,6 +61,7 @@ def test_catalog_holds_the_three_arr_apps_gluetun_and_qbittorrent_in_deploy_orde
         "recyclarr",
         "plex",
         "jellyfin",
+        "existing-plex",
     ]
     orders = [app.order for app in CATALOG]
     assert orders == sorted(orders)
@@ -105,6 +110,7 @@ def test_the_three_arr_apps_take_the_login_gluetun_takes_none_qbittorrent_its_ow
         "recyclarr": "none",
         "plex": "none",
         "jellyfin": "jellyfin",
+        "existing-plex": "none",
     }
 
 
@@ -197,6 +203,7 @@ def test_every_catalog_description_is_the_mockups_own_wording() -> None:
     assert descriptions_by_id["recyclarr"] == RECYCLARR_DESCRIPTION
     assert descriptions_by_id["plex"] == PLEX_DESCRIPTION
     assert descriptions_by_id["jellyfin"] == JELLYFIN_DESCRIPTION
+    assert descriptions_by_id["existing-plex"] == EXISTING_PLEX_DESCRIPTION
     assert PROWLARR_DESCRIPTION == "Your search sources, managed in one place."
     assert SONARR_DESCRIPTION == "Finds and organizes your TV shows."
     assert RADARR_DESCRIPTION == "Finds and organizes your movies."
@@ -426,10 +433,9 @@ def test_plex_is_unavailable_beside_jellyfin() -> None:
 # --- Jellyfin: a media-server app that excludes, and is excluded by, Plex ---
 
 
-def test_jellyfin_sits_last_right_after_plex() -> None:
+def test_jellyfin_sits_right_after_plex() -> None:
     ids = [app.id for app in CATALOG]
 
-    assert ids[-1] == "jellyfin"
     assert ids.index("jellyfin") == ids.index("plex") + 1
 
 
@@ -478,5 +484,70 @@ def test_media_server_of_returns_none_without_one() -> None:
     assert media_server_of(()) is None
 
 
-def test_media_server_app_ids_names_plex_and_jellyfin() -> None:
-    assert MEDIA_SERVER_APP_IDS == ("plex", "jellyfin")
+def test_media_server_app_ids_names_plex_jellyfin_and_existing_plex() -> None:
+    assert MEDIA_SERVER_APP_IDS == ("plex", "jellyfin", "existing-plex")
+
+
+# --- existing-plex: a media-server app Marrquee connects to but never ------
+# deploys ----------------------------------------------------------------------
+
+
+def test_existing_plex_sits_last_right_after_jellyfin() -> None:
+    ids = [app.id for app in CATALOG]
+
+    assert ids[-1] == "existing-plex"
+    assert ids.index("existing-plex") == ids.index("jellyfin") + 1
+
+
+def test_existing_plex_is_a_media_server_marrquee_never_deploys() -> None:
+    existing_plex = get_app(EXISTING_PLEX_APP_ID)
+
+    assert existing_plex.id == "existing-plex"
+    assert existing_plex.name == "Plex"
+    assert existing_plex.description == EXISTING_PLEX_DESCRIPTION
+    assert existing_plex.image == ""
+    assert existing_plex.port is None
+    assert existing_plex.env_prefix == "EXISTING_PLEX"
+    assert existing_plex.api_base == ""
+    assert existing_plex.media_folders == ()
+    assert existing_plex.needs_data_mount is False
+    assert existing_plex.glyph == "PX"
+    assert existing_plex.default_ticked is False
+    assert existing_plex.web_page is True
+    assert existing_plex.login_kind == "none"
+    assert existing_plex.kind == "media_server"
+    assert existing_plex.offered is True
+    assert existing_plex.web_path == "/web"
+    assert existing_plex.library_folders == ("movies", "tv")
+    assert existing_plex.managed is False
+
+
+def test_every_other_catalog_app_defaults_to_managed() -> None:
+    for app in CATALOG:
+        if app.id == EXISTING_PLEX_APP_ID:
+            continue
+        assert app.managed is True
+
+
+def test_plex_jellyfin_and_existing_plex_exclude_each_other() -> None:
+    plex = get_app(PLEX_APP_ID)
+    jellyfin = get_app(JELLYFIN_APP_ID)
+    existing_plex = get_app(EXISTING_PLEX_APP_ID)
+
+    assert unavailable_reason(plex, ("jellyfin",)) == PLEX_EXCLUDES_JELLYFIN
+    assert unavailable_reason(plex, ("existing-plex",)) == EXCLUDED_BY_EXISTING_PLEX
+    assert unavailable_reason(plex, ()) is None
+
+    assert unavailable_reason(jellyfin, ("plex",)) == JELLYFIN_EXCLUDES_PLEX
+    assert unavailable_reason(jellyfin, ("existing-plex",)) == EXCLUDED_BY_EXISTING_PLEX
+    assert unavailable_reason(jellyfin, ()) is None
+
+    assert unavailable_reason(existing_plex, ("plex",)) == EXISTING_PLEX_EXCLUDES_PLEX
+    assert unavailable_reason(existing_plex, ("jellyfin",)) == PLEX_EXCLUDES_JELLYFIN
+    assert unavailable_reason(existing_plex, ()) is None
+
+
+def test_media_server_of_finds_the_connected_plex() -> None:
+    found = media_server_of(("sonarr", "existing-plex"))
+    assert found is not None
+    assert found.id == "existing-plex"

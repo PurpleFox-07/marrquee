@@ -24,6 +24,7 @@ from marrquee.hardlinks import HardlinkOutcome, HardlinkReason, HardlinkResult
 from marrquee.health import AppHealth, HubState, LinkHealth, LinkState
 from marrquee.hub import (
     HUB_POLL_MS,
+    ExistingPlexView,
     HubPanel,
     HubTile,
     InstallRow,
@@ -35,6 +36,7 @@ from marrquee.hub import (
 )
 from marrquee.links import LinkCard
 from marrquee.login import LoginRecord, SavedLogin
+from marrquee.plex import ExistingPlex
 from marrquee.questions import QuestionCheck, QuestionField, QuestionStep
 from marrquee.recyclarr import SyncRecord, SyncStatus
 from marrquee.vpn import TunnelPlace
@@ -602,12 +604,19 @@ def test_installable_is_the_catalog_minus_the_deploy_in_catalog_order() -> None:
         "recyclarr",
         "plex",
         "jellyfin",
+        "existing-plex",
     ]
 
     every_id = [app.id for app in CATALOG]
+    # existing-plex's health comes from `read_existing_plex_health`
+    # (`/identity`), never Docker, but `hub_view` itself takes whatever
+    # `AppHealth` it's handed regardless of source - an "up" reading for it
+    # renders exactly as truthfully as any other app's, and its own
+    # unmanaged tile branch never reaches `_line`'s `require_port` guard
+    # (which would otherwise raise for a poster with no port).
     full_view = hub_view(
         every_id,
-        [_health(app_id) for app_id in every_id],
+        [_health(app_id, state="up") for app_id in every_id],
         authority=_AUTHORITY,
         proxied=False,
         now=_NOW,
@@ -756,7 +765,15 @@ def test_install_rows_exclude_the_app_being_added_and_grey_an_unavailable_one(
 
     ids = [row.app.id for row in view.install_rows]
     assert "sonarr" not in ids
-    assert ids == ["prowlarr", "radarr", "qbittorrent", "recyclarr", "plex", "jellyfin"]
+    assert ids == [
+        "prowlarr",
+        "radarr",
+        "qbittorrent",
+        "recyclarr",
+        "plex",
+        "jellyfin",
+        "existing-plex",
+    ]
     by_id = {row.app.id: row for row in view.install_rows}
     assert isinstance(by_id["radarr"], InstallRow)
     assert by_id["prowlarr"].unavailable is None
@@ -1823,3 +1840,178 @@ def test_drive_note_is_the_owners_sentence_only_for_copies_and_couldnt_check() -
     assert works.drive_note is None
     assert not_needed.drive_note is None
     assert no_saved_result.drive_note is None
+
+
+# --- The owner's own Plex: a tile from health, never from Docker ------------
+
+
+def _existing_plex(**overrides: object) -> ExistingPlex:
+    fields: dict[str, object] = {
+        "machine_id": "m1",
+        "name": "Den",
+        "base_url": "http://192.168.1.20:32400",
+        "port": 32400,
+        "on_this_nas": False,
+        "token": "tok-secret-999",
+        "folders": {"movies": "added", "tv": "added"},
+        "sections": {"movies": "5", "tv": "6"},
+        "replaces_link": None,
+    }
+    fields.update(overrides)
+    return ExistingPlex(**fields)  # type: ignore[arg-type]
+
+
+def test_up_no_line_link_to_this_nass_address_for_a_plex_on_this_nas() -> None:
+    record = _existing_plex(on_this_nas=True, port=32400)
+
+    view = hub_view(
+        ["existing-plex"],
+        [_health("existing-plex", state="up")],
+        authority="nas.local:7788",
+        proxied=False,
+        now=_NOW,
+        existing_plex=record,
+    )
+
+    tile = view.tiles[0]
+    assert tile.url == "http://nas.local:32400/web"
+    assert tile.line == ""
+    assert tile.state == "up"
+    assert tile.managed is False
+
+
+def test_a_wrong_machine_id_reads_as_down_and_keeps_its_link() -> None:
+    """`hub_view` never re-derives Down's cause - it's handed whatever
+    `read_existing_plex_health` decided, and only draws it: the link stays
+    live because Marrquee's own NAS-side probe failing says nothing about
+    whether the owner's browser can still reach it.
+    """
+    record = _existing_plex(on_this_nas=False, base_url="http://192.168.1.20:32400")
+
+    view = hub_view(
+        ["existing-plex"],
+        [_health("existing-plex", state="down")],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        existing_plex=record,
+    )
+
+    tile = view.tiles[0]
+    assert tile.state == "down"
+    assert tile.line == words.EXISTING_PLEX_LINE_DOWN
+    assert tile.url == "http://192.168.1.20:32400/web"
+
+
+def test_cant_see_note_with_check_again() -> None:
+    record = _existing_plex(folders={"movies": "added", "tv": "not_seen"})
+
+    view = hub_view(
+        ["existing-plex"],
+        [_health("existing-plex", state="up")],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        existing_plex=record,
+    )
+
+    tile = view.tiles[0]
+    assert tile.note == words.EXISTING_PLEX_NOTE_CANT_SEE
+    assert tile.actions == "reconnect"
+
+
+def test_a_wiring_gap_note_wins_over_the_cant_see_note() -> None:
+    record = _existing_plex(folders={"movies": "added", "tv": "not_seen"})
+    gap = WiringGap(app_id="existing-plex", failed_lines=("Couldn't reach Plex",))
+
+    view = hub_view(
+        ["existing-plex"],
+        [_health("existing-plex", state="up")],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        existing_plex=record,
+        wiring_gaps=[gap],
+    )
+
+    tile = view.tiles[0]
+    assert tile.note == words.hub_wiring_gap_note("Plex", gap.failed_lines)
+    assert tile.actions == "reconnect"
+
+
+def test_no_saved_record_falls_back_to_the_catalog_description_with_no_link() -> None:
+    view = hub_view(
+        ["existing-plex"],
+        [_health("existing-plex", state="down")],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+    )
+
+    tile = view.tiles[0]
+    assert tile.description == words.EXISTING_PLEX_DESCRIPTION
+    assert tile.url is None
+    assert tile.aria is None
+
+
+def test_existing_plex_tile_is_excluded_from_any_down_and_docker_unreachable() -> None:
+    down_view = hub_view(
+        ["sonarr", "existing-plex"],
+        [_health("sonarr", state="up"), _health("existing-plex", state="down")],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        existing_plex=_existing_plex(),
+    )
+    all_unknown_but_plex = hub_view(
+        ["sonarr", "existing-plex"],
+        [_health("sonarr", state="unknown"), _health("existing-plex", state="up")],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        existing_plex=_existing_plex(),
+    )
+
+    assert down_view.any_down is False
+    assert all_unknown_but_plex.docker_unreachable is True
+
+
+def test_managed_defaults_true_and_is_false_only_for_the_existing_plex_tile() -> None:
+    view = hub_view(
+        ["sonarr", "existing-plex"],
+        [_health("sonarr", state="up"), _health("existing-plex", state="up")],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        existing_plex=_existing_plex(),
+    )
+
+    by_id = {tile.app_id: tile for tile in view.tiles}
+    assert by_id["sonarr"].managed is True
+    assert by_id["existing-plex"].managed is False
+
+
+def test_hub_view_never_holds_the_raw_existing_plex_record() -> None:
+    record = _existing_plex()
+
+    view = hub_view(
+        ["existing-plex"],
+        [_health("existing-plex", state="up")],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+        existing_plex=record,
+        storage_root="/volume1/media",
+    )
+
+    assert not hasattr(view, "existing_plex")
+    assert view.existing_plex_view == ExistingPlexView(
+        name="Den", folders=record.folders, host_media_root="/volume1/media/data/media"
+    )
+    assert "tok-secret-999" not in repr(view.existing_plex_view)
+
+
+def test_no_existing_plex_installed_leaves_the_view_none() -> None:
+    view = hub_view(["sonarr"], [_health("sonarr")], authority=_AUTHORITY, proxied=False, now=_NOW)
+
+    assert view.existing_plex_view is None

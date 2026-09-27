@@ -122,9 +122,11 @@ def _offered_apps() -> tuple[CatalogApp, ...]:
     Gluetun is a real catalog entry (so its question step and its bring-up
     both happen in catalog order) but `offered=False` keeps it out of every
     screen that lets an owner choose it directly - whatever needs it adds
-    it as a companion instead.
+    it as a companion instead. The owner's own existing Plex is
+    `offered=True` but `managed=False`: it is connected from the Hub's "+"
+    panel once an install already exists, never ticked on this screen.
     """
-    return tuple(app for app in CATALOG if app.offered)
+    return tuple(app for app in CATALOG if app.offered and app.managed)
 
 
 async def _apps_context(

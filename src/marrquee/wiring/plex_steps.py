@@ -12,15 +12,32 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 from typing import Final, Literal
 
-from marrquee.plex import PlexResponse, PlexServer
+from marrquee.config import Settings
+from marrquee.plex import (
+    ExistingPlex,
+    FolderState,
+    PlexResponse,
+    PlexSection,
+    PlexServer,
+    parse_plex_sections,
+    probe_folder,
+    update_existing_plex,
+)
 from marrquee.storage import container_media_path
 from marrquee.wiring.steps import StepOutcome
 from marrquee.words import (
+    EXISTING_PLEX_LIBRARY_MOVIES,
+    EXISTING_PLEX_LIBRARY_TV,
+    EXISTING_PLEX_NOTE_ADDED,
+    EXISTING_PLEX_NOTE_CANT_SEE,
+    EXISTING_PLEX_TOKEN_REFUSED,
     PLEX_LIBRARY_MOVIES,
     PLEX_LIBRARY_TV,
     PLEX_NOTE_DIRECT_PLAY,
+    WIRING_EXISTING_PLEX_MISSING,
     WIRING_NOTE_ALREADY_CONNECTED,
     wiring_failure_refused,
     wiring_failure_unreachable,
@@ -109,29 +126,28 @@ def _plex_write_failure(response: PlexResponse, *, technical: str) -> StepOutcom
 # --- Libraries: Movies and TV Shows, each at most once -----------------------
 
 
-def _directories(payload: object) -> list[Mapping[str, object]]:
-    if not isinstance(payload, dict):
-        return []
-    container = payload.get("MediaContainer")
-    if not isinstance(container, dict):
-        return []
-    directories = container.get("Directory")
-    if not isinstance(directories, list):
-        return []
-    return [entry for entry in directories if isinstance(entry, dict)]
-
-
-def _library_exists(directories: list[Mapping[str, object]], spec: PlexLibrarySpec) -> bool:
+def _library_exists(sections: tuple[PlexSection, ...], spec: PlexLibrarySpec) -> bool:
     target = str(container_media_path(spec.media_folder))
-    for directory in directories:
-        if directory.get("type") != spec.plex_type:
-            continue
-        locations = directory.get("Location")
-        if not isinstance(locations, list):
-            continue
-        if any(isinstance(entry, dict) and entry.get("path") == target for entry in locations):
-            return True
-    return False
+    return any(
+        section.type == spec.plex_type and target in section.locations for section in sections
+    )
+
+
+def plex_library_params(
+    spec: PlexLibrarySpec, *, title: str, location: str
+) -> list[tuple[str, str]]:
+    """The exact form-encoded params `POST /library/sections` wants - shared
+    by both the managed Plex's own step and the existing-Plex one, so both
+    ever send only one query shape.
+    """
+    return [
+        ("name", title),
+        ("type", spec.plex_type),
+        ("agent", spec.agent),
+        ("scanner", spec.scanner),
+        ("language", _LIBRARY_LANGUAGE),
+        ("location", location),
+    ]
 
 
 async def ensure_plex_libraries(server: PlexServer, base_url: str, token: str) -> StepOutcome:
@@ -145,23 +161,18 @@ async def ensure_plex_libraries(server: PlexServer, base_url: str, token: str) -
     if not listing.ok:
         return _plex_read_failure(listing)
 
-    directories = _directories(listing.payload)
+    sections = parse_plex_sections(listing.payload)
     changed = False
     for spec in PLEX_LIBRARIES:
-        if _library_exists(directories, spec):
+        if _library_exists(sections, spec):
             continue
         created = await server.request(
             "POST",
             base_url,
             _LIBRARY_SECTIONS_PATH,
             token,
-            params=(
-                ("name", spec.title),
-                ("type", spec.plex_type),
-                ("agent", spec.agent),
-                ("scanner", spec.scanner),
-                ("language", _LIBRARY_LANGUAGE),
-                ("location", str(container_media_path(spec.media_folder))),
+            params=plex_library_params(
+                spec, title=spec.title, location=str(container_media_path(spec.media_folder))
             ),
         )
         if not created.ok:
@@ -257,4 +268,191 @@ async def ensure_plex_direct_play(server: PlexServer, base_url: str, token: str)
         technical=f"{PLEX_DIRECT_PLAY_PREF}: HTTP {confirm.status}",
         changed=False,
         transient=False,
+    )
+
+
+# --- The owner's OWN Plex: only where it can actually see the folder --------
+
+# Which of Marrquee's own titles goes with which `PlexLibrarySpec` - the
+# owner's Plex keeps its own naming for everything else, so these are the
+# only two titles this module ever sends for an existing-Plex library.
+_EXISTING_PLEX_TITLES: Final[Mapping[str, str]] = {
+    "movie": EXISTING_PLEX_LIBRARY_MOVIES,
+    "show": EXISTING_PLEX_LIBRARY_TV,
+}
+
+
+def _existing_plex_technical(action: str, response: PlexResponse) -> str:
+    return f"{action}: HTTP {response.status}"
+
+
+def _existing_plex_failure(response: PlexResponse, *, action: str) -> StepOutcome:
+    """Classify a failed call against the owner's OWN Plex.
+
+    Unlike the managed Plex's own `_plex_transient`, a 401 here is never
+    worth retrying - it means the owner's sign-in was refused outright, not
+    that Plex is merely still waking up.
+    """
+    if response.status == 0 or response.status >= 500:
+        return StepOutcome(
+            state="error",
+            note=wiring_failure_unreachable("Plex"),
+            technical=_existing_plex_technical(action, response),
+            changed=False,
+            transient=True,
+        )
+    if response.status == 401:
+        return StepOutcome(
+            state="error",
+            note=EXISTING_PLEX_TOKEN_REFUSED,
+            technical=_existing_plex_technical(action, response),
+            changed=False,
+            transient=False,
+        )
+    return StepOutcome(
+        state="error",
+        note=wiring_failure_refused("Plex"),
+        technical=_existing_plex_technical(action, response),
+        changed=False,
+        transient=False,
+    )
+
+
+def _covering_section(sections: tuple[PlexSection, ...], path: str) -> PlexSection | None:
+    """The first already-existing section whose own location is `path` or an
+    ancestor of it - "never touch existing libraries" means a folder already
+    inside one of them is left alone, whatever that library is named.
+    """
+    target = PurePosixPath(path)
+    for section in sections:
+        for location in section.locations:
+            location_path = PurePosixPath(location)
+            if location_path == target or location_path in target.parents:
+                return section
+    return None
+
+
+async def ensure_existing_plex_libraries(
+    server: PlexServer,
+    record: ExistingPlex,
+    settings: Settings,
+    root: PurePosixPath,
+    config_dir: Path,
+) -> StepOutcome:
+    """Prove the owner's own Plex is still the one Marrquee connected to,
+    then add "Movies (Marrquee)" and "TV Shows (Marrquee)" wherever that
+    Plex can actually see the folder - never duplicating a folder some
+    other library already covers, and never touching anything else already
+    in that Plex.
+
+    Each folder's own visibility is re-proven every run, since what that
+    Plex can see may change between one wiring run and the next (the owner
+    may have only just mapped the folder into its container).
+    """
+    identity = await server.identity(record.base_url)
+    if identity is None or identity.machine_id != record.machine_id:
+        return StepOutcome(
+            state="error",
+            note=wiring_failure_unreachable("Plex"),
+            technical=(
+                "identity: no answer" if identity is None else f"identity: {identity.machine_id}"
+            ),
+            changed=False,
+            transient=identity is None,
+        )
+
+    listing = await server.request("GET", record.base_url, _LIBRARY_SECTIONS_PATH, record.token)
+    if not listing.ok:
+        return _existing_plex_failure(listing, action="library sections")
+    sections = parse_plex_sections(listing.payload)
+
+    folders: dict[str, FolderState] = dict(record.folders)
+    section_keys: dict[str, str] = dict(record.sections)
+    added_locations: dict[str, str] = {}
+
+    for spec in PLEX_LIBRARIES:
+        seen = await probe_folder(
+            server, record.base_url, record.token, settings, root, spec.media_folder
+        )
+        if seen.state == "unknown":
+            return StepOutcome(
+                state="error",
+                note=wiring_failure_unreachable("Plex"),
+                technical=seen.technical,
+                changed=False,
+                transient=True,
+            )
+        if seen.state == "not_seen":
+            folders[spec.media_folder] = "not_seen"
+            continue
+
+        assert seen.path is not None  # "seen" always carries the path that matched
+        covering = _covering_section(sections, seen.path)
+        if covering is not None:
+            folders[spec.media_folder] = "already"
+            section_keys[spec.media_folder] = covering.key
+            continue
+
+        title = _EXISTING_PLEX_TITLES[spec.plex_type]
+        created = await server.request(
+            "POST",
+            record.base_url,
+            _LIBRARY_SECTIONS_PATH,
+            record.token,
+            params=plex_library_params(spec, title=title, location=seen.path),
+        )
+        if not created.ok:
+            return _existing_plex_failure(created, action=f"library {title}")
+        folders[spec.media_folder] = "added"
+        added_locations[spec.media_folder] = seen.path
+
+    if added_locations:
+        refreshed = await server.request(
+            "GET", record.base_url, _LIBRARY_SECTIONS_PATH, record.token
+        )
+        if not refreshed.ok:
+            return _existing_plex_failure(refreshed, action="library sections")
+        refreshed_sections = parse_plex_sections(refreshed.payload)
+        for media_folder, location in added_locations.items():
+            match = _covering_section(refreshed_sections, location)
+            if match is not None:
+                section_keys[media_folder] = match.key
+
+    try:
+        saved = update_existing_plex(config_dir, folders=folders, sections=section_keys)
+    except OSError as error:
+        return StepOutcome(
+            state="error",
+            note=wiring_failure_unreachable("Plex"),
+            technical=f"could not save: {type(error).__name__}",
+            changed=False,
+            transient=False,
+        )
+    if not saved:
+        return StepOutcome(
+            state="error",
+            note=WIRING_EXISTING_PLEX_MISSING,
+            technical="no saved existing-plex record",
+            changed=False,
+            transient=False,
+        )
+
+    if any(state == "not_seen" for state in folders.values()):
+        return StepOutcome(
+            state="skipped",
+            note=EXISTING_PLEX_NOTE_CANT_SEE,
+            technical=None,
+            changed=bool(added_locations),
+            transient=False,
+        )
+    if not added_locations:
+        return StepOutcome(
+            state="done",
+            note=WIRING_NOTE_ALREADY_CONNECTED,
+            technical=None,
+            changed=False,
+            transient=False,
+        )
+    return StepOutcome(
+        state="done", note=EXISTING_PLEX_NOTE_ADDED, technical=None, changed=True, transient=False
     )

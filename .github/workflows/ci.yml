@@ -2895,6 +2895,203 @@ jobs:
           fi
           echo "$login_change_output"
 
+      # existing-plex is `managed=False`: connecting one never deploys a
+      # container, so this step proves the refusals alone - Jellyfin
+      # already occupies the one media-server slot, so every door here
+      # (the install row, the JSON endpoint, the sign-in round trip, and a
+      # connect posted straight at a made-up id) must say no, write
+      # nothing, and leave compose.yaml and the app list untouched.
+      - name: Connecting your own Plex is refused while Jellyfin is installed
+        run: |
+          set -euo pipefail
+
+          if ! install_html=$(curl -fsS "http://127.0.0.1:7788/?panel=install") || [ -z "$install_html" ]; then
+            echo "::error::couldn't fetch the install pane to check existing-plex's own row"
+            exit 1
+          fi
+
+          cat > "$RUNNER_TEMP/ci_existing_plex_refused.py" <<'PY'
+          import html
+          import os
+          import re
+
+          from marrquee.words import PLEX_EXCLUDES_JELLYFIN, hub_install_unavailable
+
+          page = html.unescape(os.environ["INSTALL_HTML"])
+          match = re.search(r'data-install-row="existing-plex".*?</li>', page, re.DOTALL)
+          if match is None:
+              raise SystemExit("existing-plex's own install row is missing from the install pane")
+          row = match.group(0)
+          if 'data-available="false"' not in row:
+              raise SystemExit("existing-plex's install row was not marked unavailable")
+          if hub_install_unavailable(PLEX_EXCLUDES_JELLYFIN) not in row:
+              raise SystemExit("existing-plex's own exclusion reason is missing from its row")
+          print("existing-plex refusal check: ok")
+          PY
+          docker cp "$RUNNER_TEMP/ci_existing_plex_refused.py" marrquee-stack-smoke:/tmp/ci_existing_plex_refused.py
+          if ! refusal_output=$(docker exec -e INSTALL_HTML="$install_html" marrquee-stack-smoke python3 /tmp/ci_existing_plex_refused.py 2>&1); then
+            echo "$refusal_output"
+            echo "::error::existing-plex's own install row did not read as refused"
+            exit 1
+          fi
+          echo "$refusal_output"
+
+          if ! json_response=$(curl -s -w '\n%{http_code}' -X POST http://127.0.0.1:7788/api/hub/apps/existing-plex/install -H 'Content-Type: application/json' -d '{"answers":{}}') || [ -z "$json_response" ]; then
+            echo "::error::couldn't POST the JSON install endpoint for existing-plex"
+            exit 1
+          fi
+          json_code=$(echo "$json_response" | tail -n1)
+          if [ "$json_code" != "409" ]; then
+            echo "::error::POST /api/hub/apps/existing-plex/install returned ${json_code}, expected 409"
+            exit 1
+          fi
+
+          if ! sign_in_response=$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' -X POST http://127.0.0.1:7788/plex/sign-in --data-urlencode "then=connect") || [ -z "$sign_in_response" ]; then
+            echo "::error::couldn't POST /plex/sign-in with then=connect"
+            exit 1
+          fi
+          if [ "$sign_in_response" != "303 http://127.0.0.1:7788/" ]; then
+            echo "::error::POST /plex/sign-in (then=connect) returned ${sign_in_response}, expected 303 http://127.0.0.1:7788/"
+            exit 1
+          fi
+
+          if ! connect_code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:7788/plex/connect --data-urlencode "machine_id=ci-none") || [ -z "$connect_code" ]; then
+            echo "::error::couldn't POST /plex/connect"
+            exit 1
+          fi
+          if [ "$connect_code" != "303" ]; then
+            echo "::error::POST /plex/connect returned ${connect_code}, expected 303"
+            exit 1
+          fi
+
+          if ! docker exec marrquee-stack-smoke test -e /config/install.json; then
+            echo "::error::the positive control failed - /config/install.json is missing, so the record check below would prove nothing"
+            exit 1
+          fi
+          if docker exec marrquee-stack-smoke test -e /config/existing_plex.json; then
+            echo "::error::existing_plex.json was written despite every refusal above"
+            exit 1
+          fi
+
+          compose_file="$RUNNER_TEMP/marrquee-smoke/media/marrquee/compose.yaml"
+          if ! command -v grep > /dev/null; then
+            echo "::error::grep is not available on the runner to check compose.yaml for existing-plex"
+            exit 1
+          fi
+          if ! grep -F -q 'jellyfin:' "$compose_file"; then
+            echo "::error::the positive control failed - jellyfin: is missing from compose.yaml, so the check below would prove nothing"
+            exit 1
+          fi
+          set +e
+          grep -F -q 'existing-plex' "$compose_file"
+          existing_plex_leaked=$?
+          set -e
+          case "$existing_plex_leaked" in
+            1) ;;
+            0) echo "::error::existing-plex leaked into the real compose.yaml"; exit 1 ;;
+            *) echo "::error::couldn't check compose.yaml for a leaked existing-plex service (grep exit ${existing_plex_leaked})"; exit 1 ;;
+          esac
+
+          if ! deploy_body=$(curl -fsS http://127.0.0.1:7788/api/deploy) || [ -z "$deploy_body" ]; then
+            echo "::error::couldn't fetch /api/deploy to check existing-plex's own app list"
+            exit 1
+          fi
+          if ! echo "$deploy_body" | jq -e 'all(.apps[]; .app_id != "existing-plex")' > /dev/null; then
+            echo "::error::existing-plex appears in /api/deploy's own app list"
+            exit 1
+          fi
+
+      # The visibility probe plants and removes a uniquely named EMPTY
+      # folder of its own - this is the one place in the whole job that
+      # touches a real bind-mounted folder an owner's media actually lives
+      # in, so it runs against a sentinel file that is never a marker
+      # itself, to prove the probe's own folder is left exactly as it was.
+      - name: The Plex folder check leaves your Movies folder exactly as it was
+        run: |
+          set -euo pipefail
+
+          root="$RUNNER_TEMP/marrquee-smoke/media"
+          if ! before=$(ls -A "$root/data/media/movies"); then
+            echo "::error::couldn't list data/media/movies before the plex folder check"
+            exit 1
+          fi
+
+          touch "$root/data/media/movies/ci-not-a-marker"
+
+          cat > "$RUNNER_TEMP/ci_plex_folder_marker.py" <<'PY'
+          from pathlib import PurePosixPath
+
+          from marrquee.config import Settings
+          from marrquee.plex import make_folder_marker, remove_folder_marker
+          from marrquee.state import load_state
+          from marrquee.storage import to_host_view
+
+          settings = Settings.from_env()
+          state = load_state(settings.config_dir)
+          if state is None:
+              raise SystemExit("no install.json to read the storage root from")
+          root = PurePosixPath(state.storage_root)
+          movies = to_host_view(settings, str(root)) / "data" / "media" / "movies"
+
+          marker_name = make_folder_marker(settings, root, "movies")
+          created = (movies / marker_name).is_dir()
+
+          remove_folder_marker(settings, root, "movies", marker_name)
+          removed = not (movies / marker_name).exists()
+
+          sentinel = movies / "ci-not-a-marker"
+          remove_folder_marker(settings, root, "movies", "ci-not-a-marker")
+          sentinel_survived = sentinel.exists()
+
+          print(f"created={created}")
+          print(f"removed={removed}")
+          print(f"sentinel_survived={sentinel_survived}")
+          PY
+          docker cp "$RUNNER_TEMP/ci_plex_folder_marker.py" marrquee-stack-smoke:/tmp/ci_plex_folder_marker.py
+
+          if ! marker_output=$(docker exec marrquee-stack-smoke python3 /tmp/ci_plex_folder_marker.py) || [ -z "$marker_output" ]; then
+            echo "::error::the plex folder marker check failed to run"
+            exit 1
+          fi
+          echo "$marker_output"
+
+          if ! echo "$marker_output" | grep -qF "created=True"; then
+            echo "::error::the plex folder marker was never created"
+            exit 1
+          fi
+          if ! echo "$marker_output" | grep -qF "removed=True"; then
+            echo "::error::the plex folder marker was not removed after the probe"
+            exit 1
+          fi
+          if ! echo "$marker_output" | grep -qF "sentinel_survived=True"; then
+            echo "::error::remove_folder_marker touched a folder Marrquee never marked itself"
+            exit 1
+          fi
+
+          rm -f "$root/data/media/movies/ci-not-a-marker"
+
+          if ! after=$(ls -A "$root/data/media/movies"); then
+            echo "::error::couldn't list data/media/movies after the plex folder check"
+            exit 1
+          fi
+          if [ "$after" != "$before" ]; then
+            echo "::error::data/media/movies was not left exactly as it was before the plex folder check"
+            exit 1
+          fi
+
+          if ! command -v find > /dev/null; then
+            echo "::error::find is not available on the runner to check for a leftover plex-check marker"
+            exit 1
+          fi
+          if ! leftover=$(find "$root/data/media/movies" -name 'marrquee-plex-check-*'); then
+            echo "::error::couldn't search data/media/movies for a leftover plex-check marker"
+            exit 1
+          fi
+          if [ -n "$leftover" ]; then
+            echo "::error::a plex-check marker folder was left behind: ${leftover}"
+            exit 1
+          fi
+
       # The one place technical detail is allowed to show up, and exactly
       # where a first-time developer needs it: a red run here is debuggable
       # from the workflow's own log, not just "it failed". The same text

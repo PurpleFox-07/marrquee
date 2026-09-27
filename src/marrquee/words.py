@@ -2058,6 +2058,151 @@ _JELLYFIN_WORDS: tuple[str, ...] = (
 # end Jellyfin section
 # =============================================================================
 
+# =============================================================================
+# Your own Plex - the owner's existing Plex, connected but never deployed. The
+# same Alignment rule as Plex's and Jellyfin's sections: never call it a
+# "media server" on its own - that phrase stays reserved for the whole setup.
+# =============================================================================
+
+EXISTING_PLEX_DESCRIPTION = "The Plex you already had, connected with your Plex account."
+
+
+def existing_plex_description(name: str) -> str:
+    return f"Your own Plex, {name}."
+
+
+EXISTING_PLEX_EXCLUDES_PLEX = (
+    "Marrquee already set up a new Plex for you - you can have one Plex or "
+    "Jellyfin, and for now the choice stays"
+)
+EXCLUDED_BY_EXISTING_PLEX = (
+    "you've connected your own Plex - you can have Plex or Jellyfin, and for now the choice stays"
+)
+
+FAILURE_EXISTING_PLEX_UNREACHABLE = (
+    "Marrquee couldn't reach your Plex at the address it found. Check that Plex is "
+    "running, then press Try again - or Cancel and connect it again from the +."
+)
+EXISTING_PLEX_DISCONNECT_BUSY = "Marrquee is busy right now. Try again when it's finished."
+
+
+def existing_plex_disconnect_needed(name: str) -> str:
+    return f"{name} uses your Plex. Plex has to stay connected while {name} is installed."
+
+
+EXISTING_PLEX_LIBRARY_MOVIES = "Movies (Marrquee)"
+EXISTING_PLEX_LIBRARY_TV = "TV Shows (Marrquee)"
+EXISTING_PLEX_NOTE_ADDED = (
+    "Your Plex now has Movies (Marrquee) and TV Shows (Marrquee). Your other "
+    "libraries weren't touched."
+)
+EXISTING_PLEX_NOTE_CANT_SEE = (
+    "Your Plex can't see Marrquee's folders yet, so no libraries were added."
+)
+EXISTING_PLEX_TOKEN_REFUSED = (
+    "Your Plex didn't accept Marrquee's sign-in. Disconnect it and connect it again from the +."
+)
+WIRING_EXISTING_PLEX_MISSING = (
+    "Marrquee lost the details of your Plex. Disconnect it and connect it again from the +."
+)
+EXISTING_PLEX_LINE_DOWN = (
+    "Marrquee can't reach your Plex from the NAS - it may still work from your device."
+)
+
+EXISTING_PLEX_ROW_TITLE = "Connect a Plex you already have"
+EXISTING_PLEX_SIGN_IN_HINT = (
+    "Opens plex.tv. Approve Marrquee there, then pick your Plex server - no addresses to type."
+)
+EXISTING_PLEX_PICK_TITLE = "Pick your Plex server"
+EXISTING_PLEX_PICK_LEDE = (
+    "These are the Plex servers on your Plex account. Marrquee adds Movies (Marrquee) and TV "
+    "Shows (Marrquee) to the one you pick and never changes your other libraries."
+)
+EXISTING_PLEX_CONNECT_BUTTON = "Connect"
+EXISTING_PLEX_OFFLINE_HINT = "Plex says this server is offline right now."
+
+
+def existing_plex_replace_link(label: str) -> str:
+    return f"Replace my '{label}' link card with this Plex"
+
+
+def existing_plex_unreachable(name: str) -> str:
+    return (
+        f"Marrquee couldn't reach '{name}' from your NAS. Make sure it's switched on and on "
+        "the same network, then try again."
+    )
+
+
+EXISTING_PLEX_NO_SERVERS = (
+    "Your Plex account has no Plex server of its own yet. Sign in with the account that owns "
+    "your server."
+)
+EXISTING_PLEX_LIST_FAILED = (
+    "Marrquee couldn't get your server list from plex.tv. Try again in a minute."
+)
+EXISTING_PLEX_SIGN_IN_AGAIN = "Plex needs you to sign in again."
+EXISTING_PLEX_MANAGE = "Manage"
+EXISTING_PLEX_MANAGE_ARIA = "Manage your Plex connection"
+EXISTING_PLEX_FOLDER_OK = "Movies (Marrquee) and TV Shows (Marrquee) are in your Plex."
+
+
+def existing_plex_cant_see_help(path: str) -> str:
+    return (
+        f"Your Plex can't open {path}, so Marrquee didn't add its libraries. If Plex runs in "
+        f"your NAS's Docker app, give its container the folder {path} and set the path inside "
+        f"the container to the same {path}, restart Plex, then press Check again. If Plex runs "
+        "on another computer, it can't see these folders - you can add them yourself from a "
+        "network share."
+    )
+
+
+EXISTING_PLEX_CHECK_AGAIN = "Check again"
+EXISTING_PLEX_DISCONNECT = "Disconnect"
+EXISTING_PLEX_DISCONNECT_NOTE = (
+    "Disconnecting only takes Plex off your Hub. Your Plex and every library in it, including "
+    "Marrquee's, stay exactly as they are."
+)
+
+
+_EXISTING_PLEX_WORDS: tuple[str, ...] = (
+    "EXISTING_PLEX_DESCRIPTION",
+    "existing_plex_description",
+    "EXISTING_PLEX_EXCLUDES_PLEX",
+    "EXCLUDED_BY_EXISTING_PLEX",
+    "FAILURE_EXISTING_PLEX_UNREACHABLE",
+    "EXISTING_PLEX_DISCONNECT_BUSY",
+    "existing_plex_disconnect_needed",
+    "EXISTING_PLEX_LIBRARY_MOVIES",
+    "EXISTING_PLEX_LIBRARY_TV",
+    "EXISTING_PLEX_NOTE_ADDED",
+    "EXISTING_PLEX_NOTE_CANT_SEE",
+    "EXISTING_PLEX_TOKEN_REFUSED",
+    "WIRING_EXISTING_PLEX_MISSING",
+    "EXISTING_PLEX_LINE_DOWN",
+    "EXISTING_PLEX_ROW_TITLE",
+    "EXISTING_PLEX_SIGN_IN_HINT",
+    "EXISTING_PLEX_PICK_TITLE",
+    "EXISTING_PLEX_PICK_LEDE",
+    "EXISTING_PLEX_CONNECT_BUTTON",
+    "EXISTING_PLEX_OFFLINE_HINT",
+    "existing_plex_replace_link",
+    "existing_plex_unreachable",
+    "EXISTING_PLEX_NO_SERVERS",
+    "EXISTING_PLEX_LIST_FAILED",
+    "EXISTING_PLEX_SIGN_IN_AGAIN",
+    "EXISTING_PLEX_MANAGE",
+    "EXISTING_PLEX_MANAGE_ARIA",
+    "EXISTING_PLEX_FOLDER_OK",
+    "existing_plex_cant_see_help",
+    "EXISTING_PLEX_CHECK_AGAIN",
+    "EXISTING_PLEX_DISCONNECT",
+    "EXISTING_PLEX_DISCONNECT_NOTE",
+)
+
+# =============================================================================
+# end Your own Plex section
+# =============================================================================
+
 # The full review surface: every public name above, in one tuple. A later
 # feature area adds its own fenced section above this line, then extends
 # this tuple with its own `_..._WORDS` name - never editing an earlier
@@ -2078,4 +2223,5 @@ WORDS_INVENTORY: tuple[str, ...] = (
     *_RECYCLARR_WORDS,
     *_PLEX_WORDS,
     *_JELLYFIN_WORDS,
+    *_EXISTING_PLEX_WORDS,
 )

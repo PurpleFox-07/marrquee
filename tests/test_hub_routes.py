@@ -51,6 +51,7 @@ from marrquee.links import LINK_COUNT_MAX, LinkCard, load_links, save_links
 from marrquee.login import LOGIN_STEP, load_login, save_login
 from marrquee.login_apply import FakeLoginApplier
 from marrquee.main import create_app
+from marrquee.plex import ExistingPlex, FakePlexServer, PlexIdentity, PlexServer, save_existing_plex
 from marrquee.questions import (
     PLEX_STEP,
     SEEDING_STEP,
@@ -188,6 +189,7 @@ def _client(
     vpn_control: FakeGluetunControl | None = None,
     hardlinks: HardlinkMonitor | None = None,
     recyclarr: RecyclarrControl | None = None,
+    plex_server: PlexServer | None = None,
 ) -> TestClient:
     if engine is None:
         engine = FakeDockerEngine(DockerStatus(connected=True, version="27.3.1"))
@@ -200,6 +202,7 @@ def _client(
         vpn_control=vpn_control,
         hardlinks=hardlinks,
         recyclarr=recyclarr,
+        plex_server=plex_server,
     )
     return TestClient(app)
 
@@ -1142,7 +1145,16 @@ def test_panel_nonsense_and_edit_unknown_link_draw_it_closed(tmp_path: Path) -> 
 
 def test_install_pane_is_truthful(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
-    all_offered = ("prowlarr", "sonarr", "radarr", "qbittorrent", "recyclarr", "plex", "jellyfin")
+    all_offered = (
+        "prowlarr",
+        "sonarr",
+        "radarr",
+        "qbittorrent",
+        "recyclarr",
+        "plex",
+        "jellyfin",
+        "existing-plex",
+    )
     save_state(settings.config_dir, _install_state(all_offered))
     _write_snapshot(settings, _finale_snapshot(all_offered))
     save_login(settings.config_dir, "owner", "s3cret-password-1", honor_reset=None)
@@ -3200,3 +3212,132 @@ def test_a_fresh_saved_result_or_one_still_in_flight_starts_no_check(tmp_path: P
     client.get("/api/hub/status")
 
     assert monitor._task is None  # type: ignore[attr-defined]
+
+
+# --- The owner's own Plex: /identity health, never a Docker inspect ----------
+
+
+def _existing_plex_record(**overrides: object) -> ExistingPlex:
+    fields: dict[str, object] = {
+        "machine_id": "m1",
+        "name": "Den",
+        "base_url": "http://192.168.1.20:32400",
+        "port": 32400,
+        "on_this_nas": False,
+        "token": "tok-super-secret-999",
+        "folders": {"movies": "added", "tv": "added"},
+        "sections": {"movies": "5", "tv": "6"},
+        "replaces_link": None,
+    }
+    fields.update(overrides)
+    return ExistingPlex(**fields)  # type: ignore[arg-type]
+
+
+def test_your_plexs_light_comes_from_plex_not_docker(tmp_path: Path) -> None:
+    """FIRST TEST - a wrong (or absent) identity answer reads as Down with
+    no Docker wording, and the poster's own link never disappears.
+    """
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr", "existing-plex")))
+    _write_snapshot(settings, _finale_snapshot(("sonarr", "existing-plex")))
+    record = _existing_plex_record()
+    save_existing_plex(settings.config_dir, record)
+    engine = FakeDockerEngine(DockerStatus(connected=True, version="27.3.1"))
+    plex_server = FakePlexServer(identities_by_url={record.base_url: None})
+    client = _client(settings, engine, plex_server=plex_server)
+
+    page = client.get("/")
+    status = client.get("/api/hub/status")
+
+    assert page.status_code == 200
+    assert status.status_code == 200
+    tile = next(app for app in status.json()["apps"] if app["app_id"] == "existing-plex")
+    assert tile["state"] == "down"
+    assert tile["line"] == words.EXISTING_PLEX_LINE_DOWN
+    assert tile["url"] == "http://192.168.1.20:32400/web"
+    assert tile["managed"] is False
+    assert ("inspect", ("existing-plex",)) not in engine.calls
+    # Once per request (the page, then the poll) - never cached across them,
+    # the same way Docker's own `inspect` is asked fresh each time.
+    assert plex_server.identity_calls == [record.base_url, record.base_url]
+
+
+def test_a_connected_plex_renders_up_with_no_line_and_no_crash(tmp_path: Path) -> None:
+    """Restores the "up" case a fixture once dodged to sidestep a crash in
+    the generic tile's `require_port` guard - the owner's own Plex now has
+    its own branch, so an Up reading renders exactly as truthfully as any
+    other app's.
+    """
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr", "existing-plex")))
+    _write_snapshot(settings, _finale_snapshot(("sonarr", "existing-plex")))
+    record = _existing_plex_record()
+    save_existing_plex(settings.config_dir, record)
+    plex_server = FakePlexServer(identities_by_url={record.base_url: PlexIdentity(True, "m1")})
+    client = _client(settings, plex_server=plex_server)
+
+    page = client.get("/")
+    status = client.get("/api/hub/status")
+
+    assert page.status_code == 200
+    assert status.status_code == 200
+    tile = next(app for app in status.json()["apps"] if app["app_id"] == "existing-plex")
+    assert tile["state"] == "up"
+    assert tile["line"] == ""
+    assert tile["managed"] is False
+
+
+def test_the_status_json_never_carries_the_token(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr", "existing-plex")))
+    _write_snapshot(settings, _finale_snapshot(("sonarr", "existing-plex")))
+    token = "tok-super-secret-999"
+    record = _existing_plex_record(token=token)
+    save_existing_plex(settings.config_dir, record)
+    plex_server = FakePlexServer(identities_by_url={record.base_url: PlexIdentity(True, "m1")})
+    client = _client(settings, plex_server=plex_server)
+
+    page = client.get("/")
+    status = client.get("/api/hub/status")
+
+    assert token not in page.text
+    assert token not in status.text
+    assert "token" not in status.json()
+    for app in status.json()["apps"]:
+        assert "token" not in app
+
+
+def test_the_existing_plex_poster_carries_data_managed_false_and_others_true(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr", "existing-plex")))
+    _write_snapshot(settings, _finale_snapshot(("sonarr", "existing-plex")))
+    record = _existing_plex_record()
+    save_existing_plex(settings.config_dir, record)
+    plex_server = FakePlexServer(identities_by_url={record.base_url: PlexIdentity(True, "m1")})
+    client = _client(settings, plex_server=plex_server)
+
+    posters = _posters(client.get("/").text)
+
+    assert posters["existing-plex"]["data-managed"] == "false"
+    assert posters["sonarr"]["data-managed"] == "true"
+
+
+def test_only_the_existing_plex_poster_gets_a_manage_link(tmp_path: Path) -> None:
+    """The Manage pill opens the `plex` panel pane - a sibling of the
+    poster's own link, never nested inside it, and only for the one
+    unmanaged tile.
+    """
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr", "existing-plex")))
+    _write_snapshot(settings, _finale_snapshot(("sonarr", "existing-plex")))
+    record = _existing_plex_record()
+    save_existing_plex(settings.config_dir, record)
+    plex_server = FakePlexServer(identities_by_url={record.base_url: PlexIdentity(True, "m1")})
+    client = _client(settings, plex_server=plex_server)
+
+    page = client.get("/").text
+
+    assert page.count('data-panel-open="plex"') == 1
+    assert '<a class="hub-tile-link" href="/?panel=plex#hub-panel" data-panel-open="plex"' in page

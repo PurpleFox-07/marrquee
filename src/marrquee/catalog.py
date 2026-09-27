@@ -17,6 +17,9 @@ from dataclasses import dataclass
 from typing import Final, Literal
 
 from marrquee.words import (
+    EXCLUDED_BY_EXISTING_PLEX,
+    EXISTING_PLEX_DESCRIPTION,
+    EXISTING_PLEX_EXCLUDES_PLEX,
     JELLYFIN_DESCRIPTION,
     JELLYFIN_EXCLUDES_PLEX,
     PLEX_DESCRIPTION,
@@ -120,6 +123,16 @@ class CatalogApp:
     library opens onto (`plan_folders` plans them even when nothing else in
     the install has a `media_folders` entry of its own) - unlike
     `media_folders`, it never makes this app a Prowlarr sync partner.
+
+    `managed=False` (the owner's own existing Plex, connected but never
+    deployed) is what every reader of "is this app actually mine to run"
+    has to check before it does anything Docker-shaped: compose's service
+    loop, the per-app config folder `plan_folders` plans, the name-clash
+    check, and the deploy engine's bring-up and cancel each skip an
+    unmanaged app instead of trying to build, start or stop a container
+    that was never Marrquee's to make. It still gets an ordinary catalog
+    id, rules and a Hub poster - only the "Marrquee runs this" half is
+    switched off.
     """
 
     id: str
@@ -144,31 +157,38 @@ class CatalogApp:
     description_without_vpn: str = ""
     web_path: str = "/"
     library_folders: tuple[str, ...] = ()
+    managed: bool = True
 
 
 RECYCLARR_APP_ID: Final = "recyclarr"
 PLEX_APP_ID: Final = "plex"
 JELLYFIN_APP_ID: Final = "jellyfin"
+EXISTING_PLEX_APP_ID: Final = "existing-plex"
 
 # The id every media-server door registers under - read by `media_server_of`
-# and, later, Stories 9/10's connect/Seerr flows, so a media-server-shaped
-# app never has to be spelled out as a literal a second time.
-MEDIA_SERVER_APP_IDS: Final = ("plex", "jellyfin")
+# and Stories 9/10's connect/Seerr flows, so a media-server-shaped app never
+# has to be spelled out as a literal a second time.
+MEDIA_SERVER_APP_IDS: Final = ("plex", "jellyfin", "existing-plex")
 
 # Prowlarr, Sonarr, Radarr, Gluetun (the VPN tunnel), qBittorrent (the
 # downloader), Recyclarr (quality settings from the TRaSH guides), Plex
-# (a media server, linked to the owner's own Plex account) and Jellyfin (a
-# media server, signed in with the owner's own Marrquee login).
+# (a media server, linked to the owner's own Plex account), Jellyfin (a
+# media server, signed in with the owner's own Marrquee login) and the
+# owner's own existing Plex (a media server Marrquee connects to but never
+# deploys - `managed=False`).
 # Gluetun is `offered=False`: it never appears as its own "+" choice or
 # wizard tick - whatever needs it (qBittorrent, today) adds it as a
 # companion instead. qBittorrent's `network_via="gluetun"` is what enforces
 # "the downloader must never run outside the tunnel": it has no network or
 # API key of its own, and `build_stack_plan` refuses any install that has
-# it without Gluetun. Plex and Jellyfin both keep an ordinary, unused
-# Marrquee API key (like Recyclarr) - Plex authenticates only with the
-# owner's own Plex account token, and Jellyfin keeps its own admin API key
-# in its own settings file, never Marrquee's key. Each excludes the other
-# (`AppRule("excludes_any", ...)`): only one media server per install.
+# it without Gluetun. Plex, Jellyfin and the owner's existing Plex all keep
+# an ordinary, unused Marrquee API key (like Recyclarr) - Plex authenticates
+# only with the owner's own Plex account token, Jellyfin keeps its own admin
+# API key in its own settings file (never Marrquee's key), and the existing
+# Plex's key is never read at all. Each of the three excludes the other two
+# (`AppRule("excludes_any", ...)`): only one media server per install. The
+# existing Plex is also `offered=True` but `managed=False`: it is connected
+# from the Hub's "+" panel, never ticked on the wizard's own app grid.
 CATALOG: tuple[CatalogApp, ...] = (
     CatalogApp(
         id="prowlarr",
@@ -286,7 +306,14 @@ CATALOG: tuple[CatalogApp, ...] = (
         order=6,
         default_ticked=False,
         web_page=True,
-        rules=(AppRule(kind="excludes_any", app_ids=("jellyfin",), reason=PLEX_EXCLUDES_JELLYFIN),),
+        rules=(
+            AppRule(kind="excludes_any", app_ids=("jellyfin",), reason=PLEX_EXCLUDES_JELLYFIN),
+            AppRule(
+                kind="excludes_any",
+                app_ids=("existing-plex",),
+                reason=EXCLUDED_BY_EXISTING_PLEX,
+            ),
+        ),
         login_kind="none",
         kind="media_server",
         offered=True,
@@ -307,11 +334,43 @@ CATALOG: tuple[CatalogApp, ...] = (
         order=7,
         default_ticked=False,
         web_page=True,
-        rules=(AppRule(kind="excludes_any", app_ids=("plex",), reason=JELLYFIN_EXCLUDES_PLEX),),
+        rules=(
+            AppRule(kind="excludes_any", app_ids=("plex",), reason=JELLYFIN_EXCLUDES_PLEX),
+            AppRule(
+                kind="excludes_any",
+                app_ids=("existing-plex",),
+                reason=EXCLUDED_BY_EXISTING_PLEX,
+            ),
+        ),
         login_kind="jellyfin",
         kind="media_server",
         offered=True,
         library_folders=("movies", "tv"),
+    ),
+    CatalogApp(
+        id=EXISTING_PLEX_APP_ID,
+        name="Plex",
+        description=EXISTING_PLEX_DESCRIPTION,
+        image="",
+        port=None,
+        env_prefix="EXISTING_PLEX",
+        api_base="",
+        media_folders=(),
+        needs_data_mount=False,
+        glyph="PX",
+        order=8,
+        default_ticked=False,
+        web_page=True,
+        rules=(
+            AppRule(kind="excludes_any", app_ids=("plex",), reason=EXISTING_PLEX_EXCLUDES_PLEX),
+            AppRule(kind="excludes_any", app_ids=("jellyfin",), reason=PLEX_EXCLUDES_JELLYFIN),
+        ),
+        login_kind="none",
+        kind="media_server",
+        offered=True,
+        web_path="/web",
+        library_folders=("movies", "tv"),
+        managed=False,
     ),
 )
 

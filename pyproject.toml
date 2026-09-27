@@ -71,4 +71,5 @@ extend-immutable-calls = [
     "marrquee.vpn_control.NoGluetunControl",
     "marrquee.wiring.qbit_client.HttpQbitClient",
     "marrquee.plex.PlexPin",
+    "marrquee.plex.PlexServers",
 ]

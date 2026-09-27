@@ -9,22 +9,35 @@ readiness budget or a 30-second reassurance threshold costs nothing real.
 from __future__ import annotations
 
 import json
+import secrets
 from collections.abc import Mapping
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
 from marrquee import questions, words
+from marrquee.config import Settings
 from marrquee.jellyfin import FakeJellyfinServer, JellyfinResponse, save_jellyfin
-from marrquee.plex import FakePlexServer, PlexResponse, save_plex_sign_in
+from marrquee.plex import (
+    ExistingPlex,
+    FakePlexServer,
+    PlexIdentity,
+    PlexResponse,
+    browse_path,
+    load_existing_plex,
+    save_existing_plex,
+    save_plex_sign_in,
+)
 from marrquee.questions import save_step_answers
 from marrquee.state import STATE_VERSION, InstallState
+from marrquee.storage import container_media_path, host_media_path
 from marrquee.vpn_control import FakeGluetunControl
 from marrquee.wiring import WiringRunner, WiringStep
 from marrquee.wiring.arr_client import ArrFailure, ArrResponse, FakeArrClient, HttpArrClient
 from marrquee.wiring.engine import (
     AppSyncTask,
     DownloadClientTask,
+    ExistingPlexLibrariesTask,
     ExplainTask,
     JellyfinGraphicsTask,
     JellyfinLibrariesTask,
@@ -1277,5 +1290,232 @@ async def test_jellyfin_free_run_never_resolves_the_jellyfin_address_or_reads_je
     await engine.run(_install_state(("sonarr",)), steps.append)
 
     assert address_calls == []
+    assert load_calls == []
+    assert _frames_by_key(steps)["root-folder:sonarr"][-1].state == "done"
+
+
+# --- plan_wiring: the existing-Plex libraries task --------------------------
+
+
+def test_plan_wiring_appends_the_existing_plex_task_last_and_never_without_it() -> None:
+    state = _install_state(("prowlarr", "sonarr", "plex", "jellyfin", "existing-plex"))
+
+    keys = [task.key for task in plan_wiring(state)]
+
+    assert keys == [
+        "app-sync:sonarr",
+        "root-folder:sonarr",
+        "libraries:plex",
+        "direct-play:plex",
+        "libraries:jellyfin",
+        "libraries:existing-plex",
+    ]
+
+    without = [task.key for task in plan_wiring(_install_state(("prowlarr", "sonarr")))]
+    assert "libraries:existing-plex" not in without
+
+
+def test_existing_plex_task_about_equals_involved() -> None:
+    tasks = {task.key: task for task in plan_wiring(_install_state(("existing-plex",)))}
+
+    task = tasks["libraries:existing-plex"]
+    assert isinstance(task, ExistingPlexLibrariesTask)
+    assert task.involved == ("existing-plex",)
+    assert task.about == task.involved
+
+
+def test_existing_plex_task_line_matches_content_direction() -> None:
+    tasks = {task.key: task for task in plan_wiring(_install_state(("existing-plex",)))}
+
+    assert tasks["libraries:existing-plex"].line == words.wiring_line_libraries("Plex")
+
+
+# --- WiringEngine.run: resolving the owner's own Plex's saved record -------
+
+
+def _existing_plex_settings(tmp_path: Path) -> Settings:
+    (tmp_path / "volume1" / "media" / "data" / "media" / "movies").mkdir(parents=True)
+    (tmp_path / "volume1" / "media" / "data" / "media" / "tv").mkdir(parents=True)
+    return Settings(host_mount=tmp_path)
+
+
+_EXISTING_BASE_URL = "http://192.168.1.20:32400"
+
+
+def _existing_plex_record(**overrides: object) -> ExistingPlex:
+    fields: dict[str, object] = {
+        "machine_id": "m1",
+        "name": "Den",
+        "base_url": _EXISTING_BASE_URL,
+        "port": 32400,
+        "on_this_nas": False,
+        "token": "owner-plex-token",
+        "folders": {"movies": "unchecked", "tv": "unchecked"},
+        "sections": {},
+        "replaces_link": None,
+    }
+    fields.update(overrides)
+    return ExistingPlex(**fields)  # type: ignore[arg-type]
+
+
+def _existing_plex_no_libraries() -> PlexResponse:
+    return PlexResponse(
+        ok=True, status=200, payload={"MediaContainer": {"Directory": []}}, detail=None
+    )
+
+
+def _existing_plex_not_seen() -> PlexResponse:
+    return PlexResponse(ok=True, status=200, payload={"MediaContainer": {"Path": []}}, detail=None)
+
+
+async def test_missing_settings_reports_unreachable_for_existing_plex(tmp_path: Path) -> None:
+    save_existing_plex(tmp_path, _existing_plex_record())
+    engine = WiringEngine(
+        client=FakeArrClient({}),
+        plex=FakePlexServer(identities_by_url={_EXISTING_BASE_URL: PlexIdentity(True, "m1")}),
+        config_dir=tmp_path,
+        settings=None,
+    )
+    steps: list[WiringStep] = []
+
+    await engine.run(_install_state(("existing-plex",)), steps.append)
+
+    frames = _frames_by_key(steps)
+    last = frames["libraries:existing-plex"][-1]
+    assert last.state == "error"
+    assert last.note == words.wiring_failure_unreachable("Plex")
+    # Pins the precheck's OWN technical text - not merely the same note an
+    # uncaught exception's generic handler would also have produced.
+    assert last.technical == "libraries:existing-plex: no plex server or settings"
+
+
+async def test_missing_existing_plex_record_reports_it_lost(tmp_path: Path) -> None:
+    engine = WiringEngine(
+        client=FakeArrClient({}),
+        plex=FakePlexServer(identities_by_url={_EXISTING_BASE_URL: PlexIdentity(True, "m1")}),
+        config_dir=tmp_path,
+        settings=_existing_plex_settings(tmp_path),
+    )
+    steps: list[WiringStep] = []
+
+    await engine.run(_install_state(("existing-plex",)), steps.append)
+
+    frames = _frames_by_key(steps)
+    assert frames["libraries:existing-plex"][-1].state == "error"
+    assert frames["libraries:existing-plex"][-1].note == words.WIRING_EXISTING_PLEX_MISSING
+
+
+async def test_existing_plex_task_wires_both_libraries_from_the_saved_record(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = _existing_plex_settings(tmp_path)
+    save_existing_plex(tmp_path, _existing_plex_record())
+    monkeypatch.setattr(secrets, "token_hex", lambda n: "deadbeef")
+    marker_name = "marrquee-plex-check-deadbeef"
+    root = PurePosixPath(_ROOT)
+    host_movies = str(host_media_path(str(root), "movies"))
+    container_movies = str(container_media_path("movies"))
+    host_tv = str(host_media_path(str(root), "tv"))
+    container_tv = str(container_media_path("tv"))
+
+    def _seen(candidate: str) -> PlexResponse:
+        return PlexResponse(
+            ok=True,
+            status=200,
+            payload={
+                "MediaContainer": {
+                    "Path": [{"path": f"{candidate}/{marker_name}", "title": marker_name}]
+                }
+            },
+            detail=None,
+        )
+
+    server = FakePlexServer(
+        identities_by_url={_EXISTING_BASE_URL: PlexIdentity(True, "m1")},
+        script={
+            ("GET", "/library/sections"): [
+                _existing_plex_no_libraries(),
+                PlexResponse(
+                    ok=True,
+                    status=200,
+                    payload={
+                        "MediaContainer": {
+                            "Directory": [
+                                {
+                                    "key": "1",
+                                    "type": "movie",
+                                    "title": words.EXISTING_PLEX_LIBRARY_MOVIES,
+                                    "Location": [{"path": container_movies}],
+                                },
+                                {
+                                    "key": "2",
+                                    "type": "show",
+                                    "title": words.EXISTING_PLEX_LIBRARY_TV,
+                                    "Location": [{"path": container_tv}],
+                                },
+                            ]
+                        }
+                    },
+                    detail=None,
+                ),
+            ],
+            ("POST", "/library/sections"): [
+                PlexResponse(ok=True, status=200, payload=None, detail=None),
+                PlexResponse(ok=True, status=200, payload=None, detail=None),
+            ],
+            ("GET", browse_path(host_movies)): [_existing_plex_not_seen()],
+            ("GET", browse_path(container_movies)): [_seen(container_movies)],
+            ("GET", browse_path(host_tv)): [_existing_plex_not_seen()],
+            ("GET", browse_path(container_tv)): [_seen(container_tv)],
+        },
+    )
+    engine = WiringEngine(
+        client=FakeArrClient({}), plex=server, config_dir=tmp_path, settings=settings
+    )
+    steps: list[WiringStep] = []
+
+    await engine.run(_install_state(("existing-plex",)), steps.append)
+
+    frames = _frames_by_key(steps)
+    assert frames["libraries:existing-plex"][-1].state == "done"
+    assert frames["libraries:existing-plex"][-1].note == words.EXISTING_PLEX_NOTE_ADDED
+    record = load_existing_plex(tmp_path)
+    assert record is not None
+    assert record.folders == {"movies": "added", "tv": "added"}
+    assert record.sections == {"movies": "1", "tv": "2"}
+
+
+async def test_existing_plex_free_run_never_reads_the_record(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The cost of the existing-Plex feature must be zero for every install
+    that never connected one - `load_existing_plex` must never even be
+    CALLED, not merely "answer nothing".
+    """
+    import marrquee.wiring.engine as engine_module
+
+    load_calls: list[Path] = []
+
+    def _recording_load(config_dir: Path) -> ExistingPlex | None:
+        load_calls.append(config_dir)
+        return None
+
+    monkeypatch.setattr(engine_module, "load_existing_plex", _recording_load)
+
+    fake = FakeArrClient(
+        {
+            ("GET", "http://sonarr:8989", "api/v3/system/status"): [_ok(None)],
+            ("GET", "http://sonarr:8989", "api/v3/rootfolder"): [
+                _ok([{"id": 1, "path": "/data/media/tv"}])
+            ],
+        }
+    )
+    engine = WiringEngine(
+        client=fake, config_dir=tmp_path, settings=_existing_plex_settings(tmp_path)
+    )
+    steps: list[WiringStep] = []
+
+    await engine.run(_install_state(("sonarr",)), steps.append)
+
     assert load_calls == []
     assert _frames_by_key(steps)["root-folder:sonarr"][-1].state == "done"

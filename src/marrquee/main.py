@@ -165,6 +165,7 @@ def create_app(
                     plex_address=_host_address,
                     jellyfin=jellyfin,
                     jellyfin_address=_host_address,
+                    settings=settings,
                 )
             ),
             login=(

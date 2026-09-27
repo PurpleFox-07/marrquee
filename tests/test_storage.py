@@ -349,6 +349,32 @@ def test_plex_library_folders_are_planned_without_torrents() -> None:
         assert not str(relative).startswith("data/torrents")
 
 
+def test_plan_folders_skips_the_apps_config_folder_for_an_unmanaged_app() -> None:
+    """FIRST TEST - `existing-plex` is `managed=False`: Marrquee connects to
+    it but never deploys it, so it must never get a
+    `marrquee/apps/existing-plex` config folder of its own, even though its
+    `library_folders` still plan the shared `data/media/movies`/`tv` tree
+    the folder-visibility probe needs.
+    """
+    result = storage.plan_folders(("sonarr", "existing-plex"))
+
+    assert PurePosixPath("data/media/movies") in result
+    assert PurePosixPath("data/media/tv") in result
+    assert PurePosixPath("marrquee/apps/sonarr") in result
+    assert PurePosixPath("marrquee/apps/existing-plex") not in result
+
+    # A managed-only app set is byte-identical to before this app existed.
+    assert storage.plan_folders(("sonarr", "radarr")) == (
+        PurePosixPath("data/torrents/tv"),
+        PurePosixPath("data/torrents/movies"),
+        PurePosixPath("data/media/tv"),
+        PurePosixPath("data/media/movies"),
+        PurePosixPath("marrquee"),
+        PurePosixPath("marrquee/apps/sonarr"),
+        PurePosixPath("marrquee/apps/radarr"),
+    )
+
+
 def test_arr_only_folder_plan_is_unchanged_by_library_folders() -> None:
     """Pinned byte-for-byte: adding Plex's `library_folders` mechanism must
     never alter a plan with no media-server app in it.

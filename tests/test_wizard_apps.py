@@ -32,10 +32,12 @@ _WIZARD_CSS_PATH = (
     Path(__file__).resolve().parents[1] / "src" / "marrquee" / "static" / "css" / "wizard.css"
 )
 
-# Gluetun is a real catalog entry but `offered=False` - the wizard's own
-# grid never draws a checkbox for it, so every assertion about "one
-# checkbox per app" means one per *offered* app.
-_OFFERED = tuple(app for app in CATALOG if app.offered)
+# Gluetun is a real catalog entry but `offered=False`, and existing-plex is
+# `managed=False` - the wizard's own grid never draws a checkbox for either
+# (an unmanaged app is connected from the Hub, never ticked here), so every
+# assertion about "one checkbox per app" means one per *offered and managed*
+# app.
+_OFFERED = tuple(app for app in CATALOG if app.offered and app.managed)
 
 
 class _CheckboxCollector(HTMLParser):
@@ -181,6 +183,19 @@ def test_gluetun_never_gets_a_checkbox_of_its_own(tmp_path: Path) -> None:
 
     checkboxes = _checkbox_inputs(response.text)
     assert "gluetun" not in [box["value"] for box in checkboxes]
+
+
+def test_the_wizard_never_offers_the_existing_plex(tmp_path: Path) -> None:
+    """`existing-plex` is a Hub-only door: the owner connects it from the
+    "+" panel once an install already exists, never ticks it on this
+    screen.
+    """
+    client = _client(_settings(tmp_path))
+
+    response = client.get("/setup/apps")
+
+    checkboxes = _checkbox_inputs(response.text)
+    assert "existing-plex" not in [box["value"] for box in checkboxes]
 
 
 def test_a_saved_install_ticks_exactly_the_saved_apps(tmp_path: Path) -> None:

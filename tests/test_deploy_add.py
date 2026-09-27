@@ -47,9 +47,12 @@ from marrquee.jellyfin import FakeJellyfinServer, JellyfinResponse
 from marrquee.login import SavedLogin, load_login, save_login
 from marrquee.login_apply import FakeLoginApplier, LoginApplyResult
 from marrquee.plex import (
+    ExistingPlex,
     FakePlexServer,
     FakePlexTv,
+    load_existing_plex,
     load_plex_account,
+    save_existing_plex,
     save_plex_sign_in,
     write_plex_claim,
 )
@@ -573,6 +576,54 @@ async def test_adding_jellyfin_mints_an_ordinary_api_key(tmp_path: Path) -> None
     grown = load_state(settings.config_dir)
     assert grown is not None
     assert re.fullmatch(r"[0-9a-f]{32}", grown.api_keys.get("jellyfin", ""))
+
+
+async def test_cancel_of_a_failed_existing_plex_connect_touches_no_container(
+    tmp_path: Path,
+) -> None:
+    """The unmanaged cancel: `existing-plex` never had a container in the
+    first place, so `compose_ran` being False (per the plan refresh
+    amendment) already keeps the removal loop from ever reaching it - this
+    also proves the loop's own per-app `managed` gate, which is what still
+    protects a real, managed companion added alongside an unmanaged app in
+    the same run.
+    """
+    manager, engine, settings = await _deployed_to_finale(tmp_path, ("prowlarr", "sonarr"))
+    manager._plex_server = FakePlexServer(  # type: ignore[attr-defined]
+        identities_by_url={"http://192.168.1.20:32400": None}
+    )
+    save_existing_plex(
+        settings.config_dir,
+        ExistingPlex(
+            machine_id="m1",
+            name="Den",
+            base_url="http://192.168.1.20:32400",
+            port=32400,
+            on_this_nas=True,
+            token="tok-secret-1",
+            folders={"movies": "unchecked", "tv": "unchecked"},
+            sections={},
+            replaces_link=None,
+        ),
+    )
+
+    calls_before = len(engine.calls)
+    manager.add_app("existing-plex")
+    failed = await _finish_add(manager)
+    assert failed.adding is not None and failed.adding.state == "error"
+    assert failed.adding.failure is not None
+    assert failed.adding.failure.code == "existing_plex_unreachable"
+    assert failed.adding.compose_ran is False
+
+    ok = await manager.cancel_add()
+    assert ok is True
+    calls_during_cancel = engine.calls[calls_before:]
+    assert not any(call[0] == "remove_container" for call in calls_during_cancel)
+
+    after_cancel = load_state(settings.config_dir)
+    assert after_cancel is not None
+    assert after_cancel.app_ids == ("prowlarr", "sonarr")
+    assert load_existing_plex(settings.config_dir) is None
 
 
 async def test_cancel_of_a_failed_add_rewrites_compose_still_holding_gluetun(

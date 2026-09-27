@@ -18,8 +18,16 @@ from marrquee.docker_client import (
     DockerStatus,
     FakeDockerEngine,
 )
-from marrquee.health import AppHealth, HubState, LinkHealth, read_health, read_link_health
+from marrquee.health import (
+    AppHealth,
+    HubState,
+    LinkHealth,
+    read_existing_plex_health,
+    read_health,
+    read_link_health,
+)
 from marrquee.links import LinkCard
+from marrquee.plex import ExistingPlex, FakePlexServer, PlexIdentity
 
 _STATUS = DockerStatus(connected=True, version="27.3.1")
 
@@ -195,6 +203,69 @@ async def test_read_health_only_ever_calls_inspect():
     await read_health(engine, ["sonarr"])
 
     assert engine.calls == [("inspect", ("sonarr",))]
+
+
+# --- read_existing_plex_health: the owner's own Plex, /identity not Docker --
+
+
+def _record(*, machine_id: str = "m1") -> ExistingPlex:
+    return ExistingPlex(
+        machine_id=machine_id,
+        name="Den",
+        base_url="http://192.168.1.20:32400",
+        port=32400,
+        on_this_nas=False,
+        token="tok-secret",
+        folders={"movies": "unchecked", "tv": "unchecked"},
+        sections={},
+        replaces_link=None,
+    )
+
+
+async def test_read_existing_plex_health_with_no_record_is_down_and_never_calls_plex():
+    """FIRST TEST: nothing saved means nothing to ask - `identity_calls` stays
+    empty, the same "ask nothing you don't need to" contract `read_health`
+    itself makes for a missing container.
+    """
+    identities = {"http://192.168.1.20:32400": PlexIdentity(True, "m1")}
+    server = FakePlexServer(identities_by_url=identities)
+
+    reading = await read_existing_plex_health(server, None)
+
+    assert reading == AppHealth(app_id="existing-plex", state="down", exists=True, finished_at=None)
+    assert server.identity_calls == []
+
+
+async def test_read_existing_plex_health_is_up_when_the_machine_id_matches():
+    record = _record(machine_id="m1")
+    server = FakePlexServer(identities_by_url={record.base_url: PlexIdentity(True, "m1")})
+
+    reading = await read_existing_plex_health(server, record)
+
+    assert reading.state == "up"
+    assert reading.app_id == "existing-plex"
+    assert server.identity_calls == [record.base_url]
+
+
+async def test_read_existing_plex_health_is_down_when_identity_gives_no_answer():
+    record = _record()
+    server = FakePlexServer(identities_by_url={record.base_url: None})
+
+    reading = await read_existing_plex_health(server, record)
+
+    assert reading.state == "down"
+
+
+async def test_a_wrong_machine_id_reads_as_down():
+    """A different Plex answering at the saved address (a recycled IP, say)
+    must never read as this Plex being up.
+    """
+    record = _record(machine_id="m1")
+    server = FakePlexServer(identities_by_url={record.base_url: PlexIdentity(True, "zzz")})
+
+    reading = await read_existing_plex_health(server, record)
+
+    assert reading.state == "down"
 
 
 # --- Link health: HttpLinkProbe, FakeLinkProbe and read_link_health ----------

@@ -188,6 +188,17 @@ def test_the_vpn_down_poster_is_never_dimmed() -> None:
     assert "filter: none" in body
 
 
+def test_the_existing_plex_down_poster_is_never_dimmed() -> None:
+    """The owner's own Plex keeps a working link even while Down - like the
+    VPN's own Down rule beside it, its art must never dim the way an
+    ordinary Down poster's does.
+    """
+    selector = '.hub-poster[data-managed="false"][data-state="down"]::before'
+    body = _block_for(_HUB_CSS.read_text(), selector)
+
+    assert "filter: none" in body
+
+
 def test_the_paused_dot_is_warning_not_error() -> None:
     css = _HUB_CSS.read_text()
 
@@ -263,3 +274,53 @@ def test_the_drive_note_is_hidden_by_the_root_attribute_not_by_removing_it() -> 
 
     shown_body = _block_for(css, '[data-drive-note="true"] [data-role="drive-note"]')
     assert "display: inline-flex;" in shown_body
+
+
+def test_the_plex_servers_and_plex_panes_are_shown_by_their_own_panel_mode() -> None:
+    css = _HUB_CSS.read_text()
+
+    assert (
+        '.hub-panel[data-panel-mode="plex-servers"] [data-panel-pane="plex-servers"],\n'
+        '.hub-panel[data-panel-mode="plex"] [data-panel-pane="plex"] {' in css
+    )
+
+
+def test_the_plex_server_list_is_a_grid_of_surface_cards() -> None:
+    css = _HUB_CSS.read_text()
+
+    list_body = _block_for(css, ".plex-server-list")
+    assert "display: grid;" in list_body
+    assert "gap: var(--space-3);" in list_body
+
+    card_body = _block_for(css, ".plex-server")
+    assert "background: var(--surface);" in card_body
+    assert "border: 1px solid var(--border);" in card_body
+    assert "border-radius: var(--radius-lg);" in card_body
+    assert "padding: var(--space-4);" in card_body
+
+    name_body = _block_for(css, ".plex-server__name")
+    assert "font-size: var(--text-base);" in name_body
+    assert "font-weight: var(--weight-bold);" in name_body
+    assert "color: var(--text-primary);" in name_body
+
+    hint_body = _block_for(css, ".plex-server__hint")
+    assert "font-size: var(--text-sm);" in hint_body
+    assert "color: var(--text-secondary);" in hint_body
+
+
+def test_the_replace_link_checkbox_uses_the_spotlight_accent() -> None:
+    css = _HUB_CSS.read_text()
+
+    label_body = _block_for(css, ".plex-server label")
+    assert "font-size: var(--text-sm);" in label_body
+    assert "color: var(--text-primary);" in label_body
+
+    checkbox_body = _block_for(css, '.plex-server input[type="checkbox"]')
+    assert "accent-color: var(--spotlight);" in checkbox_body
+
+
+def test_disconnect_is_a_ghost_button_tinted_toward_error() -> None:
+    body = _block_for(_HUB_CSS.read_text(), '[data-role="disconnect-form"] .btn-ghost')
+
+    assert "color: var(--error);" in body
+    assert "border-color: var(--error);" in body

@@ -228,6 +228,7 @@ class HubTileOut(BaseModel):
     can_change_seeding: bool
     can_change_vpn: bool
     sync_state: SyncState | None
+    managed: bool
 
 
 class LinkTileOut(BaseModel):
@@ -339,6 +340,7 @@ def _hub_tile_out(tile: HubTile) -> HubTileOut:
         can_change_seeding=tile.can_change_seeding,
         can_change_vpn=tile.can_change_vpn,
         sync_state=tile.sync_state,
+        managed=tile.managed,
     )
 
 
@@ -390,7 +392,7 @@ async def get_catalog() -> CatalogResponse:
         apps=[
             CatalogAppOut(id=app.id, name=app.name, description=app.description, port=app.port)
             for app in CATALOG
-            if app.offered
+            if app.offered and app.managed
         ]
     )
 
@@ -580,6 +582,15 @@ async def post_hub_install(
     try:
         app = get_app(app_id)
     except KeyError:
+        response.status_code = 409
+        return HubInstallOut(
+            ok=False, message=HUB_INSTALL_UNKNOWN, step_id=None, step_app_id=None, field=None
+        )
+
+    if not app.managed:
+        # The owner's own Plex is a Hub-only door, connected through
+        # `POST /plex/connect` - never through here, so this refuses before
+        # any answer is even looked at, the same as an unrecognised id.
         response.status_code = 409
         return HubInstallOut(
             ok=False, message=HUB_INSTALL_UNKNOWN, step_id=None, step_app_id=None, field=None
