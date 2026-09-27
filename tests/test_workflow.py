@@ -2342,15 +2342,16 @@ def test_stack_smoke_plex_host_step_checks_the_logs_with_a_tool_check_and_whitel
     assert 'grep -qF "$phrase"' in run
 
     case_block = _text_between(run, 'case "$found" in', "esac")
-    arms = _shell_case_arms(case_block)
-    assert arms == {
-        "0": "",
-        "1": 'echo "::error::Plex\'s own log never said: ${phrase}"; exit 1',
-        "*": (
-            "echo \"::error::couldn't check Plex's own logs for its claim code "
-            '(grep exit ${found})"; exit 1'
-        ),
-    }
+    # Arm "1" (never said it, even after polling) spans several lines - it
+    # reports Plex's last log lines through an escaped ::error:: - so the
+    # three arms are pinned by their text rather than a one-line parse.
+    assert "0) ;;" in case_block
+    assert "1)\n" in case_block
+    assert "Plex's own log never said: ${phrase}" in case_block
+    assert (
+        "*) echo \"::error::couldn't check Plex's own logs for its claim code "
+        '(grep exit ${found})"; exit 1 ;;' in case_block
+    )
 
 
 def test_stack_smoke_plex_host_step_polls_web_index_bounded_and_pins_the_verdict() -> None:
@@ -3771,3 +3772,17 @@ def test_qbittorrent_login_check_judges_the_status_code_not_the_old_body() -> No
     assert "bad.status_code != 401" in run
     # The wrong password must not ride the right one's session cookie.
     assert run.count("async with httpx.AsyncClient(") == 2
+
+
+def test_plex_claim_log_check_waits_for_init_plex_claim_to_finish() -> None:
+    """`init-plex-claim` answers `/identity` as unclaimed during its own
+    temporary start, before it has even tried the code - so the "Unable to
+    claim" line must be polled for, never read once (the first real CI run
+    read it too early). A miss reports Plex's last log lines, claim redacted."""
+    run = _step_named(_stack_smoke_job(), "plex runs on the host network")["run"]
+    log_check = run[run.index('for phrase in "PLEX_CLAIM set from') :]
+
+    assert "for _ in $(seq 1 36)" in log_check
+    assert "sleep 5" in log_check
+    assert "Last lines:" in log_check
+    assert "claim-[redacted]" in log_check

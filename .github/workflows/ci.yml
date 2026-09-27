@@ -2360,15 +2360,32 @@ jobs:
             echo "::error::grep is not available inside marrquee-stack-smoke to check Plex's own logs"
             exit 1
           fi
-          plex_logs=$(docker logs plex 2>&1 || true)
+          # `init-plex-claim` briefly starts Plex BEFORE it tries the code, so
+          # the unclaimed `/identity` above can answer long before the
+          # "Unable to claim" line is written (it waits for Plex's database,
+          # stops Plex, then asks plex.tv). Poll the log for up to 3 minutes -
+          # the same "one unclaimed reply proves nothing" rule
+          # `deploy.py`'s own Plex wait follows.
           for phrase in "PLEX_CLAIM set from FILE__PLEX_CLAIM" "Unable to claim Plex server"; do
-            set +e
-            echo "$plex_logs" | grep -qF "$phrase"
-            found=$?
-            set -e
+            found=1
+            for _ in $(seq 1 36); do
+              plex_logs=$(docker logs plex 2>&1 || true)
+              set +e
+              echo "$plex_logs" | grep -qF "$phrase"
+              found=$?
+              set -e
+              if [ "$found" -ne 1 ]; then
+                break
+              fi
+              sleep 5
+            done
             case "$found" in
               0) ;;
-              1) echo "::error::Plex's own log never said: ${phrase}"; exit 1 ;;
+              1)
+                MESSAGE="Plex's own log never said: ${phrase} (within 3 minutes). Last lines: $(echo "$plex_logs" | tail -n 12 | sed 's/claim-[A-Za-z0-9_-]*/claim-[redacted]/g')" \
+                  python3 -c "import os; text = os.environ['MESSAGE'][:1500].replace('%', '%25').replace(chr(13), '%0D').replace(chr(10), '%0A').replace('::', ': :'); print('::error::' + text)"
+                exit 1
+                ;;
               *) echo "::error::couldn't check Plex's own logs for its claim code (grep exit ${found})"; exit 1 ;;
             esac
           done
