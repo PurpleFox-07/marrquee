@@ -1247,20 +1247,32 @@ jobs:
               if not result.ok:
                   raise SystemExit(f"HttpLoginApplier did not apply the login: {result.technical}")
 
+              # qBittorrent 5.x answers a login by status alone: 200 with an
+              # empty body when it takes, 401 when it doesn't
+              # (`authcontroller.cpp` loginAction). The old plain-text bodies
+              # are gone, so the body is never what's judged here. The wrong
+              # password gets its own fresh client: loginAction answers 200
+              # to any request that already carries a session cookie, so
+              # reusing the first client would let any password "log in".
               async with httpx.AsyncClient(timeout=10.0) as client:
                   good = await client.post(
                       "http://gluetun:8080/api/v2/auth/login",
                       data={"username": "marrquee-ci", "password": password},
                   )
-                  if good.text != "Ok.":
-                      raise SystemExit("the right password did not log in")
+                  if good.status_code != 200:
+                      raise SystemExit(
+                          f"the right password did not log in (status {good.status_code})"
+                      )
 
+              async with httpx.AsyncClient(timeout=10.0) as client:
                   bad = await client.post(
                       "http://gluetun:8080/api/v2/auth/login",
                       data={"username": "marrquee-ci", "password": "definitely-the-wrong-password"},
                   )
-                  if bad.text == "Ok.":
-                      raise SystemExit("a wrong password still logged in")
+                  if bad.status_code != 401:
+                      raise SystemExit(
+                          f"a wrong password was not refused (expected 401, got {bad.status_code})"
+                      )
 
 
           asyncio.run(main())

@@ -1386,7 +1386,7 @@ def test_stack_smoke_qbittorrent_takes_the_one_login() -> None:
     assert "SavedLogin" in run
     assert "MARRQUEE_CI_PASSWORD" in run
     assert "gluetun:8080/api/v2/auth/login" in run
-    assert '"Ok."' in run
+    assert "status_code != 200" in run
     assert "::error::" in run
 
 
@@ -3757,3 +3757,17 @@ def test_no_step_captures_an_exit_code_that_bash_e_would_never_reach() -> None:
                 elif re.fullmatch(r"\w+=\$\?", stripped) and not errexit_off:
                     offenders.append(f"{job_name} / {step.get('name')}: {stripped}")
     assert offenders == []
+
+
+def test_qbittorrent_login_check_judges_the_status_code_not_the_old_body() -> None:
+    """qBittorrent 5.x answers `auth/login` with 200 and an EMPTY body on
+    success and 401 on a wrong password - the old "Ok."/"Fails." bodies are
+    gone. The first real CI run failed a login that had worked because the
+    check compared the body to "Ok."."""
+    run = _step_named(_stack_smoke_job(), "qbittorrent takes the one login")["run"]
+
+    assert '"Ok."' not in run
+    assert "good.status_code != 200" in run
+    assert "bad.status_code != 401" in run
+    # The wrong password must not ride the right one's session cookie.
+    assert run.count("async with httpx.AsyncClient(") == 2
