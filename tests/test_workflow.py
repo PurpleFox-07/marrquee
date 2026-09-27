@@ -12,7 +12,9 @@ exercises the port and mount the rest of the project agreed on.
 from __future__ import annotations
 
 import ast
+import os
 import re
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -3636,3 +3638,122 @@ def test_stack_smoke_dump_diagnostics_step_gained_seerr_logs() -> None:
 
     assert "docker logs seerr" in dump_run
     assert re.search(r"docker rm -f[^\n]*\bseerr\b", cleanup_run)
+
+
+# ---------------------------------------------------------------------------
+# Shell semantics, not just text: GitHub runs a step with no `shell:` as
+# `bash -e {0}`, so a command that is EXPECTED to fail (a blocked tunnel, a
+# keyed control server answering 401) aborts the step before a following
+# `x_exit=$?` line can ever capture it. The first real CI run of the VPN
+# checks died exactly that way, silently. These tests run the two
+# kill-switch steps under that same shell with a stub `docker` on PATH.
+# ---------------------------------------------------------------------------
+
+_STUB_DOCKER = r"""#!/bin/sh
+# A stand-in `docker` for the kill-switch steps. KS_LEAK=1 lets traffic
+# out; KS_TOOL picks which probe tool the qBittorrent image "ships".
+args="$*"
+case "$args" in
+  *"command -v curl"*) [ "$KS_TOOL" = curl ]; exit $? ;;
+  *"command -v wget"*) [ "$KS_TOOL" = wget ]; exit $? ;;
+esac
+case "$args" in
+  *"curl"*"127.0.0.1:8000"*) printf 401; exit 0 ;;
+  *"wget"*"127.0.0.1:8000"*) echo "  HTTP/1.1 401 Unauthorized" >&2; exit 1 ;;
+  *"container:gluetun"*"1.1.1.1"*|*"exec qbittorrent"*"1.1.1.1"*)
+    if [ "$KS_LEAK" = 1 ]; then exit 0; fi
+    case "$args" in
+      *curl*) exit 28 ;;
+      *) echo "wget: can't connect to remote host (1.1.1.1): Connection refused" >&2; exit 1 ;;
+    esac ;;
+  *"1.1.1.1"*) exit 0 ;;
+esac
+echo "unexpected docker call: $args" >&2
+exit 99
+"""
+
+
+def _run_step_like_github(
+    run: str, tmp_path: Path, *, leak: bool, tool: str = "wget"
+) -> subprocess.CompletedProcess[str]:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    docker = bin_dir / "docker"
+    docker.write_text(_STUB_DOCKER)
+    docker.chmod(0o755)
+    script = tmp_path / "step.sh"
+    script.write_text(run)
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+        "RUNNER_TEMP": str(tmp_path),
+        "KS_LEAK": "1" if leak else "0",
+        "KS_TOOL": tool,
+    }
+    return subprocess.run(
+        ["bash", "--noprofile", "--norc", "-e", str(script)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+
+def test_gluetun_kill_switch_step_passes_under_bash_e_when_the_tunnel_blocks(
+    tmp_path: Path,
+) -> None:
+    run = _step_named(_stack_smoke_job(), "nothing gets out without the tunnel")["run"]
+    result = _run_step_like_github(run, tmp_path, leak=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_gluetun_kill_switch_step_fails_loudly_under_bash_e_when_traffic_leaks(
+    tmp_path: Path,
+) -> None:
+    run = _step_named(_stack_smoke_job(), "nothing gets out without the tunnel")["run"]
+    result = _run_step_like_github(run, tmp_path, leak=True)
+    assert result.returncode != 0
+    assert "::error::Traffic left through the kill switch" in result.stdout
+
+
+def test_qbittorrent_kill_switch_step_passes_under_bash_e_when_the_tunnel_blocks(
+    tmp_path: Path,
+) -> None:
+    run = _step_named(_stack_smoke_job(), "the downloader can't reach the internet")["run"]
+    for tool in ("curl", "wget"):
+        result = _run_step_like_github(run, tmp_path, leak=False, tool=tool)
+        assert result.returncode == 0, f"{tool}: {result.stdout}{result.stderr}"
+        assert "kill switch held" in result.stdout
+
+
+def test_qbittorrent_kill_switch_step_fails_loudly_under_bash_e_when_traffic_leaks(
+    tmp_path: Path,
+) -> None:
+    run = _step_named(_stack_smoke_job(), "the downloader can't reach the internet")["run"]
+    for tool in ("curl", "wget"):
+        result = _run_step_like_github(run, tmp_path, leak=True, tool=tool)
+        assert result.returncode != 0, tool
+        assert "::error::qBittorrent reached the internet outside the VPN" in result.stdout
+
+
+def test_no_step_captures_an_exit_code_that_bash_e_would_never_reach() -> None:
+    """A bare `x=$?` line only runs if the command before it succeeded, under
+    GitHub's default `bash -e` - so it must sit inside a `set +e` region.
+    The errexit-safe form is `cmd || x=$?` on the command's own line."""
+    offenders = []
+    for job_name, job in _jobs().items():
+        for step in _steps(job):
+            run = step.get("run")
+            if not isinstance(run, str):
+                continue
+            errexit_off = False
+            for line in run.splitlines():
+                stripped = line.strip()
+                if stripped == "set +e":
+                    errexit_off = True
+                elif stripped.startswith("set -e"):
+                    errexit_off = False
+                elif re.fullmatch(r"\w+=\$\?", stripped) and not errexit_off:
+                    offenders.append(f"{job_name} / {step.get('name')}: {stripped}")
+    assert offenders == []

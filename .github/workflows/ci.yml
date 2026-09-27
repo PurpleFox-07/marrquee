@@ -979,10 +979,14 @@ jobs:
           # trusted to mean the kill switch. `docker run` itself failing to
           # join that namespace is Docker's own 125+ exit convention,
           # judged separately from busybox wget's own exit codes below.
+          # `|| control_exit=$?` rather than a separate `control_exit=$?`
+          # line: GitHub runs this step as `bash -e`, which would end the
+          # step on the expected nonzero exit (the control server answers
+          # 401 without Marrquee's key) before a separate line could run.
+          control_exit=0
           docker run --rm --network container:gluetun alpine:3.20 \
             wget -q -T 5 -S -O /dev/null http://127.0.0.1:8000/v1/vpn/status \
-            > "$RUNNER_TEMP/kill_switch_positive_control.log" 2>&1
-          control_exit=$?
+            > "$RUNNER_TEMP/kill_switch_positive_control.log" 2>&1 || control_exit=$?
           if [ "$control_exit" -ge 125 ]; then
             echo "::error::the kill-switch check could not run (docker exit ${control_exit})"
             cat "$RUNNER_TEMP/kill_switch_positive_control.log"
@@ -998,8 +1002,8 @@ jobs:
           # truthiness, so `docker run` itself failing (can't join the
           # namespace) can never read the same as "blocked by the
           # firewall" - the bug this whole block hardens against.
-          docker run --rm --network container:gluetun alpine:3.20 wget -q -T 5 -O /dev/null http://1.1.1.1
-          real_exit=$?
+          real_exit=0
+          docker run --rm --network container:gluetun alpine:3.20 wget -q -T 5 -O /dev/null http://1.1.1.1 || real_exit=$?
           if [ "$real_exit" -ge 125 ]; then
             echo "::error::the kill-switch check could not run (docker exit ${real_exit})"
             exit 1
@@ -1391,7 +1395,7 @@ jobs:
           echo "kill-switch probe tool: $tool"
 
           if [ "$tool" = "curl" ]; then
-            control_code=$(docker exec qbittorrent curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/v1/vpn/status)
+            control_code=$(docker exec qbittorrent curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/v1/vpn/status || true)
             echo "positive control status: $control_code"
             if [ -z "$control_code" ] || [ "$control_code" = "000" ]; then
               echo "::error::the kill-switch check's positive control got no HTTP response through qBittorrent's shared network namespace - the probe tool or the namespace itself is broken, not the VPN"
@@ -1408,16 +1412,18 @@ jobs:
           fi
 
           if [ "$tool" = "curl" ]; then
-            docker exec qbittorrent curl -s -m 5 -o /dev/null http://1.1.1.1
-            real_exit=$?
+            # `|| real_exit=$?`: this step runs as `bash -e`, and a blocked
+            # tunnel is an expected nonzero exit.
+            real_exit=0
+            docker exec qbittorrent curl -s -m 5 -o /dev/null http://1.1.1.1 || real_exit=$?
             case "$real_exit" in
               7|28) echo "kill switch held (curl exit ${real_exit})" ;;
               0) echo "::error::qBittorrent reached the internet outside the VPN"; exit 1 ;;
               *) echo "::error::the kill-switch check failed for an unrelated reason (curl exit ${real_exit})"; exit 1 ;;
             esac
           else
-            docker exec qbittorrent wget -q -T 5 -O /dev/null http://1.1.1.1 2>"$RUNNER_TEMP/qbit_kill_switch_real.log"
-            real_exit=$?
+            real_exit=0
+            docker exec qbittorrent wget -q -T 5 -O /dev/null http://1.1.1.1 2>"$RUNNER_TEMP/qbit_kill_switch_real.log" || real_exit=$?
             if [ "$real_exit" -eq 0 ]; then
               echo "::error::qBittorrent reached the internet outside the VPN"
               exit 1
