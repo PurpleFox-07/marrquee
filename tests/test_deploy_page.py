@@ -37,6 +37,7 @@ from marrquee.docker_client import ComposeResult, DockerStatus, FakeDockerEngine
 from marrquee.login import load_login, save_login
 from marrquee.main import create_app
 from marrquee.questions import QuestionCheck, QuestionStep
+from marrquee.seen_host import load_seen_host
 from marrquee.state import STATE_VERSION, InstallState, save_state, write_json_atomic
 from marrquee.wiring import WiringStep
 from marrquee.words import (
@@ -191,6 +192,17 @@ def test_the_ready_page_names_every_chosen_app_and_every_folder_that_will_be_bui
     assert "/volume1/media/data/torrents" in response.text
     assert "/volume1/media/data/media/tv" in response.text
     assert "/volume1/media/data/media/movies" in response.text
+
+
+def test_get_deploy_remembers_the_browsers_host(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    client = _client(settings)
+
+    response = client.get("/deploy", headers={"host": "nas.local:7788"})
+
+    assert response.status_code == 200
+    assert load_seen_host(settings.config_dir) == "nas.local"
 
 
 def test_the_ready_page_shows_the_step_pills_and_a_back_link_the_running_page_shows_neither(

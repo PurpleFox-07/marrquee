@@ -2203,6 +2203,100 @@ _EXISTING_PLEX_WORDS: tuple[str, ...] = (
 # end Your own Plex section
 # =============================================================================
 
+# =============================================================================
+# Seerr - asking for movies and shows. The same Alignment rule as Plex's,
+# Jellyfin's and Your own Plex's sections: Plex and Jellyfin are never called
+# a "media server".
+# =============================================================================
+
+SEERR_DESCRIPTION = (
+    "Lets you - and the people you share Plex or Jellyfin with - ask for movies and shows. "
+    "Your requests start straight away; theirs wait for you to approve them."
+)
+SEERR_NEEDS_PLEX_OR_JELLYFIN = "needs Plex or Jellyfin first"
+SEERR_NEEDS_ARR = "needs Sonarr or Radarr first"
+SEERR_COMPOSE_COMMENT = (
+    "Marrquee finished Seerr's first-time setup and connected it to Sonarr, Radarr and your "
+    "Plex or Jellyfin. You sign in to Seerr with Plex or Jellyfin - it has no separate password."
+)
+SEERR_CONFIG_MOUNT_COMMENT = (
+    "Seerr's settings and your requests. Seerr runs as its own user, number 1000, so Marrquee "
+    "gives this folder to that user."
+)
+FAILURE_SEERR_NOT_OURS = (
+    "Seerr is already set up for a different Plex or Jellyfin - its settings folder, "
+    "marrquee/apps/seerr on your drive, is left over from an earlier Seerr. Rename that "
+    "folder in your NAS's file manager, then press Try again."
+)
+FAILURE_SEERR_SETUP_REFUSED = (
+    "Seerr started, but refused Marrquee's first-time setup. Press Try again - if it "
+    "happens again, the details are on the Diagnostics page."
+)
+
+
+def wiring_line_seerr(name: str) -> str:
+    return f"Connecting Seerr to {name}"
+
+
+def seerr_note_libraries(name: str) -> str:
+    return f"Seerr now sees what's in your {name}, so it shows what you already have."
+
+
+def seerr_note_no_libraries(name: str) -> str:
+    return (
+        f"{name} has no Movies or TV Shows library yet, so Seerr can't tell what you already have."
+    )
+
+
+def seerr_note_profile(arr: str, profile: str) -> str:
+    return f'New requests go to {arr} with the "{profile}" quality profile.'
+
+
+def seerr_failure_cant_reach(name: str) -> str:
+    return (
+        f"Seerr couldn't reach {name} to finish connecting. Your apps are running fine - "
+        f"check that {name} is running, then try again."
+    )
+
+
+def seerr_failure_no_folder(name: str) -> str:
+    return (
+        f"{name} doesn't have its library folder yet, so Seerr can't send it requests. "
+        f"Connect {name} again first, then Seerr."
+    )
+
+
+def seerr_failure_no_profiles(name: str) -> str:
+    return f"{name} has no quality profiles, so Seerr can't send it requests."
+
+
+SEERR_FAILURE_WRONG_PLEX = (
+    "Seerr reached a different Plex than the one you connected. Press Connect again."
+)
+
+
+_SEERR_WORDS: tuple[str, ...] = (
+    "SEERR_DESCRIPTION",
+    "SEERR_NEEDS_PLEX_OR_JELLYFIN",
+    "SEERR_NEEDS_ARR",
+    "SEERR_COMPOSE_COMMENT",
+    "SEERR_CONFIG_MOUNT_COMMENT",
+    "FAILURE_SEERR_NOT_OURS",
+    "FAILURE_SEERR_SETUP_REFUSED",
+    "wiring_line_seerr",
+    "seerr_note_libraries",
+    "seerr_note_no_libraries",
+    "seerr_note_profile",
+    "seerr_failure_cant_reach",
+    "seerr_failure_no_folder",
+    "seerr_failure_no_profiles",
+    "SEERR_FAILURE_WRONG_PLEX",
+)
+
+# =============================================================================
+# end Seerr section
+# =============================================================================
+
 # The full review surface: every public name above, in one tuple. A later
 # feature area adds its own fenced section above this line, then extends
 # this tuple with its own `_..._WORDS` name - never editing an earlier
@@ -2224,4 +2318,5 @@ WORDS_INVENTORY: tuple[str, ...] = (
     *_PLEX_WORDS,
     *_JELLYFIN_WORDS,
     *_EXISTING_PLEX_WORDS,
+    *_SEERR_WORDS,
 )

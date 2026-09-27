@@ -50,6 +50,8 @@ from marrquee.words import (
     PLEX_COMPOSE_COMMENT,
     PLEX_SECRETS_MOUNT_COMMENT,
     RECYCLARR_COMPOSE_COMMENT,
+    SEERR_COMPOSE_COMMENT,
+    SEERR_CONFIG_MOUNT_COMMENT,
     VPN_SECRETS_MOUNT_COMMENT,
 )
 
@@ -86,6 +88,9 @@ _MEDIA_LIBRARY_MOUNT_SUFFIX = ":/data/media:ro"
 # does - this longer, host-path-anchored tail is what tells the two apart,
 # and it must be checked before `_VPN_SECRETS_MOUNT_SUFFIX` below.
 _PLEX_SECRETS_MOUNT_TAIL = "/marrquee/plex:/run/secrets:ro"
+# Seerr's own image reads its config from /app/config, not /config - kept
+# distinct so its comment is never mistaken for an arr app's plain mount.
+_SEERR_CONFIG_MOUNT_SUFFIX = ":/app/config"
 _COMMENT_WIDTH = 78
 
 
@@ -104,7 +109,10 @@ class ServicePlan:
     (Recyclarr's branch), makes `_render_service` write a `user:` line right
     after `container_name:` - the one app that must run as the drive owner
     instead of the image's own default user, because its image ignores
-    PUID/PGID entirely.
+    PUID/PGID entirely. `init`, when true (Seerr's branch), makes
+    `_render_service` write an `init: true` line right after `restart:` -
+    Seerr's image provides no init process of its own and needs the
+    container runtime's, or an orphaned first process never reaps zombies.
     """
 
     app_id: str
@@ -119,6 +127,7 @@ class ServicePlan:
     devices: tuple[str, ...] = ()
     network_mode: str | None = None
     user: str | None = None
+    init: bool = False
 
 
 @dataclass(frozen=True)
@@ -225,6 +234,9 @@ def _service_plan(
         if app.id == JELLYFIN_APP_ID:
             return _jellyfin_service_plan(app, state, root, answers)
         return _plex_service_plan(app, state, root)
+
+    if app.kind == "requests":
+        return _seerr_service_plan(app, state, root)
 
     try:
         api_key = state.api_keys[app.id]
@@ -512,6 +524,46 @@ def _jellyfin_service_plan(
     )
 
 
+def _seerr_service_plan(app: CatalogApp, state: InstallState, root: PurePosixPath) -> ServicePlan:
+    """Seerr's own branch: an ordinary Marrquee key handed over as
+    `API_KEY` - v3.4.1 reads its own admin key from that environment
+    setting on every load, so nothing is ever read back from Seerr itself.
+    It joins `marrquee` like an arr app (no host networking, no
+    `network_via`), but takes no PUID/PGID and no `user:`: it always runs
+    as its image's own uid 1000, which is exactly why `build_folders` gives
+    its config folder to that uid instead of the drive's puid:pgid
+    (`CatalogApp.config_owner`). `init=True` supplies the init process the
+    image itself does not.
+    """
+    try:
+        api_key = state.api_keys[app.id]
+    except KeyError:
+        raise ValueError(f"no API key has been generated yet for {app.id!r}") from None
+
+    port = require_port(app)
+    config_mount = f"{root / 'marrquee' / 'apps' / app.id}{_SEERR_CONFIG_MOUNT_SUFFIX}"
+
+    environment: tuple[tuple[str, str], ...] = (
+        ("TZ", state.timezone),
+        ("PORT", str(port)),
+        ("LOG_LEVEL", "info"),
+        ("CONFIG_DIRECTORY", "/app/config"),
+        ("API_KEY", api_key),
+    )
+
+    return ServicePlan(
+        app_id=app.id,
+        service=app.id,
+        image=app.image,
+        container_name=app.id,
+        ports=((port, port),),
+        environment=environment,
+        volumes=(config_mount,),
+        comment=f"{app.description} {SEERR_COMPOSE_COMMENT}",
+        init=True,
+    )
+
+
 def render_compose(plan: StackPlan) -> str:
     """Render `plan` as a human-readable Docker Compose file.
 
@@ -543,6 +595,8 @@ def _render_service(service: ServicePlan, network: str) -> list[str]:
     if service.user is not None:
         lines.append(f"    user: {_quoted(service.user)}")
     lines.append("    restart: unless-stopped")
+    if service.init:
+        lines.append("    init: true")
     if service.network_mode is not None:
         # Compose refuses a service that names both `network_mode:` and
         # `networks:` - this service shares another container's whole
@@ -588,6 +642,10 @@ def _render_service(service: ServicePlan, network: str) -> list[str]:
         elif volume.endswith(_VPN_SECRETS_MOUNT_SUFFIX):
             lines.extend(
                 f"      {comment}" for comment in _comment_lines(VPN_SECRETS_MOUNT_COMMENT)
+            )
+        elif volume.endswith(_SEERR_CONFIG_MOUNT_SUFFIX):
+            lines.extend(
+                f"      {comment}" for comment in _comment_lines(SEERR_CONFIG_MOUNT_COMMENT)
             )
         lines.append(f"      - {_quoted(volume)}")
     if service.network_mode is None:

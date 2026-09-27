@@ -828,6 +828,102 @@ def test_jellyfin_does_not_disturb_an_arr_service_rendered_beside_it() -> None:
     assert _service_block(text, "sonarr") == _service_block(_GOLDEN_THREE_APP_COMPOSE, "sonarr")
 
 
+# --- Seerr's own compose branch: joins marrquee, an ordinary key, init: true -
+
+_SEERR_KEY = "9" * 32
+
+
+def _seerr_state(app_ids: tuple[str, ...] = ("seerr",)) -> InstallState:
+    all_keys = {"sonarr": _SONARR_KEY, "seerr": _SEERR_KEY}
+    return InstallState(
+        version=STATE_VERSION,
+        storage_root="/volume1/media",
+        app_ids=app_ids,
+        api_keys={app_id: all_keys[app_id] for app_id in app_ids},
+        puid=1000,
+        pgid=1000,
+        umask="002",
+        timezone="Etc/UTC",
+        created="2026-09-19T00:00:00+00:00",
+    )
+
+
+def test_seerr_service_joins_marrquee_with_init_true_and_no_user_or_puid() -> None:
+    """Name-the-network rule: Seerr sets no `network_mode`, so it must join
+    `marrquee` explicitly like any arr service - and, unlike them, it never
+    gets PUID/PGID or a `user:` line, since it always runs as its image's
+    own uid.
+    """
+    doc = _rendered_doc(_seerr_state(("sonarr", "seerr")))
+    services = _services(doc)
+    seerr = services["seerr"]
+
+    assert seerr["init"] is True
+    assert seerr["networks"] == ["marrquee"]
+    assert "network_mode" not in seerr
+    assert seerr["ports"] == ["5055:5055"]
+    assert "user" not in seerr
+    assert services["sonarr"]["networks"] == ["marrquee"]
+
+
+def test_seerr_env_is_exact_and_api_key_is_the_installs_own_key() -> None:
+    state = _seerr_state()
+    doc = _rendered_doc(state)
+    seerr = _services(doc)["seerr"]
+
+    environment = _environment(seerr)
+    assert list(environment.keys()) == [
+        "TZ",
+        "PORT",
+        "LOG_LEVEL",
+        "CONFIG_DIRECTORY",
+        "API_KEY",
+    ]
+    assert environment == {
+        "TZ": "Etc/UTC",
+        "PORT": "5055",
+        "LOG_LEVEL": "info",
+        "CONFIG_DIRECTORY": "/app/config",
+        "API_KEY": state.api_keys["seerr"],
+    }
+    assert "PUID" not in environment
+    assert "PGID" not in environment
+
+
+def test_seerr_config_volume_and_comment() -> None:
+    state = _seerr_state()
+    doc = _rendered_doc(state)
+    seerr = _services(doc)["seerr"]
+
+    assert _volumes(seerr) == ["/volume1/media/marrquee/apps/seerr:/app/config"]
+
+    text = compose.render_compose(compose.build_stack_plan(state))
+    seerr_block = _service_block(text, "seerr")
+    comments = _comment_text(seerr_block)
+
+    assert words.SEERR_COMPOSE_COMMENT in comments
+    assert words.SEERR_CONFIG_MOUNT_COMMENT in comments
+    for key in state.api_keys.values():
+        assert key not in _comment_text(seerr_block)
+
+
+def test_init_is_rendered_only_for_seerr() -> None:
+    state = _seerr_state(("sonarr", "seerr"))
+    doc = _rendered_doc(state)
+    services = _services(doc)
+
+    assert "init" not in services["sonarr"]
+    assert services["seerr"]["init"] is True
+
+
+def test_seerr_does_not_disturb_an_arr_service_rendered_beside_it() -> None:
+    state = _seerr_state(("sonarr", "seerr"))
+
+    text = compose.render_compose(compose.build_stack_plan(state))
+
+    assert _service_block(text, "sonarr") == _service_block(_GOLDEN_THREE_APP_COMPOSE, "sonarr")
+
+
 # --- the single highest-consequence path bug in the story --------------------
 
 

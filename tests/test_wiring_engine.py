@@ -25,10 +25,12 @@ from marrquee.plex import (
     PlexResponse,
     browse_path,
     load_existing_plex,
+    plex_base_url,
     save_existing_plex,
     save_plex_sign_in,
 )
 from marrquee.questions import save_step_answers
+from marrquee.seerr import FakeSeerrClient, SeerrResponse
 from marrquee.state import STATE_VERSION, InstallState
 from marrquee.storage import container_media_path, host_media_path
 from marrquee.vpn_control import FakeGluetunControl
@@ -45,6 +47,8 @@ from marrquee.wiring.engine import (
     PlexLibrariesTask,
     QbitSettingsTask,
     RootFolderTask,
+    SeerrArrTask,
+    SeerrMediaServerTask,
     WiringEngine,
     plan_wiring,
 )
@@ -1519,3 +1523,378 @@ async def test_existing_plex_free_run_never_reads_the_record(
 
     assert load_calls == []
     assert _frames_by_key(steps)["root-folder:sonarr"][-1].state == "done"
+
+
+# --- Seerr: plan_wiring's placement, and WiringEngine.run's own wiring ------
+
+
+def _seerr_ok(payload: object = None, *, status: int = 200) -> SeerrResponse:
+    return SeerrResponse(ok=True, status=status, payload=payload, detail=None)
+
+
+async def _fake_seerr_gateway() -> str | None:
+    return "172.30.0.5"
+
+
+async def _no_seerr_gateway() -> str | None:
+    return None
+
+
+def test_plan_wiring_appends_seerr_tasks_last_media_first_then_arr() -> None:
+    state = _install_state(("prowlarr", "sonarr", "radarr", "jellyfin", "seerr"))
+
+    keys = [task.key for task in plan_wiring(state)]
+
+    assert keys[-3:] == ["media-server:seerr", "seerr:sonarr", "seerr:radarr"]
+
+
+def test_plan_wiring_no_media_task_without_a_media_server() -> None:
+    state = _install_state(("sonarr", "seerr"))
+
+    tasks = {task.key: task for task in plan_wiring(state)}
+
+    assert "media-server:seerr" not in tasks
+    assert "seerr:sonarr" in tasks
+
+
+def test_plan_wiring_no_seerr_tasks_without_seerr() -> None:
+    state = _install_state(("sonarr", "plex"))
+
+    keys = [task.key for task in plan_wiring(state)]
+
+    assert "media-server:seerr" not in keys
+    assert "seerr:sonarr" not in keys
+
+
+def test_seerr_media_task_involved_and_about() -> None:
+    tasks = {task.key: task for task in plan_wiring(_install_state(("plex", "seerr")))}
+
+    task = tasks["media-server:seerr"]
+    assert isinstance(task, SeerrMediaServerTask)
+    assert task.involved == ("seerr", "plex")
+    assert task.about == task.involved
+    assert task.line == words.wiring_line_seerr("Plex")
+
+
+def test_seerr_arr_task_involved_and_about() -> None:
+    tasks = {task.key: task for task in plan_wiring(_install_state(("sonarr", "seerr")))}
+
+    task = tasks["seerr:sonarr"]
+    assert isinstance(task, SeerrArrTask)
+    assert task.involved == ("seerr", "sonarr")
+    assert task.about == task.involved
+    assert task.line == words.wiring_line_seerr("Sonarr")
+
+
+def test_only_app_sonarr_keeps_seerr_sonarr() -> None:
+    state = _install_state(("sonarr", "radarr", "jellyfin", "seerr"))
+
+    keys = [task.key for task in plan_wiring(state, only_app="sonarr")]
+
+    assert "seerr:sonarr" in keys
+    assert "seerr:radarr" not in keys
+    assert "media-server:seerr" not in keys
+
+
+def test_connect_again_on_plex_reruns_media_server_seerr() -> None:
+    keys = [
+        task.key
+        for task in plan_wiring(_install_state(("plex", "sonarr", "seerr")), only_app="plex")
+    ]
+
+    assert "media-server:seerr" in keys
+
+
+def test_connect_again_on_jellyfin_reruns_media_server_seerr() -> None:
+    keys = [
+        task.key
+        for task in plan_wiring(
+            _install_state(("jellyfin", "sonarr", "seerr")), only_app="jellyfin"
+        )
+    ]
+
+    assert "media-server:seerr" in keys
+
+
+def test_connect_again_on_existing_plex_reruns_media_server_seerr() -> None:
+    keys = [
+        task.key
+        for task in plan_wiring(
+            _install_state(("existing-plex", "sonarr", "seerr")), only_app="existing-plex"
+        )
+    ]
+
+    assert "media-server:seerr" in keys
+
+
+async def test_seerr_free_run_never_reads_gateway_or_host(tmp_path: Path) -> None:
+    """The cost of Seerr's own wiring must be zero for every install that
+    never installed it - `seerr_address()` must never even be CALLED.
+    """
+    calls: list[None] = []
+
+    async def _recording_gateway() -> str | None:
+        calls.append(None)
+        return "172.30.0.5"
+
+    fake = FakeArrClient(
+        {
+            ("GET", "http://sonarr:8989", "api/v3/system/status"): [_ok(None)],
+            ("GET", "http://sonarr:8989", "api/v3/rootfolder"): [
+                _ok([{"id": 1, "path": "/data/media/tv"}])
+            ],
+        }
+    )
+    engine = WiringEngine(client=fake, config_dir=tmp_path, seerr_address=_recording_gateway)
+    steps: list[WiringStep] = []
+
+    await engine.run(_install_state(("sonarr",)), steps.append)
+
+    assert calls == []
+
+
+async def test_seerr_wires_new_plex_through_its_own_gateway_not_marrquees(tmp_path: Path) -> None:
+    save_plex_sign_in(tmp_path, "the-plex-token", "owner")
+    plex = FakePlexServer(
+        identities_by_url={plex_base_url("192.168.1.5"): PlexIdentity(True, "m1")}
+    )
+    seerr = FakeSeerrClient(
+        {
+            ("GET", "api/v1/settings/plex"): [
+                _seerr_ok(
+                    {"ip": "", "port": 32400, "useSsl": False, "machineId": "", "libraries": []}
+                )
+            ],
+            ("POST", "api/v1/settings/plex"): [_seerr_ok({"machineId": "m1"})],
+            ("GET", "api/v1/settings/plex/library"): [_seerr_ok([])],
+        }
+    )
+    engine = WiringEngine(
+        client=FakeArrClient({}),
+        plex=plex,
+        plex_address=_fake_plex_address,
+        config_dir=tmp_path,
+        seerr=seerr,
+        seerr_address=_fake_seerr_gateway,
+    )
+    steps: list[WiringStep] = []
+
+    await engine.run(_install_state(("plex", "seerr")), steps.append)
+
+    frames = _frames_by_key(steps)
+    assert frames["media-server:seerr"][-1].state == "skipped"
+    assert seerr.bodies[1] == {"ip": "172.30.0.5", "port": 32400, "useSsl": False}
+    # The machine-id check reaches Marrquee's OWN working connection to
+    # Plex (192.168.1.5), never Seerr's own gateway address.
+    assert plex.identity_calls == [plex_base_url("192.168.1.5")]
+
+
+async def test_seerr_wires_new_jellyfin_through_its_own_gateway(tmp_path: Path) -> None:
+    seerr = FakeSeerrClient(
+        {
+            ("GET", "api/v1/settings/jellyfin"): [
+                _seerr_ok({"ip": "", "port": 0, "useSsl": True, "urlBase": "x", "libraries": []})
+            ],
+            ("POST", "api/v1/settings/jellyfin"): [_seerr_ok({})],
+            ("GET", "api/v1/settings/jellyfin/library"): [_seerr_ok([])],
+        }
+    )
+    engine = WiringEngine(
+        client=FakeArrClient({}),
+        config_dir=tmp_path,
+        seerr=seerr,
+        seerr_address=_fake_seerr_gateway,
+    )
+    steps: list[WiringStep] = []
+
+    await engine.run(_install_state(("jellyfin", "seerr")), steps.append)
+
+    frames = _frames_by_key(steps)
+    assert frames["media-server:seerr"][-1].state == "skipped"
+    assert seerr.bodies[1] == {"ip": "172.30.0.5", "port": 8096, "useSsl": False, "urlBase": ""}
+
+
+async def test_seerr_wires_existing_plex_on_this_nas_through_seerr_gateway(tmp_path: Path) -> None:
+    record = ExistingPlex(
+        machine_id="m1",
+        name="Den",
+        base_url="http://172.18.0.1:32400",
+        port=32400,
+        on_this_nas=True,
+        token="owner-plex-token",
+        folders={"movies": "unchecked", "tv": "unchecked"},
+        sections={},
+        replaces_link=None,
+    )
+    save_existing_plex(tmp_path, record)
+    seerr = FakeSeerrClient(
+        {
+            ("GET", "api/v1/settings/plex"): [
+                _seerr_ok(
+                    {"ip": "", "port": 32400, "useSsl": False, "machineId": "", "libraries": []}
+                )
+            ],
+            ("POST", "api/v1/settings/plex"): [_seerr_ok({"machineId": "m1"})],
+            ("GET", "api/v1/settings/plex/library"): [_seerr_ok([])],
+        }
+    )
+    engine = WiringEngine(
+        client=FakeArrClient({}),
+        plex=FakePlexServer(identities_by_url={_EXISTING_BASE_URL: PlexIdentity(True, "m1")}),
+        config_dir=tmp_path,
+        settings=_existing_plex_settings(tmp_path),
+        seerr=seerr,
+        seerr_address=_fake_seerr_gateway,
+    )
+    steps: list[WiringStep] = []
+
+    await engine.run(_install_state(("existing-plex", "seerr")), steps.append)
+
+    frames = _frames_by_key(steps)
+    assert frames["media-server:seerr"][-1].state == "skipped"
+    assert seerr.bodies[1] == {"ip": "172.30.0.5", "port": 32400, "useSsl": False}
+
+
+async def test_seerr_wires_existing_plex_remote_from_its_own_saved_address(tmp_path: Path) -> None:
+    remote_base_url = "https://1-2-3-4.abc.plex.direct:32400"
+    record = ExistingPlex(
+        machine_id="m1",
+        name="Den",
+        base_url=remote_base_url,
+        port=32400,
+        on_this_nas=False,
+        token="owner-plex-token",
+        folders={"movies": "unchecked", "tv": "unchecked"},
+        sections={},
+        replaces_link=None,
+    )
+    save_existing_plex(tmp_path, record)
+    seerr = FakeSeerrClient(
+        {
+            ("GET", "api/v1/settings/plex"): [
+                _seerr_ok(
+                    {"ip": "", "port": 32400, "useSsl": False, "machineId": "", "libraries": []}
+                )
+            ],
+            ("POST", "api/v1/settings/plex"): [_seerr_ok({"machineId": "m1"})],
+            ("GET", "api/v1/settings/plex/library"): [_seerr_ok([])],
+        }
+    )
+    engine = WiringEngine(
+        client=FakeArrClient({}),
+        plex=FakePlexServer(identities_by_url={remote_base_url: PlexIdentity(True, "m1")}),
+        config_dir=tmp_path,
+        settings=_existing_plex_settings(tmp_path),
+        seerr=seerr,
+        # A remote Plex never needs Seerr's own gateway - proven by never
+        # answering one here.
+        seerr_address=_no_seerr_gateway,
+    )
+    steps: list[WiringStep] = []
+
+    await engine.run(_install_state(("existing-plex", "seerr")), steps.append)
+
+    frames = _frames_by_key(steps)
+    assert frames["media-server:seerr"][-1].state == "skipped"
+    assert seerr.bodies[1] == {"ip": "1-2-3-4.abc.plex.direct", "port": 32400, "useSsl": True}
+
+
+async def test_seerr_media_precheck_errors_without_a_gateway(tmp_path: Path) -> None:
+    save_plex_sign_in(tmp_path, "the-plex-token", "owner")
+    engine = WiringEngine(
+        client=FakeArrClient({}),
+        plex=FakePlexServer(),
+        plex_address=_fake_plex_address,
+        config_dir=tmp_path,
+        seerr=FakeSeerrClient({}),
+        seerr_address=_no_seerr_gateway,
+    )
+    steps: list[WiringStep] = []
+
+    await engine.run(_install_state(("plex", "seerr")), steps.append)
+
+    frames = _frames_by_key(steps)
+    assert frames["media-server:seerr"][-1].state == "error"
+    assert frames["media-server:seerr"][-1].note == words.wiring_failure_unreachable("Seerr")
+
+
+async def test_seerr_media_precheck_errors_without_existing_plex_record(tmp_path: Path) -> None:
+    engine = WiringEngine(
+        client=FakeArrClient({}),
+        plex=FakePlexServer(),
+        config_dir=tmp_path,
+        settings=_existing_plex_settings(tmp_path),
+        seerr=FakeSeerrClient({}),
+        seerr_address=_fake_seerr_gateway,
+    )
+    steps: list[WiringStep] = []
+
+    await engine.run(_install_state(("existing-plex", "seerr")), steps.append)
+
+    frames = _frames_by_key(steps)
+    assert frames["media-server:seerr"][-1].state == "error"
+    assert frames["media-server:seerr"][-1].note == words.WIRING_EXISTING_PLEX_MISSING
+
+
+async def test_seerr_arr_task_prefers_recyclarrs_profile_when_installed(tmp_path: Path) -> None:
+    save_step_answers(tmp_path, "sonarr", {"tv_quality": "1080p"})
+    seerr = FakeSeerrClient(
+        {
+            ("GET", "api/v1/settings/sonarr"): [_seerr_ok([])],
+            ("POST", "api/v1/settings/sonarr/test"): [
+                _seerr_ok(
+                    {
+                        "profiles": [{"id": 7, "name": "WEB-1080p"}],
+                        "rootFolders": [{"id": 1, "path": "/data/media/tv"}],
+                    }
+                )
+            ],
+            ("POST", "api/v1/settings/sonarr"): [_seerr_ok(status=201)],
+        }
+    )
+    sonarr_ready = FakeArrClient(
+        {("GET", "http://sonarr:8989", "api/v3/system/status"): [_ok(None)]}
+    )
+    engine = WiringEngine(client=sonarr_ready, config_dir=tmp_path, seerr=seerr)
+    steps: list[WiringStep] = []
+
+    await engine.run(_install_state(("sonarr", "recyclarr", "seerr")), steps.append)
+
+    body = seerr.bodies[2]
+    assert isinstance(body, dict)
+    assert body["activeProfileName"] == "WEB-1080p"
+
+
+async def test_seerr_arr_task_ignores_answers_without_recyclarr(tmp_path: Path) -> None:
+    """The same saved answer is on disk, but Recyclarr isn't installed - the
+    profile choice must fall through to the fallback chain instead.
+    """
+    save_step_answers(tmp_path, "sonarr", {"tv_quality": "1080p"})
+    seerr = FakeSeerrClient(
+        {
+            ("GET", "api/v1/settings/sonarr"): [_seerr_ok([])],
+            ("POST", "api/v1/settings/sonarr/test"): [
+                _seerr_ok(
+                    {
+                        "profiles": [
+                            {"id": 4, "name": "HD-1080p"},
+                            {"id": 7, "name": "WEB-1080p"},
+                        ],
+                        "rootFolders": [{"id": 1, "path": "/data/media/tv"}],
+                    }
+                )
+            ],
+            ("POST", "api/v1/settings/sonarr"): [_seerr_ok(status=201)],
+        }
+    )
+    sonarr_ready = FakeArrClient(
+        {("GET", "http://sonarr:8989", "api/v3/system/status"): [_ok(None)]}
+    )
+    engine = WiringEngine(client=sonarr_ready, config_dir=tmp_path, seerr=seerr)
+    steps: list[WiringStep] = []
+
+    await engine.run(_install_state(("sonarr", "seerr")), steps.append)
+
+    body = seerr.bodies[2]
+    assert isinstance(body, dict)
+    assert body["activeProfileName"] == "HD-1080p"

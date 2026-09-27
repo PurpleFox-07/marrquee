@@ -33,7 +33,7 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
-from marrquee.catalog import apps_in_order
+from marrquee.catalog import apps_in_order, get_app
 from marrquee.config import Settings
 from marrquee.state import write_json_atomic
 from marrquee.words import MARKER_WHAT_IS_THIS
@@ -640,7 +640,18 @@ def build_folders(
             created.append(target)
 
     for target in created:
-        chown(target, puid, pgid)
+        # A created `marrquee/apps/<id>` whose catalog entry names a fixed
+        # `config_owner` (Seerr, which always runs as its image's own uid
+        # 1000) is chowned to that pair instead of the drive's puid:pgid -
+        # every other created folder, including every other app's own
+        # config folder, keeps the ordinary drive ownership.
+        owner = (puid, pgid)
+        relative_parts = target.relative_to(container_root).parts
+        if len(relative_parts) == 3 and relative_parts[:2] == ("marrquee", "apps"):
+            config_owner = get_app(relative_parts[2]).config_owner
+            if config_owner is not None:
+                owner = config_owner
+        chown(target, *owner)
         chmod(target, 0o775)
 
     return FolderReport(created=tuple(created))

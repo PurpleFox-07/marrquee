@@ -85,6 +85,7 @@ from marrquee.login import (
 from marrquee.plex import PlexServer, PlexTv, account_plex_servers, load_existing_plex
 from marrquee.questions import SEEDING_STEP, VPN_STEP, check_step, load_answers, save_step_answers
 from marrquee.recyclarr import RecyclarrControl, SyncStatus
+from marrquee.seen_host import remember_host
 from marrquee.state import load_state
 from marrquee.vpn import VPN_APP_ID, TunnelPlace
 from marrquee.vpn_control import GluetunControl
@@ -245,6 +246,11 @@ async def get_hub(request: Request) -> Response:
     settings: Settings = request.app.state.settings
     if load_state(settings.config_dir) is None:
         return RedirectResponse("/setup/apps", status_code=303)
+
+    # Only a real page load, never the `/api/hub/status` poll (which shares
+    # `read_hub_view` below but never reaches this route) - so a browser tab
+    # left open doesn't keep re-saving the same address it already remembers.
+    remember_host(settings.config_dir, authority_from_headers(request.headers))
 
     manager: DeployManager = request.app.state.deploy
     snapshot = manager.snapshot()

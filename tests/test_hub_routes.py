@@ -64,6 +64,7 @@ from marrquee.questions import (
 )
 from marrquee.recyclarr import RecyclarrControl, SyncRecord, SyncStatus
 from marrquee.routes.wizard import router as wizard_router
+from marrquee.seen_host import load_seen_host
 from marrquee.state import STATE_VERSION, InstallState, load_state, save_state, write_json_atomic
 from marrquee.vpn import VPN_PROVIDERS, TunnelPlace, provider_wiki_url
 from marrquee.vpn_control import FakeGluetunControl
@@ -527,6 +528,77 @@ def test_the_finales_go_to_your_hub_link_now_lands_on_the_hub(tmp_path: Path) ->
 def test_the_wizard_router_no_longer_registers_the_front_door() -> None:
     paths = {route.path for route in wizard_router.routes if isinstance(route, APIRoute)}
     assert "/" not in paths
+
+
+# --- Remembering the owner's own address, for Seerr's own links --------------
+
+
+def test_get_hub_remembers_the_browsers_host(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    _write_snapshot(settings, _finale_snapshot(("sonarr",)))
+    engine = FakeDockerEngine(
+        DockerStatus(connected=True, version="27.3.1"),
+        containers=_running_containers(("sonarr",)),
+    )
+    client = _client(settings, engine)
+
+    response = client.get("/", headers={"host": "nas.local:7788"})
+
+    assert response.status_code == 200
+    assert load_seen_host(settings.config_dir) == "nas.local"
+
+
+def test_get_hub_from_loopback_saves_nothing(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    _write_snapshot(settings, _finale_snapshot(("sonarr",)))
+    engine = FakeDockerEngine(
+        DockerStatus(connected=True, version="27.3.1"),
+        containers=_running_containers(("sonarr",)),
+    )
+    client = _client(settings, engine)
+
+    client.get("/", headers={"host": "127.0.0.1:7788"})
+
+    assert load_seen_host(settings.config_dir) is None
+
+
+def test_the_status_poll_never_writes_the_seen_host(tmp_path: Path) -> None:
+    """`/api/hub/status` shares `read_hub_view` with `GET /`, but must never
+    itself remember an address - it's a live poll a page keeps firing on
+    its own, never something the owner's browser navigated to on purpose.
+    """
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    _write_snapshot(settings, _finale_snapshot(("sonarr",)))
+    engine = FakeDockerEngine(
+        DockerStatus(connected=True, version="27.3.1"),
+        containers=_running_containers(("sonarr",)),
+    )
+    client = _client(settings, engine)
+
+    response = client.get("/api/hub/status", headers={"host": "nas.local:7788"})
+
+    assert response.status_code == 200
+    assert load_seen_host(settings.config_dir) is None
+
+
+def test_a_write_failure_still_renders_the_hub(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    _write_snapshot(settings, _finale_snapshot(("sonarr",)))
+    (settings.config_dir / "seen_host.json").mkdir()  # every write to it now fails
+    engine = FakeDockerEngine(
+        DockerStatus(connected=True, version="27.3.1"),
+        containers=_running_containers(("sonarr",)),
+    )
+    client = _client(settings, engine)
+
+    response = client.get("/", headers={"host": "nas.local:7788"})
+
+    assert response.status_code == 200
+    assert words.HUB_TITLE in response.text
 
 
 # --- Posters: addresses, states, wording --------------------------------------
@@ -1154,6 +1226,7 @@ def test_install_pane_is_truthful(tmp_path: Path) -> None:
         "plex",
         "jellyfin",
         "existing-plex",
+        "seerr",
     )
     save_state(settings.config_dir, _install_state(all_offered))
     _write_snapshot(settings, _finale_snapshot(all_offered))

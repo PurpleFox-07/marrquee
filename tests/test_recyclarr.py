@@ -18,6 +18,7 @@ import yaml
 
 from marrquee.config import Settings
 from marrquee.docker_client import ContainerSnapshot, DockerStatus, FakeDockerEngine
+from marrquee.main import create_app
 from marrquee.recyclarr import (
     GUIDE_PROFILES,
     RecyclarrMonitor,
@@ -538,6 +539,114 @@ async def test_a_clean_run_clears_run_failed_even_with_no_log_to_confirm_it(
     final_status = await monitor.status()
     assert final_status.last is None  # still no log to read - unrelated to the fix
     assert final_status.run_failed is False
+
+
+# --- after_sync: Seerr's profile refresh hook ----------------------------------
+
+
+class _SyncSpy:
+    """Stands in for `main.py`'s own `_refresh_seerr` closure: records
+    whether the hook actually ran, and can be told to raise so a test can
+    prove that never changes the run's own verdict.
+    """
+
+    def __init__(self, *, raises: bool = False) -> None:
+        self.calls = 0
+        self._raises = raises
+
+    async def __call__(self) -> None:
+        self.calls += 1
+        if self._raises:
+            raise RuntimeError("seerr refresh boom")
+
+
+async def test_after_sync_runs_once_after_a_successful_sync(tmp_path: Path) -> None:
+    settings = _monitor_settings(tmp_path)
+    save_state(settings.config_dir, _fixture_state(("sonarr", "recyclarr")))
+    engine = FakeDockerEngine(
+        DockerStatus(connected=True),
+        containers={"recyclarr": _running_recyclarr()},
+        exec_exit_codes={"recyclarr": 0},
+    )
+    spy = _SyncSpy()
+    monitor = RecyclarrMonitor(settings, engine, after_sync=spy)
+
+    result = await monitor.request_sync()
+
+    assert result is True
+    assert spy.calls == 1
+
+
+async def test_after_sync_does_not_run_on_a_failed_exit_code(tmp_path: Path) -> None:
+    settings = _monitor_settings(tmp_path)
+    save_state(settings.config_dir, _fixture_state(("sonarr", "recyclarr")))
+    engine = FakeDockerEngine(
+        DockerStatus(connected=True),
+        containers={"recyclarr": _running_recyclarr()},
+        exec_exit_codes={"recyclarr": 1},
+    )
+    spy = _SyncSpy()
+    monitor = RecyclarrMonitor(settings, engine, after_sync=spy)
+
+    result = await monitor.request_sync()
+
+    assert result is False
+    assert spy.calls == 0
+
+
+async def test_after_sync_does_not_run_when_the_log_reads_as_failed(tmp_path: Path) -> None:
+    """The exec can exit 0 and still not count as a real success - the
+    freshly written log showing an ERR line is what `_run_once` trusts
+    instead, and the hook must never run ahead of that check.
+    """
+    settings = _monitor_settings(tmp_path)
+    save_state(settings.config_dir, _fixture_state(("sonarr", "recyclarr")))
+    log_dir = _log_dir(tmp_path)
+    log_dir.mkdir(parents=True)
+    (log_dir / "recyclarr_2026-09-24_00-00-01.debug.log").write_text(
+        "[00:00:03 ERR] sonarr sync failed\n"
+    )
+    engine = FakeDockerEngine(
+        DockerStatus(connected=True),
+        containers={"recyclarr": _running_recyclarr()},
+        exec_exit_codes={"recyclarr": 0},
+    )
+    spy = _SyncSpy()
+    monitor = RecyclarrMonitor(settings, engine, after_sync=spy)
+
+    result = await monitor.request_sync()
+
+    assert result is False
+    assert spy.calls == 0
+
+
+async def test_after_sync_raising_is_logged_and_never_changes_the_result(tmp_path: Path) -> None:
+    settings = _monitor_settings(tmp_path)
+    save_state(settings.config_dir, _fixture_state(("sonarr", "recyclarr")))
+    engine = FakeDockerEngine(
+        DockerStatus(connected=True),
+        containers={"recyclarr": _running_recyclarr()},
+        exec_exit_codes={"recyclarr": 0},
+    )
+    spy = _SyncSpy(raises=True)
+    monitor = RecyclarrMonitor(settings, engine, after_sync=spy)
+
+    result = await monitor.request_sync()
+
+    assert result is True
+    assert spy.calls == 1
+
+
+def test_create_app_wires_the_default_monitor_with_a_seerr_refresh_hook(tmp_path: Path) -> None:
+    """`create_app`'s own default `RecyclarrMonitor` (no `recyclarr=`
+    passed in) must carry a real `after_sync` hook - otherwise a real,
+    Marrquee-started sync would never move Seerr's Sonarr/Radarr profiles
+    at all. An injected `recyclarr=` keeps whichever hook it already has.
+    """
+    settings = _monitor_settings(tmp_path)
+    app = create_app(settings=settings, engine=FakeDockerEngine(DockerStatus(connected=True)))
+
+    assert app.state.recyclarr._after_sync is not None  # type: ignore[attr-defined]
 
 
 async def test_status_reports_syncing_while_the_exec_polls_running(tmp_path: Path) -> None:

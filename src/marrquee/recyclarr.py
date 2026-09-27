@@ -451,12 +451,17 @@ class RecyclarrMonitor:
         chown: ChownFn = os.chown,
         clock: Callable[[], datetime] = _utc_now,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        after_sync: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self._settings = settings
         self._engine = engine
         self._chown = chown
         self._clock = clock
         self._sleep = sleep
+        # Awaited once per run that actually earns a clean verdict (exit 0
+        # AND a log that doesn't read as failed) - never on a failed run,
+        # and never allowed to turn a real success into a reported failure.
+        self._after_sync = after_sync
         self._task: asyncio.Task[bool] | None = None
         self._again = False
         self._start_failed_at: datetime | None = None
@@ -571,6 +576,14 @@ class RecyclarrMonitor:
             return False
 
         self._run_failed_at = None
+        if self._after_sync is not None:
+            try:
+                await self._after_sync()
+            except Exception:
+                # A refresh that can't run is never this run's own failure -
+                # the sync itself genuinely succeeded, so the verdict this
+                # method returns must say so regardless.
+                logger.warning("recyclarr sync: after_sync hook failed", exc_info=True)
         return True
 
     async def _await_exec(self, exec_id: str) -> int | None:

@@ -3296,3 +3296,343 @@ def test_stack_smoke_dump_diagnostics_step_gained_no_existing_plex_container_log
     assert "docker logs plex" in dump_run
     assert "docker logs jellyfin" in dump_run
     assert "existing-plex" not in cleanup_run
+
+
+# --- Seerr: real Docker proves it set up, signed in, and a request reaching
+# Radarr - the cycle's finale. Two steps only, "seerr is set up" and "request
+# in seerr" - the Plex-reachability step the plan first sketched was dropped:
+# CI's Plex is removed long before these run (`docker rm -f plex` above), and
+# Plex and Jellyfin never run at once, so a Plex-backed Seerr stays PENDING
+# the owner's NAS. ------------------------------------------------------------
+
+_SEERR_STEP_NEEDLES = [("seerr is set up",), ("request in seerr",)]
+
+
+def test_stack_smoke_seerr_step_names_avoid_forbidden_needles() -> None:
+    """Same reasoning as every other story's own naming test: a name that
+    collides with an earlier step's own name (or a generic phrase like
+    "developer test") would silently resolve `_step_named` to that earlier
+    step instead of this one's.
+    """
+    job = _stack_smoke_job()
+    forbidden = (
+        "developer test",
+        "recyclarr",
+        "sync turns amber",
+        "stop radarr",
+        "start radarr again",
+        "cancel",
+        "clean up",
+        "dump diagnostics",
+        "plex runs on the host network",
+        "link code stays root-only",
+        "throwaway",
+        "graphics chip check",
+        "jellyfin is set up",
+        "changes jellyfin's admin",
+        "connecting your own plex",
+        "plex folder check",
+    )
+    for needles in _SEERR_STEP_NEEDLES:
+        name = str(_step_named(job, *needles)["name"]).lower()
+        for phrase in forbidden:
+            assert phrase not in name, f"step {name!r} contains the forbidden phrase {phrase!r}"
+
+
+def test_stack_smoke_seerr_steps_run_after_the_plex_folder_check_and_before_dump() -> None:
+    job = _stack_smoke_job()
+    names = [str(step.get("name", "")) for step in _steps(job)]
+
+    folder_check_index = names.index(_step_named(job, "plex folder check")["name"])
+    seerr_setup_index = names.index(_step_named(job, "seerr is set up")["name"])
+    seerr_request_index = names.index(_step_named(job, "request in seerr")["name"])
+    dump_index = names.index(_step_named(job, "dump diagnostics")["name"])
+
+    assert folder_check_index < seerr_setup_index < seerr_request_index < dump_index
+
+
+def test_stack_smoke_every_new_seerr_step_emits_error_on_failure() -> None:
+    job = _stack_smoke_job()
+    for needles in _SEERR_STEP_NEEDLES:
+        step = _step_named(job, *needles)
+        run = step["run"]
+        assert "::error::" in run, f"step {step['name']!r} never emits ::error::"
+        assert "set -euo pipefail" in run
+        assert "while true" not in run
+
+
+def test_stack_smoke_seerr_steps_guard_every_curl_assignment() -> None:
+    """The strict `if ! ...` guard applies to every one-shot curl call in
+    these two steps. The poll loop's own `status=$(curl ...) || status=""`
+    is the same retry idiom every other polling step in this job already
+    uses - it is not silent, because the loop's own post-loop verdict emits
+    its own `::error::` when the state never settles - so, exactly as every
+    other step's own guard test already does, it is excluded here rather
+    than asserted against.
+    """
+    setup_run = _step_named(_stack_smoke_job(), "seerr is set up")["run"]
+    request_run = _step_named(_stack_smoke_job(), "request in seerr")["run"]
+
+    poll_line = 'status=$(curl -fsS http://127.0.0.1:7788/api/hub/status) || status=""'
+    assert poll_line in setup_run
+    _assert_every_curl_assignment_is_guarded(setup_run.replace(poll_line, ""))
+    _assert_every_curl_assignment_is_guarded(request_run)
+
+
+def test_stack_smoke_seerr_setup_step_guards_its_own_substitutions() -> None:
+    """Every non-curl substitution this step relies on (the stat, the three
+    docker inspect reads, the docker-exec'd setup script) is its own `if !
+    ...` guard too, the same standard the curl calls already get.
+    """
+    run = _step_named(_stack_smoke_job(), "seerr is set up")["run"]
+
+    assert 'if ! seerr_uid=$(stat -c \'%u\' "$seerr_dir") || [ -z "$seerr_uid" ]; then' in run
+    assert (
+        "if ! seerr_init=$(docker inspect -f '{{.HostConfig.Init}}' seerr) "
+        '|| [ -z "$seerr_init" ]; then' in run
+    )
+    assert (
+        "if ! seerr_port=$(docker inspect -f "
+        "'{{index .HostConfig.PortBindings \"5055/tcp\"}}' seerr) "
+        '|| [ -z "$seerr_port" ]; then' in run
+    )
+    assert (
+        "if ! seerr_gateway=$(docker inspect -f "
+        "'{{(index .NetworkSettings.Networks \"marrquee\").Gateway}}' seerr) "
+        '|| [ -z "$seerr_gateway" ]; then' in run
+    )
+    assert (
+        'if ! setup_output=$(docker exec -e SEERR_GATEWAY="$seerr_gateway" '
+        "marrquee-stack-smoke python3 /tmp/ci_seerr_setup.py 2>&1) "
+        '|| [ -z "$setup_output" ]; then' in run
+    )
+
+
+def test_stack_smoke_seerr_setup_step_pins_the_post_loop_and_uid_verdicts() -> None:
+    run = _step_named(_stack_smoke_job(), "seerr is set up")["run"]
+
+    _assert_post_loop_verdict(
+        run,
+        'if [ "$state" != "up" ] || [ "$add_state" != "null" ] || [ -n "$note" ] '
+        '|| [ "$busy" != "false" ]; then',
+        "Seerr never finished adding within 10 minutes",
+    )
+    _assert_post_loop_verdict(run, 'if [ "$seerr_uid" != "1000" ]; then', "not owned by uid 1000")
+    assert 'if [ ! -e "$seerr_dir/settings.json" ]; then' in run
+    assert "::error::Seerr couldn't write its settings folder" in run
+    _assert_post_loop_verdict(
+        run, 'if [ "$seerr_init" != "true" ]; then', "seerr's container did not run with an init"
+    )
+
+
+def test_stack_smoke_seerr_setup_step_compose_check_runs_grep_then_positive_control_then_case() -> (
+    None
+):
+    run = _step_named(_stack_smoke_job(), "seerr is set up")["run"]
+
+    grep_tool_index = run.index("command -v grep")
+    positive_control_index = run.index("grep -F -q 'seerr:'")
+    case_index = run.index('case "$seerr_init_rendered" in')
+    assert grep_tool_index < positive_control_index < case_index
+
+    case_block = _text_between(run, 'case "$seerr_init_rendered" in', "esac")
+    arms = _shell_case_arms(case_block)
+    assert arms["0"] == ""
+    assert "seerr" in arms["1"].lower() and "init: true" in arms["1"]
+    assert "seerr" in arms["*"].lower() and "grep exit" in arms["*"]
+
+
+def test_stack_smoke_seerr_setup_heredoc_reads_the_login_and_key_inside_the_container() -> None:
+    """The one login's password changed in an earlier step and was never
+    exported anywhere bash could read it back - `load_login` inside the
+    container is the only correct source, so the heredoc must use it
+    instead of any leftover `$MARRQUEE_CI_PASSWORD`-shaped shortcut.
+    """
+    run = _step_named(_stack_smoke_job(), "seerr is set up")["run"]
+    body = _heredoc_body(run, "ci_seerr_setup.py")
+
+    assert "load_login(" in body
+    assert "settings/jellyfin" in body
+    assert "settings/jellyfin/library" not in body
+    assert '"username": "marrquee-ci' not in body
+    assert "MARRQUEE_CI_PASSWORD" not in run
+
+
+def test_stack_smoke_seerr_request_heredoc_pins_the_movie_ids_and_status() -> None:
+    run = _step_named(_stack_smoke_job(), "request in seerr")["run"]
+    body = _heredoc_body(run, "ci_seerr_request.py")
+
+    assert '"mediaId": 603' in body
+    assert '"mediaId": 13' in body
+    assert "status" in body
+    assert "secrets.token_hex(16)" in body
+
+
+def test_stack_smoke_seerr_request_never_puts_radarrs_key_in_a_url() -> None:
+    """Every other key in this job travels in a header, never a query
+    string - a query string is echoed back in access logs and shell
+    history in a way a header never is. Scoped to this one heredoc so a
+    legitimate `"apikey"`-shaped word anywhere else in the file (there is
+    none, but a future step could add one) can never satisfy this pin.
+    """
+    body = _heredoc_body(
+        _step_named(_stack_smoke_job(), "request in seerr")["run"], "ci_seerr_request.py"
+    )
+
+    assert "apikey" not in body.lower()
+    assert '{"X-Api-Key": radarr_key}' in body
+    assert "headers=radarr_headers" in body
+
+
+def test_stack_smoke_seerr_request_verdict_resolves_the_real_radarr_profile_name() -> None:
+    """`radarr_got_it` must mean "Radarr actually filed this under Recyclarr's
+    own UHD Bluray + WEB profile", not merely "Radarr has some profile id
+    for it" - the movie's own `qualityProfileId` is meaningless without the
+    quality-profile list to resolve it against a name.
+    """
+    body = _heredoc_body(
+        _step_named(_stack_smoke_job(), "request in seerr")["run"], "ci_seerr_request.py"
+    )
+
+    assert "api/v3/qualityprofile" in body
+    assert '"UHD Bluray + WEB"' in body
+    assert 'profile_names.get(profile_id) == "UHD Bluray + WEB"' in body
+
+
+def test_stack_smoke_seerr_setup_heredoc_pins_the_real_verdict_conditions() -> None:
+    """The two checks that decide whether Seerr's first-run setup actually
+    finished right are pinned as their own exact source lines - a mutation
+    that hollows either one out (to `if False:`, say) changes this literal
+    text, even though the check's own printed verdict below is computed
+    fresh and would otherwise look unaffected.
+    """
+    body = _heredoc_body(
+        _step_named(_stack_smoke_job(), "seerr is set up")["run"], "ci_seerr_setup.py"
+    )
+
+    assert 'if public.payload.get("initialized") is not True:' in body
+    assert 'if main_settings.payload.get("defaultPermissions") != 32:' in body
+
+
+def test_stack_smoke_seerr_request_heredoc_pins_the_real_verdict_conditions() -> None:
+    body = _heredoc_body(
+        _step_named(_stack_smoke_job(), "request in seerr")["run"], "ci_seerr_request.py"
+    )
+
+    assert (
+        "if not isinstance(owner_request.payload, dict) "
+        'or owner_request.payload.get("status") != 2:' in body
+    )
+    assert 'friend_waits = friend_payload.get("status") == 1' in body
+
+
+_SEERR_VERDICT_BOOLEAN_NAMES = frozenset(
+    {
+        "initialized_ok",
+        "local_login_off",
+        "default_permissions_ok",
+        "sonarr_ok",
+        "radarr_ok",
+        "auth_ok",
+        "radarr_got_it",
+        "friend_waits",
+    }
+)
+
+
+def _literal_true_assignments(body: str, names: frozenset[str]) -> set[str]:
+    tree = ast.parse(body)
+    return {
+        node.targets[0].id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id in names
+        and isinstance(node.value, ast.Constant)
+        and node.value.value is True
+    }
+
+
+def test_stack_smoke_seerr_heredocs_never_hardcode_a_verdict_boolean() -> None:
+    """Every printed verdict boolean in both heredocs - `friend_waits`,
+    `radarr_got_it` and the setup script's own `*_ok` values - must be a
+    real derived expression, the same standard the plex folder marker's
+    own `created`/`removed`/`sentinel_survived` verdicts already get. A
+    literal `False` is a legitimate starting point before a real check runs
+    (several of these do exactly that), but a bare literal `True` is never
+    legitimate anywhere in this pair of scripts: every one of these names
+    is only ever set from a real comparison.
+    """
+    setup_body = _heredoc_body(
+        _step_named(_stack_smoke_job(), "seerr is set up")["run"], "ci_seerr_setup.py"
+    )
+    request_body = _heredoc_body(
+        _step_named(_stack_smoke_job(), "request in seerr")["run"], "ci_seerr_request.py"
+    )
+
+    hardcoded = _literal_true_assignments(
+        setup_body, _SEERR_VERDICT_BOOLEAN_NAMES
+    ) | _literal_true_assignments(request_body, _SEERR_VERDICT_BOOLEAN_NAMES)
+    assert hardcoded == set(), (
+        f"these verdicts are hardcoded to True instead of derived: {hardcoded}"
+    )
+
+
+def test_stack_smoke_seerr_request_step_pins_the_radarr_and_friend_verdicts() -> None:
+    run = _step_named(_stack_smoke_job(), "request in seerr")["run"]
+
+    assert (
+        "if ! request_output=$(docker exec marrquee-stack-smoke "
+        "python3 /tmp/ci_seerr_request.py 2>&1) "
+        '|| [ -z "$request_output" ]; then' in run
+    )
+    assert 'grep -qF "radarr_got_it=True"' in run
+    assert (
+        "::error::The owner's request didn't reach Radarr "
+        "(Seerr needs TMDB - check the runner's internet)" in run
+    )
+    assert 'grep -qF "friend_waits=True"' in run
+    assert "::error::A shared person's request didn't wait for approval" in run
+
+
+def test_stack_smoke_seerr_pinned_lines_are_unique_anchors() -> None:
+    setup_run = _step_named(_stack_smoke_job(), "seerr is set up")["run"]
+    request_run = _step_named(_stack_smoke_job(), "request in seerr")["run"]
+
+    pinned = [
+        (
+            setup_run,
+            'docker cp "$RUNNER_TEMP/ci_seerr_setup.py" '
+            "marrquee-stack-smoke:/tmp/ci_seerr_setup.py",
+        ),
+        (
+            request_run,
+            'docker cp "$RUNNER_TEMP/ci_seerr_request.py" '
+            "marrquee-stack-smoke:/tmp/ci_seerr_request.py",
+        ),
+    ]
+    for run, line in pinned:
+        assert "seerr" in line.lower()
+        assert line in run
+
+
+def test_stack_smoke_seerr_steps_never_echo_a_secret() -> None:
+    for needles in _SEERR_STEP_NEEDLES:
+        run = _step_named(_stack_smoke_job(), *needles)["run"]
+        for line in run.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("echo"):
+                lowered = stripped.lower()
+                assert "password" not in lowered
+                assert "token" not in lowered
+                assert "api_key" not in lowered
+
+
+def test_stack_smoke_dump_diagnostics_step_gained_seerr_logs() -> None:
+    job = _stack_smoke_job()
+    dump_run = _step_named(job, "dump diagnostics")["run"]
+    cleanup_run = _step_named(job, "clean up every container")["run"]
+
+    assert "docker logs seerr" in dump_run
+    assert re.search(r"docker rm -f[^\n]*\bseerr\b", cleanup_run)

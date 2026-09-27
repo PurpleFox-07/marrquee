@@ -19,6 +19,7 @@ from marrquee.catalog import (
     MEDIA_SERVER_APP_IDS,
     PLEX_APP_ID,
     RECYCLARR_APP_ID,
+    SEERR_APP_ID,
     AppRule,
     CatalogApp,
     app_host,
@@ -45,6 +46,9 @@ from marrquee.words import (
     RADARR_DESCRIPTION,
     RECYCLARR_DESCRIPTION,
     RECYCLARR_NEEDS_ARR,
+    SEERR_DESCRIPTION,
+    SEERR_NEEDS_ARR,
+    SEERR_NEEDS_PLEX_OR_JELLYFIN,
     SONARR_DESCRIPTION,
 )
 
@@ -62,6 +66,7 @@ def test_catalog_holds_the_three_arr_apps_gluetun_and_qbittorrent_in_deploy_orde
         "plex",
         "jellyfin",
         "existing-plex",
+        "seerr",
     ]
     orders = [app.order for app in CATALOG]
     assert orders == sorted(orders)
@@ -111,6 +116,7 @@ def test_the_three_arr_apps_take_the_login_gluetun_takes_none_qbittorrent_its_ow
         "plex": "none",
         "jellyfin": "jellyfin",
         "existing-plex": "none",
+        "seerr": "none",
     }
 
 
@@ -204,6 +210,7 @@ def test_every_catalog_description_is_the_mockups_own_wording() -> None:
     assert descriptions_by_id["plex"] == PLEX_DESCRIPTION
     assert descriptions_by_id["jellyfin"] == JELLYFIN_DESCRIPTION
     assert descriptions_by_id["existing-plex"] == EXISTING_PLEX_DESCRIPTION
+    assert descriptions_by_id["seerr"] == SEERR_DESCRIPTION
     assert PROWLARR_DESCRIPTION == "Your search sources, managed in one place."
     assert SONARR_DESCRIPTION == "Finds and organizes your TV shows."
     assert RADARR_DESCRIPTION == "Finds and organizes your movies."
@@ -492,10 +499,10 @@ def test_media_server_app_ids_names_plex_jellyfin_and_existing_plex() -> None:
 # deploys ----------------------------------------------------------------------
 
 
-def test_existing_plex_sits_last_right_after_jellyfin() -> None:
+def test_existing_plex_sits_right_after_jellyfin() -> None:
+    """Seerr now follows it - see `test_seerr_sits_last_right_after_existing_plex`."""
     ids = [app.id for app in CATALOG]
 
-    assert ids[-1] == "existing-plex"
     assert ids.index("existing-plex") == ids.index("jellyfin") + 1
 
 
@@ -551,3 +558,62 @@ def test_media_server_of_finds_the_connected_plex() -> None:
     found = media_server_of(("sonarr", "existing-plex"))
     assert found is not None
     assert found.id == "existing-plex"
+
+
+# --- seerr: the owner's "ask for a movie or show" door ----------------------
+
+
+def test_seerr_sits_last_right_after_existing_plex() -> None:
+    ids = [app.id for app in CATALOG]
+
+    assert ids[-1] == "seerr"
+    assert ids.index("seerr") == ids.index("existing-plex") + 1
+
+
+def test_seerr_facts_match_the_verified_image_docs() -> None:
+    seerr = get_app(SEERR_APP_ID)
+
+    assert seerr.id == "seerr"
+    assert seerr.name == "Seerr"
+    assert seerr.description == SEERR_DESCRIPTION
+    assert seerr.image == "ghcr.io/seerr-team/seerr:v3.4.1"
+    assert seerr.port == 5055
+    assert seerr.env_prefix == "SEERR"
+    assert seerr.api_base == "api/v1"
+    assert seerr.media_folders == ()
+    assert seerr.needs_data_mount is False
+    assert seerr.glyph == "SR"
+    assert seerr.order == 9
+    assert seerr.default_ticked is False
+    assert seerr.web_page is True
+    assert seerr.login_kind == "none"
+    assert seerr.kind == "requests"
+    assert seerr.offered is True
+    # No `api_key_source` field exists - Seerr mints its key the same way
+    # every other app does, and hands it over as `API_KEY`.
+    assert seerr.api_key_style == "hex32"
+    assert seerr.web_path == "/"
+    assert seerr.library_folders == ()
+    assert seerr.managed is True
+    assert seerr.config_owner == (1000, 1000)
+
+
+def test_seerr_rules_need_a_media_server_first_then_sonarr_or_radarr() -> None:
+    """The first failing rule wins: with neither a media server nor an arr
+    app present, the media-server reason is the one the row shows.
+    """
+    seerr = get_app(SEERR_APP_ID)
+
+    assert unavailable_reason(seerr, ()) == SEERR_NEEDS_PLEX_OR_JELLYFIN
+    assert unavailable_reason(seerr, ("jellyfin",)) == SEERR_NEEDS_ARR
+    assert unavailable_reason(seerr, ("plex",)) == SEERR_NEEDS_ARR
+    assert unavailable_reason(seerr, ("existing-plex",)) == SEERR_NEEDS_ARR
+    assert unavailable_reason(seerr, ("jellyfin", "sonarr")) is None
+    assert unavailable_reason(seerr, ("existing-plex", "radarr")) is None
+
+
+def test_every_other_catalog_app_has_no_config_owner() -> None:
+    for app in CATALOG:
+        if app.id == SEERR_APP_ID:
+            continue
+        assert app.config_owner is None

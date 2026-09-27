@@ -200,6 +200,7 @@ def test_catalog_route_lists_apps_in_deploy_order_with_port_only(tmp_path: Path)
         "recyclarr",
         "plex",
         "jellyfin",
+        "seerr",
     ]
     assert apps[0].keys() == {"id", "name", "description", "port"}
     assert apps[0]["port"] == 9696
@@ -207,6 +208,7 @@ def test_catalog_route_lists_apps_in_deploy_order_with_port_only(tmp_path: Path)
     assert apps_by_id["recyclarr"]["port"] is None
     assert apps_by_id["plex"]["port"] == 32400
     assert apps_by_id["jellyfin"]["port"] == 8096
+    assert apps_by_id["seerr"]["port"] == 5055
     # existing-plex is `offered=True` but `managed=False`: it is connected
     # from the Hub only, never listed as a catalog choice.
     assert "existing-plex" not in apps_by_id

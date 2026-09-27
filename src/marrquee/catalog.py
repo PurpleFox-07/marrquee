@@ -30,6 +30,9 @@ from marrquee.words import (
     RADARR_DESCRIPTION,
     RECYCLARR_DESCRIPTION,
     RECYCLARR_NEEDS_ARR,
+    SEERR_DESCRIPTION,
+    SEERR_NEEDS_ARR,
+    SEERR_NEEDS_PLEX_OR_JELLYFIN,
     SONARR_DESCRIPTION,
     VPN_DESCRIPTION,
 )
@@ -80,8 +83,13 @@ LoginKind = Literal["arr", "none", "qbittorrent", "jellyfin"]
 # one app the owner actually watches through - it has its own compose
 # shape and bring-up rules (no pre-generated API key, its own claim/sign-in
 # door), and `library_folders` names the shared library it opens onto
-# instead of a per-app media folder of its own.
-AppKind = Literal["arr", "vpn", "downloader", "sync", "media_server"]
+# instead of a per-app media folder of its own. "requests" is Seerr: the
+# owner's "ask for a movie or show" door - it takes an ordinary Marrquee
+# key (handed over as `API_KEY`, never read back) and needs its own
+# bring-up entirely; its config folder is chowned to its image's own user
+# rather than the drive's owner (`config_owner`, below), because it runs as
+# a fixed uid its own image picked, not whatever PUID the owner's drive uses.
+AppKind = Literal["arr", "vpn", "downloader", "sync", "media_server", "requests"]
 
 
 @dataclass(frozen=True)
@@ -133,6 +141,12 @@ class CatalogApp:
     that was never Marrquee's to make. It still gets an ordinary catalog
     id, rules and a Hub poster - only the "Marrquee runs this" half is
     switched off.
+
+    `config_owner`, when set (Seerr's `(1000, 1000)`), is the fixed uid:gid
+    `build_folders` chowns this app's created config folder to instead of
+    the drive's own puid:pgid - for an app whose image always runs as one
+    particular user regardless of what PUID the rest of the stack uses.
+    `None` (every other app) keeps the ordinary puid:pgid behaviour.
     """
 
     id: str
@@ -158,12 +172,14 @@ class CatalogApp:
     web_path: str = "/"
     library_folders: tuple[str, ...] = ()
     managed: bool = True
+    config_owner: tuple[int, int] | None = None
 
 
 RECYCLARR_APP_ID: Final = "recyclarr"
 PLEX_APP_ID: Final = "plex"
 JELLYFIN_APP_ID: Final = "jellyfin"
 EXISTING_PLEX_APP_ID: Final = "existing-plex"
+SEERR_APP_ID: Final = "seerr"
 
 # The id every media-server door registers under - read by `media_server_of`
 # and Stories 9/10's connect/Seerr flows, so a media-server-shaped app never
@@ -173,9 +189,11 @@ MEDIA_SERVER_APP_IDS: Final = ("plex", "jellyfin", "existing-plex")
 # Prowlarr, Sonarr, Radarr, Gluetun (the VPN tunnel), qBittorrent (the
 # downloader), Recyclarr (quality settings from the TRaSH guides), Plex
 # (a media server, linked to the owner's own Plex account), Jellyfin (a
-# media server, signed in with the owner's own Marrquee login) and the
+# media server, signed in with the owner's own Marrquee login), the
 # owner's own existing Plex (a media server Marrquee connects to but never
-# deploys - `managed=False`).
+# deploys - `managed=False`) and Seerr (the owner's "ask for a movie or
+# show" door, last in deploy order so a media server and an arr app are
+# always already installed before it needs either one).
 # Gluetun is `offered=False`: it never appears as its own "+" choice or
 # wizard tick - whatever needs it (qBittorrent, today) adds it as a
 # companion instead. qBittorrent's `network_via="gluetun"` is what enforces
@@ -371,6 +389,36 @@ CATALOG: tuple[CatalogApp, ...] = (
         web_path="/web",
         library_folders=("movies", "tv"),
         managed=False,
+    ),
+    CatalogApp(
+        id=SEERR_APP_ID,
+        name="Seerr",
+        description=SEERR_DESCRIPTION,
+        image="ghcr.io/seerr-team/seerr:v3.4.1",
+        port=5055,
+        env_prefix="SEERR",
+        api_base="api/v1",
+        media_folders=(),
+        needs_data_mount=False,
+        glyph="SR",
+        order=9,
+        default_ticked=False,
+        web_page=True,
+        rules=(
+            AppRule(
+                kind="needs_any",
+                app_ids=MEDIA_SERVER_APP_IDS,
+                reason=SEERR_NEEDS_PLEX_OR_JELLYFIN,
+            ),
+            AppRule(kind="needs_any", app_ids=("sonarr", "radarr"), reason=SEERR_NEEDS_ARR),
+        ),
+        login_kind="none",
+        kind="requests",
+        offered=True,
+        web_path="/",
+        library_folders=(),
+        managed=True,
+        config_owner=(1000, 1000),
     ),
 )
 

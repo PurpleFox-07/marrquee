@@ -22,6 +22,7 @@ from marrquee.deploy import DeployManager
 from marrquee.deploy_screen import deploy_view
 from marrquee.login import load_login
 from marrquee.questions import load_answers, uses_graphics_chip
+from marrquee.seen_host import remember_host
 from marrquee.state import load_state
 from marrquee.wizard import step_number, wizard_steps
 
@@ -46,6 +47,7 @@ async def get_deploy(request: Request) -> Response:
 
     manager: DeployManager = request.app.state.deploy
     authority = authority_from_headers(request.headers)
+    remember_host(settings.config_dir, authority)
     view = deploy_view(state, manager.snapshot(), authority=authority)
 
     # No probe here - once a deploy has started, the chip question is

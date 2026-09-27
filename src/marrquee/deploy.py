@@ -90,6 +90,14 @@ from marrquee.recyclarr import (
     sync_wanted_after,
     write_recyclarr_config,
 )
+from marrquee.seerr import (
+    HttpSeerrClient,
+    SeerrClient,
+    ensure_seerr_setup,
+    seerr_base_url,
+    seerr_sign_in,
+    seerr_sign_in_kind,
+)
 from marrquee.state import InstallState, load_state, save_state, write_json_atomic
 from marrquee.storage import (
     FreshnessCheck,
@@ -127,6 +135,8 @@ from marrquee.words import (
     FAILURE_PLEX_NOT_CLAIMED,
     FAILURE_PLEX_PORT_TAKEN,
     FAILURE_PLEX_SIGN_IN_NEEDED,
+    FAILURE_SEERR_NOT_OURS,
+    FAILURE_SEERR_SETUP_REFUSED,
     FAILURE_VPN_NO_TUN,
     JELLYFIN_SERVER_NAME,
     PHASE_HEADLINE_FINALE,
@@ -191,6 +201,8 @@ FailureCode = Literal[
     "jellyfin_not_ours",
     "jellyfin_setup_refused",
     "existing_plex_unreachable",
+    "seerr_not_ours",
+    "seerr_setup_refused",
 ]
 
 # An add's own tiny state machine - never "done": once wiring finishes, the
@@ -456,6 +468,7 @@ class DeployManager:
         plex_tv: PlexTv | None = None,
         plex_server: PlexServer | None = None,
         jellyfin: JellyfinServer | None = None,
+        seerr: SeerrClient | None = None,
     ) -> None:
         self._settings = settings
         self._engine = engine
@@ -471,6 +484,7 @@ class DeployManager:
         self._plex_tv = plex_tv if plex_tv is not None else HttpPlexTv()
         self._plex_server = plex_server if plex_server is not None else HttpPlexServer()
         self._jellyfin = jellyfin if jellyfin is not None else HttpJellyfinServer()
+        self._seerr = seerr if seerr is not None else HttpSeerrClient()
         self._task: asyncio.Task[None] | None = None
         # The login run's own in-memory progress line - never persisted and
         # never resumed after a restart (the pending names plus Try again
@@ -1420,6 +1434,15 @@ class DeployManager:
                 app, install, root, compose_path, self_id, report, recreate=recreate
             )
 
+        if app.kind == "requests":
+            # Seerr has no `/api/v1/system/status` for the generic readiness
+            # loop below to probe, so it must never fall through to it -
+            # its own bring-up proves readiness through its own first-run
+            # setup instead.
+            return await self._bring_up_seerr(
+                app, install, compose_path, network, self_id, report, recreate=recreate
+            )
+
         if app.kind == "vpn":
             secrets_failure = self._write_vpn_secrets(app, install, root)
             if secrets_failure is not None:
@@ -2080,6 +2103,137 @@ class DeployManager:
                 await report("starting", line, note)
 
             await self._sleep(self.POLL_INTERVAL_SECONDS)
+
+    # --- Seerr: no port pre-flight, no generic readiness probe --------------
+
+    async def _bring_up_seerr(
+        self,
+        app: CatalogApp,
+        install: InstallState,
+        compose_path: Path,
+        network: str,
+        self_id: str,
+        report: Callable[[AppState, str, str | None], Awaitable[None]],
+        *,
+        recreate: bool = False,
+    ) -> Failure | None:
+        """Seerr's own branch of `_bring_up_app`: a sign-in must already be
+        on disk before anything starts, and "ready" means Marrquee's own
+        first-time setup (`ensure_seerr_setup`) says so - never merely that
+        the container answers, since Seerr has no `system/status` route for
+        the generic loop to probe.
+        """
+        config_dir = self._settings.config_dir
+        kind = seerr_sign_in_kind(install.app_ids, config_dir)
+        if kind is None:
+            return self._seerr_failure(
+                "seerr_setup_refused",
+                FAILURE_SEERR_SETUP_REFUSED,
+                technical="no sign-in saved for seerr",
+            )
+        if kind == "jellyfin" and JELLYFIN_APP_ID in pending_app_ids(
+            load_login(config_dir), install.app_ids
+        ):
+            return self._seerr_failure(
+                "seerr_setup_refused",
+                FAILURE_SEERR_SETUP_REFUSED,
+                technical="the one login has not reached jellyfin yet",
+            )
+
+        fetching_image = not await self._engine.image_present(app.image)
+        line = app_line_getting(app.name) if fetching_image else app_line_starting(app.name)
+        await report("starting", line, None)
+
+        result = await self._engine.compose_up(
+            self._settings.stack_project, compose_path, app.id, recreate=recreate
+        )
+        if not result.ok:
+            return _compose_failure(app, fetching_image, result)
+
+        connect_result = await self._engine.connect_network(network, self_id)
+        if not connect_result.ok:
+            return _docker_unreachable_failure(
+                connect_result.detail
+                or f"could not join the {network!r} network (self_id={self_id!r})"
+            )
+
+        return await self._await_seerr_setup(app, install, kind, report)
+
+    async def _await_seerr_setup(
+        self,
+        app: CatalogApp,
+        install: InstallState,
+        kind: Literal["plex", "jellyfin"],
+        report: Callable[[AppState, str, str | None], Awaitable[None]],
+    ) -> Failure | None:
+        config_dir = self._settings.config_dir
+        start = self._clock()
+        reassured = False
+        line = app_line_starting(app.name)
+        note: str | None = None
+        last_technical: str | None = None
+
+        while True:
+            elapsed = self._clock() - start
+            if elapsed >= self.NEVER_READY_AFTER_SECONDS:
+                logs = await self._engine.logs(app.id, tail=50)
+                technical = logs if last_technical is None else f"{logs}\n{last_technical}"
+                headline, what_to_do = _split_failure_text(failure_never_became_ready(app.name))
+                return Failure(
+                    code="never_became_ready",
+                    headline=headline,
+                    what_to_do=what_to_do,
+                    technical=technical,
+                )
+
+            container = await self._engine.inspect(app.id)
+            candidate_line = line
+            if container.state == "running":
+                gateway = await self._engine.host_gateway(app.id)
+                sign_in = seerr_sign_in(kind, config_dir, jellyfin_host=gateway)
+                if sign_in is None:
+                    # The gateway (or, for Jellyfin, the saved login) isn't
+                    # there yet - the same "still booting" story as a
+                    # container that hasn't answered a real request yet.
+                    candidate_line = app_line_warming_up(app.name)
+                else:
+                    setup = await ensure_seerr_setup(
+                        self._seerr, seerr_base_url(), install.api_keys[app.id], sign_in
+                    )
+                    last_technical = setup.technical
+                    if setup.state == "done":
+                        await report("done", app_line_done(app.name), None)
+                        return None
+                    if setup.state == "not_ours":
+                        return self._seerr_failure(
+                            "seerr_not_ours",
+                            FAILURE_SEERR_NOT_OURS,
+                            technical=setup.technical or "seerr: settings are not ours",
+                        )
+                    if setup.state == "refused":
+                        return self._seerr_failure(
+                            "seerr_setup_refused",
+                            FAILURE_SEERR_SETUP_REFUSED,
+                            technical=setup.technical or "seerr: setup refused",
+                        )
+                    # "waiting": Seerr is running but hasn't answered a real
+                    # request yet.
+                    candidate_line = app_line_warming_up(app.name)
+
+            candidate_note = note
+            if not reassured and elapsed >= self.REASSURANCE_AFTER_SECONDS:
+                reassured = True
+                candidate_note = app_note_slow_start(app.name)
+
+            if candidate_line != line or candidate_note != note:
+                line, note = candidate_line, candidate_note
+                await report("starting", line, note)
+
+            await self._sleep(self.POLL_INTERVAL_SECONDS)
+
+    def _seerr_failure(self, code: FailureCode, message: str, *, technical: str) -> Failure:
+        headline, what_to_do = _split_failure_text(message)
+        return Failure(code=code, headline=headline, what_to_do=what_to_do, technical=technical)
 
     # --- Running an add or a retry -----------------------------------------
 
@@ -3281,6 +3435,8 @@ def _failure_from_payload(payload: dict[str, object]) -> Failure:
                     "jellyfin_not_ours",
                     "jellyfin_setup_refused",
                     "existing_plex_unreachable",
+                    "seerr_not_ours",
+                    "seerr_setup_refused",
                 ),
             ),
         ),

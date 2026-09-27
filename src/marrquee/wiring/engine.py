@@ -17,9 +17,19 @@ import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Final, Protocol
+from typing import Final, Literal, Protocol
 
-from marrquee.catalog import CATALOG, CatalogApp, apps_in_order
+from marrquee.catalog import (
+    CATALOG,
+    EXISTING_PLEX_APP_ID,
+    JELLYFIN_APP_ID,
+    PLEX_APP_ID,
+    SEERR_APP_ID,
+    CatalogApp,
+    apps_in_order,
+    media_server_of,
+    require_port,
+)
 from marrquee.config import Settings
 from marrquee.jellyfin import HttpJellyfinServer, JellyfinServer, jellyfin_base_url, load_jellyfin
 from marrquee.plex import (
@@ -32,7 +42,10 @@ from marrquee.plex import (
 )
 from marrquee.qbittorrent import QBIT_BASE_PREFERENCES
 from marrquee.questions import load_answers, uses_graphics_chip
+from marrquee.recyclarr import quality_profile_name
 from marrquee.seeding import seeding_preferences
+from marrquee.seen_host import load_seen_host
+from marrquee.seerr import HttpSeerrClient, SeerrClient, seerr_base_url
 from marrquee.state import InstallState
 from marrquee.storage import container_media_path, host_media_path
 from marrquee.vpn_control import GluetunControl, NoGluetunControl
@@ -45,6 +58,12 @@ from marrquee.wiring.plex_steps import (
     ensure_plex_libraries,
 )
 from marrquee.wiring.qbit_client import HttpQbitClient, QbitClient
+from marrquee.wiring.seerr_steps import (
+    SeerrPlexTarget,
+    ensure_seerr_arr,
+    ensure_seerr_media_server,
+    seerr_plex_target,
+)
 from marrquee.wiring.steps import (
     StepOutcome,
     app_base_url,
@@ -73,6 +92,7 @@ from marrquee.words import (
     wiring_line_downloader_settings,
     wiring_line_libraries,
     wiring_line_root_folder,
+    wiring_line_seerr,
     wiring_note_still_waking,
     wiring_skip_no_prowlarr,
 )
@@ -111,7 +131,10 @@ class WiringContext:
     at all. `existing_plex` is the owner's own Plex's saved record, loaded
     the same way - only when an existing-Plex task is planned. `settings`
     and `config_dir` are what that task needs to probe a folder and save
-    its own updated record back.
+    its own updated record back. `seerr_gateway` is Seerr's own container's
+    Docker gateway (never Marrquee's own, which `plex_base_url` already
+    covers) and `seerr_host` is the owner's last-seen address - both
+    resolved once per run, only when a Seerr task is actually planned.
     """
 
     client: ArrClient
@@ -129,6 +152,9 @@ class WiringContext:
     existing_plex: ExistingPlex | None = None
     settings: Settings | None = None
     config_dir: Path | None = None
+    seerr: SeerrClient | None = None
+    seerr_gateway: str | None = None
+    seerr_host: str | None = None
 
 
 class WiringTask(Protocol):
@@ -525,6 +551,181 @@ class ExistingPlexLibrariesTask:
         )
 
 
+def _seerr_client_precheck(ctx: WiringContext) -> StepOutcome | None:
+    """The one check every Seerr task makes before it ever calls Seerr -
+    mirrors `_plex_precheck`/`_jellyfin_precheck`. Never transient: nothing
+    here talks to Seerr at all.
+    """
+    if ctx.seerr is None or SEERR_APP_ID not in ctx.state.api_keys:
+        return StepOutcome(
+            state="error",
+            note=wiring_failure_unreachable("Seerr"),
+            technical="no seerr client or key",
+            changed=False,
+            transient=False,
+        )
+    return None
+
+
+def _seerr_media_precheck(ctx: WiringContext, media_id: str) -> StepOutcome | None:
+    """The extra checks only Seerr's media-server task needs, on top of
+    `_seerr_client_precheck`: the owner's own Plex record when that's the
+    media server in play, and a gateway address for anything Seerr must
+    reach on the host network (every media server except a remote or
+    https-only existing Plex).
+    """
+    outcome = _seerr_client_precheck(ctx)
+    if outcome is not None:
+        return outcome
+
+    needs_gateway = True
+    if media_id == EXISTING_PLEX_APP_ID:
+        if ctx.existing_plex is None:
+            return StepOutcome(
+                state="error",
+                note=WIRING_EXISTING_PLEX_MISSING,
+                technical="no saved existing-plex record",
+                changed=False,
+                transient=False,
+            )
+        needs_gateway = ctx.existing_plex.on_this_nas
+
+    if needs_gateway and ctx.seerr_gateway is None:
+        return StepOutcome(
+            state="error",
+            note=wiring_failure_unreachable("Seerr"),
+            technical="no address for seerr's gateway",
+            changed=False,
+            transient=False,
+        )
+    return None
+
+
+async def _seerr_plex_expected_machine_id(ctx: WiringContext) -> str | None:
+    """The machine id Marrquee's OWN (already-working) connection to Plex
+    reports, so a Seerr pointed at the wrong Plex can be told apart from one
+    that's merely still starting up. `None` when Marrquee's own connection
+    isn't resolved either - Seerr's write is still attempted; only the
+    read-back comparison is skipped.
+    """
+    if ctx.plex is None or ctx.plex_base_url is None:
+        return None
+    identity = await ctx.plex.identity(ctx.plex_base_url)
+    return identity.machine_id if identity is not None else None
+
+
+@dataclass(frozen=True)
+class SeerrMediaServerTask:
+    """Seerr's connection to whichever media server the install actually
+    has - new Plex, new Jellyfin, or the owner's own already-running Plex -
+    plus every movie/TV library it can see there.
+    """
+
+    key: str
+    line: str
+    involved: tuple[str, ...]
+
+    @property
+    def about(self) -> tuple[str, ...]:
+        return self.involved
+
+    async def apply(self, ctx: WiringContext) -> StepOutcome:
+        media_id = self.involved[1]
+        outcome = _seerr_media_precheck(ctx, media_id)
+        if outcome is not None:
+            return outcome
+        assert ctx.seerr is not None
+
+        media_app = ctx.apps[media_id]
+        server, target, expected_machine_id = await self._resolve_target(ctx, media_id, media_app)
+        return await ensure_seerr_media_server(
+            ctx.seerr,
+            seerr_base_url(),
+            ctx.state.api_keys[SEERR_APP_ID],
+            server,
+            plex_target=target,
+            expected_machine_id=expected_machine_id,
+            owner_host=ctx.seerr_host,
+            name=media_app.name,
+        )
+
+    @staticmethod
+    async def _resolve_target(
+        ctx: WiringContext, media_id: str, media_app: CatalogApp
+    ) -> tuple[Literal["plex", "jellyfin"], SeerrPlexTarget | None, str | None]:
+        """Which server Seerr connects as, the address it reaches it at, and
+        (Plex only) the machine id that address should answer with -
+        resolved from Seerr's own network position, never Marrquee's.
+        """
+        if media_id == JELLYFIN_APP_ID:
+            gateway = ctx.seerr_gateway
+            target = (
+                SeerrPlexTarget(ip=gateway, port=require_port(media_app), use_ssl=False)
+                if gateway is not None
+                else None
+            )
+            return "jellyfin", target, None
+
+        if media_id == PLEX_APP_ID:
+            gateway = ctx.seerr_gateway
+            target = (
+                SeerrPlexTarget(ip=gateway, port=require_port(media_app), use_ssl=False)
+                if gateway is not None
+                else None
+            )
+            machine_id = await _seerr_plex_expected_machine_id(ctx)
+            return "plex", target, machine_id
+
+        assert ctx.existing_plex is not None  # the precheck already proved this
+        record = ctx.existing_plex
+        if record.on_this_nas:
+            gateway = ctx.seerr_gateway
+            target = (
+                SeerrPlexTarget(ip=gateway, port=record.port, use_ssl=False)
+                if gateway is not None
+                else None
+            )
+        else:
+            target = seerr_plex_target(record.base_url)
+        return "plex", target, record.machine_id
+
+
+@dataclass(frozen=True)
+class SeerrArrTask:
+    """Seerr's connection to one installed Sonarr or Radarr - the known
+    key, its own library folder, and a quality profile.
+    """
+
+    key: str
+    line: str
+    involved: tuple[str, ...]
+
+    @property
+    def about(self) -> tuple[str, ...]:
+        return self.involved
+
+    async def apply(self, ctx: WiringContext) -> StepOutcome:
+        outcome = _seerr_client_precheck(ctx)
+        if outcome is not None:
+            return outcome
+        assert ctx.seerr is not None
+
+        arr_id = self.involved[1]
+        arr = ctx.apps[arr_id]
+        preferred_profile = (
+            quality_profile_name(arr_id, ctx.answers) if "recyclarr" in ctx.state.app_ids else None
+        )
+        return await ensure_seerr_arr(
+            ctx.seerr,
+            seerr_base_url(),
+            ctx.state.api_keys[SEERR_APP_ID],
+            arr,
+            ctx.state.api_keys[arr_id],
+            preferred_profile=preferred_profile,
+            owner_host=ctx.seerr_host,
+        )
+
+
 @dataclass(frozen=True)
 class ExplainTask:
     """A step whose outcome is always `skipped`, with a fixed plain-language note.
@@ -682,6 +883,26 @@ def plan_wiring(
             )
         )
 
+    if SEERR_APP_ID in state.app_ids:
+        media_app = media_server_of(state.app_ids)
+        if media_app is not None:
+            tasks.append(
+                SeerrMediaServerTask(
+                    key="media-server:seerr",
+                    line=wiring_line_seerr(media_app.name),
+                    involved=(SEERR_APP_ID, media_app.id),
+                )
+            )
+        for app in apps:
+            if app.id in ("sonarr", "radarr"):
+                tasks.append(
+                    SeerrArrTask(
+                        key=f"seerr:{app.id}",
+                        line=wiring_line_seerr(app.name),
+                        involved=(SEERR_APP_ID, app.id),
+                    )
+                )
+
     if only_app is None:
         return tuple(tasks)
     return tuple(task for task in tasks if only_app in task.about)
@@ -708,6 +929,8 @@ class WiringEngine:
         jellyfin: JellyfinServer | None = None,
         jellyfin_address: Callable[[], Awaitable[str | None]] | None = None,
         settings: Settings | None = None,
+        seerr: SeerrClient | None = None,
+        seerr_address: Callable[[], Awaitable[str | None]] | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         clock: Callable[[], float] = time.monotonic,
         ready_timeout: float = 180.0,
@@ -725,6 +948,8 @@ class WiringEngine:
         self._jellyfin = jellyfin if jellyfin is not None else HttpJellyfinServer()
         self._jellyfin_address = jellyfin_address
         self._settings = settings
+        self._seerr = seerr if seerr is not None else HttpSeerrClient()
+        self._seerr_address = seerr_address
         self._sleep = sleep
         self._clock = clock
         self._ready_timeout = ready_timeout
@@ -800,6 +1025,17 @@ class WiringEngine:
         if any("existing-plex" in task.about for task in tasks) and self._config_dir is not None:
             resolved_existing_plex = load_existing_plex(self._config_dir)
 
+        # Same shape again - an install with no Seerr never calls
+        # `seerr_address()` or reads seen_host.json at all.
+        resolved_seerr_gateway: str | None = None
+        resolved_seerr_host: str | None = None
+        if any("seerr" in task.about for task in tasks):
+            resolved_seerr_gateway = (
+                await self._seerr_address() if self._seerr_address is not None else None
+            )
+            if self._config_dir is not None:
+                resolved_seerr_host = load_seen_host(self._config_dir)
+
         ctx = WiringContext(
             client=self._client,
             state=state,
@@ -816,6 +1052,9 @@ class WiringEngine:
             existing_plex=resolved_existing_plex,
             settings=self._settings,
             config_dir=self._config_dir,
+            seerr=self._seerr,
+            seerr_gateway=resolved_seerr_gateway,
+            seerr_host=resolved_seerr_host,
         )
         ready_apps: set[str] = set()
         total = len(tasks)

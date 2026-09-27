@@ -32,6 +32,7 @@ from test_deploy import (
 )
 from test_deploy_recyclarr import _RecordingSyncTrigger
 
+from marrquee import deploy
 from marrquee.catalog import AppRule, CatalogApp, get_app
 from marrquee.config import Settings
 from marrquee.deploy import (
@@ -42,9 +43,9 @@ from marrquee.deploy import (
     FakeReadinessProbe,
     WiringGap,
 )
-from marrquee.docker_client import ComposeResult
+from marrquee.docker_client import ComposeResult, ContainerSnapshot, DockerStatus, FakeDockerEngine
 from marrquee.jellyfin import FakeJellyfinServer, JellyfinResponse
-from marrquee.login import SavedLogin, load_login, save_login
+from marrquee.login import SavedLogin, load_login, record_applied, save_login
 from marrquee.login_apply import FakeLoginApplier, LoginApplyResult
 from marrquee.plex import (
     ExistingPlex,
@@ -58,12 +59,14 @@ from marrquee.plex import (
 )
 from marrquee.questions import save_step_answers
 from marrquee.recyclarr import recyclarr_config_host_path
+from marrquee.seerr import FakeSeerrClient
 from marrquee.state import InstallState, load_state, save_state, write_json_atomic
 from marrquee.storage import read_marker, to_host_view
 from marrquee.vpn import TunnelPlace
 from marrquee.vpn_control import FakeGluetunControl, GluetunControl, NoGluetunControl
 from marrquee.wiring import WiringStep
 from marrquee.wiring.qbit_client import HttpQbitClient, QbitClient
+from marrquee.words import PHASE_HEADLINE_FINALE, STATUS_CHIP_DONE, app_line_done
 
 # --- A wiring runner that scripts `only_app` and one gap ---------------------
 
@@ -1134,3 +1137,106 @@ async def test_start_during_an_add_starts_nothing(tmp_path: Path) -> None:
     # activity comes from the add already in flight.
     new_calls = engine.calls[len(before_calls) :]
     assert not any(name == "compose_up" and args[2] != "radarr" for name, args in new_calls)
+
+
+# --- Seerr: cancel keeps the folder -------------------------------------------
+
+
+@pytest.fixture
+def _stub_seerr_folder_chown(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Seerr's config folder is owned by a fixed uid rather than the
+    drive's own puid:pgid, so `build_folders` chowns it through the real
+    `os.chown` - a non-root test process can't do that chown. This patches
+    `deploy.py`'s own `build_folders` reference, for the length of this one
+    test, to a wrapper that never calls the real `os.chown`; production
+    keeps the real default untouched.
+    """
+    real_build_folders = deploy.build_folders
+
+    def _without_chowning_for_real(*args: object, **kwargs: object) -> object:
+        kwargs["chown"] = lambda *_a: None
+        return real_build_folders(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(deploy, "build_folders", _without_chowning_for_real)
+
+
+async def test_cancel_of_a_failed_seerr_add_keeps_the_folder(
+    tmp_path: Path, _stub_seerr_folder_chown: None
+) -> None:
+    """A failed Seerr add still creates and chowns its config folder before
+    ever calling compose - cancelling that add must remove the container it
+    created but never touch that folder.
+    """
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+    install = _install_state(("sonarr", "jellyfin"), root)
+    save_state(settings.config_dir, install)
+    saved = save_login(settings.config_dir, "owner", "s3cret-password-1", honor_reset=None)
+    record_applied(settings.config_dir, "jellyfin", saved.generation)
+
+    def _done(app_id: str) -> AppProgress:
+        app = get_app(app_id)
+        return AppProgress(
+            app_id=app.id,
+            name=app.name,
+            state="done",
+            chip=STATUS_CHIP_DONE,
+            line=app_line_done(app.name),
+            note=None,
+            port=app.port,
+        )
+
+    write_json_atomic(
+        settings.config_dir / "deploy.json",
+        dataclasses.asdict(
+            DeploySnapshot(
+                run_id="run-1",
+                phase="finale",
+                apps=(_done("sonarr"), _done("jellyfin")),
+                headline=PHASE_HEADLINE_FINALE,
+                detail=None,
+                failure=None,
+                started_at="2026-09-27T00:00:00+00:00",
+                finished_at="2026-09-27T00:05:00+00:00",
+            )
+        ),
+    )
+
+    engine = FakeDockerEngine(
+        DockerStatus(connected=True),
+        images={get_app("sonarr").image, get_app("jellyfin").image, get_app("seerr").image},
+        frames={
+            "seerr": [
+                ContainerSnapshot(
+                    name="seerr", exists=False, state=None, exit_code=None, image=None, detail=None
+                )
+            ]
+        },
+        self_container_id="marrquee",
+    )
+    engine._compose_results["seerr"] = ComposeResult(  # type: ignore[attr-defined]
+        ok=False, exit_code=1, output="Error: something went wrong"
+    )
+    clock = _FakeClock()
+    manager = DeployManager(
+        settings, engine, clock=clock.time, sleep=clock.sleep, login=FakeLoginApplier()
+    )
+    manager._seerr = FakeSeerrClient({})  # type: ignore[attr-defined]
+
+    manager.add_app("seerr")
+    failed = await _finish_add(manager)
+    assert failed.adding is not None and failed.adding.state == "error"
+    assert failed.adding.failure is not None
+    assert failed.adding.failure.code == "compose_failed"
+
+    seerr_folder = to_host_view(settings, str(root)) / "marrquee" / "apps" / "seerr"
+    assert seerr_folder.is_dir()  # build_folders already created it, before compose ever ran
+
+    ok = await manager.cancel_add()
+    assert ok is True
+    assert any(call[0] == "remove_container" and call[1] == ("seerr",) for call in engine.calls)
+    assert seerr_folder.is_dir()  # cancel never deletes a folder
+
+    after_cancel = load_state(settings.config_dir)
+    assert after_cancel is not None
+    assert set(after_cancel.app_ids) == {"sonarr", "jellyfin"}

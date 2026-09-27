@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 from test_deploy import _fresh_root, _install_state, _run_to_terminal, _settings, _StatefulEngine
@@ -21,7 +21,13 @@ from test_deploy_add import _finish_add
 
 from marrquee.catalog import AppRule, get_app
 from marrquee.config import Settings
-from marrquee.deploy import DeployManager, Disconnect, FakeReadinessProbe
+from marrquee.deploy import (
+    AppProgress,
+    DeployManager,
+    DeploySnapshot,
+    Disconnect,
+    FakeReadinessProbe,
+)
 from marrquee.docker_client import ComposeResult
 from marrquee.links import LinkCard, load_links, save_links
 from marrquee.login import save_login
@@ -34,7 +40,8 @@ from marrquee.plex import (
     load_existing_plex,
     save_existing_plex,
 )
-from marrquee.state import load_state, save_state
+from marrquee.state import load_state, save_state, write_json_atomic
+from marrquee.words import STATUS_CHIP_DONE, app_line_done
 
 _BASE_URL = "http://192.168.1.20:32400"
 
@@ -363,6 +370,77 @@ async def test_disconnect_is_refused_while_another_app_needs_it(
 
     assert result.outcome == "needed"
     assert result.needed_by == get_app("sonarr").name
+    after = load_state(settings.config_dir)
+    assert after is not None
+    assert "existing-plex" in after.app_ids
+
+
+def _seerr_progress() -> AppProgress:
+    seerr = get_app("seerr")
+    return AppProgress(
+        app_id=seerr.id,
+        name=seerr.name,
+        state="done",
+        chip=STATUS_CHIP_DONE,
+        line=app_line_done(seerr.name),
+        note=None,
+        port=seerr.port,
+    )
+
+
+def _existing_plex_progress() -> AppProgress:
+    existing_plex = get_app("existing-plex")
+    return AppProgress(
+        app_id=existing_plex.id,
+        name=existing_plex.name,
+        state="done",
+        chip=STATUS_CHIP_DONE,
+        line=app_line_done(existing_plex.name),
+        note=None,
+        port=existing_plex.port,
+    )
+
+
+async def test_disconnect_is_refused_while_the_real_seerr_entry_needs_it(tmp_path: Path) -> None:
+    """Pins `disconnect`'s "needed" loop against Seerr's own, real catalog
+    rule (`needs_any(MEDIA_SERVER_APP_IDS)`) - no monkeypatched stand-in.
+
+    Built directly from a persisted snapshot rather than a real run: Seerr's
+    catalog entry chowns its config folder to a fixed uid (1000), and a real
+    `build_folders` call in a non-root test process cannot chown to a uid it
+    doesn't own.
+    """
+    settings = _settings(tmp_path)
+    save_existing_plex(settings.config_dir, _record())
+    install = _install_state(("existing-plex", "seerr"), PurePosixPath("/volume1/media"))
+    save_state(settings.config_dir, install)
+    write_json_atomic(
+        settings.config_dir / "deploy.json",
+        dataclasses.asdict(
+            DeploySnapshot(
+                run_id="run-1",
+                phase="finale",
+                apps=(_existing_plex_progress(), _seerr_progress()),
+                headline="Now showing: your media server",
+                detail=None,
+                failure=None,
+                started_at="2026-09-23T00:00:00+00:00",
+                finished_at="2026-09-23T00:05:00+00:00",
+            )
+        ),
+    )
+    manager = DeployManager(
+        settings,
+        _StatefulEngine(()),
+        probe=FakeReadinessProbe(default=True),
+        login=FakeLoginApplier(),
+        plex_server=FakePlexServer(identities_by_url={_BASE_URL: PlexIdentity(True, "m1")}),
+    )
+
+    result = await manager.disconnect("existing-plex")
+
+    assert result.outcome == "needed"
+    assert result.needed_by == get_app("seerr").name
     after = load_state(settings.config_dir)
     assert after is not None
     assert "existing-plex" in after.app_ids

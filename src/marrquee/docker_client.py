@@ -1049,6 +1049,7 @@ class FakeDockerEngine:
         exec_exit_codes: Mapping[str, int] | None = None,
         exec_running_polls: int = 0,
         host_gateway: str | None = "172.18.0.1",
+        host_gateways: Mapping[str, str] | None = None,
         host_paths: Iterable[str] = (),
     ) -> None:
         self._status = status
@@ -1086,7 +1087,19 @@ class FakeDockerEngine:
         self._network_exists = network_exists
         self._self_container_id = self_container_id
         self._host_gateway = host_gateway
+        # A per-container override, for a test that needs Marrquee's own
+        # gateway and another container's (Seerr's) to genuinely differ -
+        # on a real NAS, Marrquee's own gateway can be 127.0.0.1, which is
+        # never a usable address from inside a different container. Falls
+        # back to `_host_gateway` for any container not named here.
+        self._host_gateways: dict[str, str] = dict(host_gateways) if host_gateways else {}
         self._host_paths = frozenset(host_paths)
+        # Every service this fake has ever `compose_up`'d successfully - a
+        # real container joins the stack's own network as a side effect of
+        # that same `up`, so it (like Marrquee's own self container) has a
+        # gateway to answer; a container nobody has ever composed up has no
+        # networks at all (docker-fakes-model-state).
+        self._composed_up: set[str] = set()
         self.calls: list[tuple[str, tuple[object, ...]]] = []
         # What a real Docker daemon uses to decide whether a recreate is a
         # no-op: the service's own rendered config, as last seen. Tracked
@@ -1155,6 +1168,7 @@ class FakeDockerEngine:
         # first successful `up` - whichever service happens to be first -
         # not before, and not conditional on which one it is.
         self._network_exists = True
+        self._composed_up.add(service)
         # Tracked on EVERY successful call, recreate or not - a later
         # recreate needs a genuine baseline to compare against, including
         # one set by the plain `compose up --no-recreate` an initial deploy
@@ -1259,9 +1273,11 @@ class FakeDockerEngine:
     async def host_gateway(self, container: str) -> str | None:
         self.calls.append(("host_gateway", (container,)))
         # An unknown container has no networks at all (docker-fakes-model-
-        # state) - only Marrquee's own self container ever gets an answer.
-        if container == self._self_container_id:
-            return self._host_gateway
+        # state) - only Marrquee's own self container, or a container this
+        # fake has itself brought up through `compose_up`, ever gets an
+        # answer.
+        if container == self._self_container_id or container in self._composed_up:
+            return self._host_gateways.get(container, self._host_gateway)
         return None
 
     async def probe_host_path(self, self_container: str, host_path: str) -> HostPathProbe:

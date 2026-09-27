@@ -3092,6 +3092,427 @@ jobs:
             exit 1
           fi
 
+      # The cycle's finale: Seerr is added through the real Hub install
+      # endpoint alone, the same as every other app in this job - a script
+      # that poked Seerr's API directly would prove nothing about
+      # Marrquee's own bring-up. Seerr has no readiness probe of its own
+      # (deploy.py's generic HttpReadinessProbe asks a route Seerr does not
+      # have), so its own bring-up is exactly what this step proves. A
+      # Plex-backed Seerr (new Plex, or the owner's own Plex) is wired the
+      # same way in the real code, but stays PENDING the owner's NAS: CI's
+      # Plex is long gone by now (`docker rm -f plex` above), and Plex and
+      # Jellyfin never run at once.
+      - name: Seerr is set up with Jellyfin, Sonarr and Radarr
+        run: |
+          set -euo pipefail
+
+          if ! host_probe=$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: marrquee-ci.local:7788' http://127.0.0.1:7788/) || [ -z "$host_probe" ]; then
+            echo "::error::couldn't open the Hub as marrquee-ci.local to remember that address for Seerr"
+            exit 1
+          fi
+          if [ "$host_probe" != "200" ]; then
+            echo "::error::GET / as marrquee-ci.local returned ${host_probe}, expected 200"
+            exit 1
+          fi
+
+          if ! response=$(curl -s -w '\n%{http_code}' -X POST http://127.0.0.1:7788/api/hub/apps/seerr/install -H 'Content-Type: application/json' -d '{"answers":{}}') || [ -z "$response" ]; then
+            echo "::error::couldn't reach Marrquee to install Seerr"
+            exit 1
+          fi
+          code=$(echo "$response" | tail -n1)
+          body=$(echo "$response" | sed '$d')
+          echo "seerr install response (${code}): ${body}"
+          if [ "$code" != "202" ]; then
+            echo "::error::POST /api/hub/apps/seerr/install returned ${code}, expected 202: ${body}"
+            exit 1
+          fi
+
+          state=""
+          add_state=""
+          note=""
+          busy=""
+          line=""
+          for _ in $(seq 1 120); do
+            status=$(curl -fsS http://127.0.0.1:7788/api/hub/status) || status=""
+            if [ -n "$status" ]; then
+              seerr=$(echo "$status" | jq -c '.apps[] | select(.app_id == "seerr")')
+              state=$(echo "$seerr" | jq -r '.state')
+              add_state=$(echo "$seerr" | jq -r '.add_state')
+              note=$(echo "$seerr" | jq -r '.note')
+              busy=$(echo "$status" | jq -r '.busy')
+              line=$(echo "$seerr" | jq -r '.line')
+              echo "seerr state: $state / add_state: $add_state / note: $note / busy: $busy"
+              if [ "$add_state" = "error" ]; then
+                MESSAGE="adding Seerr failed: ${line}" \
+                  python3 -c "import os; text = os.environ['MESSAGE'][:500].replace('%', '%25').replace(chr(13), '%0D').replace(chr(10), '%0A').replace('::', ': :'); print('::error::' + text)"
+                exit 1
+              fi
+              if [ "$state" = "up" ] && [ "$add_state" = "null" ] && [ -z "$note" ] && [ "$busy" = "false" ]; then
+                break
+              fi
+            fi
+            sleep 5
+          done
+          if [ "$state" != "up" ] || [ "$add_state" != "null" ] || [ -n "$note" ] || [ "$busy" != "false" ]; then
+            echo "::error::Seerr never finished adding within 10 minutes (state=${state}, add_state=${add_state}, note=${note}, busy=${busy})"
+            exit 1
+          fi
+
+          seerr_dir="$RUNNER_TEMP/marrquee-smoke/media/marrquee/apps/seerr"
+          if ! seerr_uid=$(stat -c '%u' "$seerr_dir") || [ -z "$seerr_uid" ]; then
+            echo "::error::couldn't stat seerr's own config folder to check its owner"
+            exit 1
+          fi
+          if [ "$seerr_uid" != "1000" ]; then
+            echo "::error::seerr's config folder was not owned by uid 1000 (got: ${seerr_uid})"
+            exit 1
+          fi
+          if [ ! -e "$seerr_dir/settings.json" ]; then
+            echo "::error::Seerr couldn't write its settings folder"
+            exit 1
+          fi
+
+          if ! seerr_init=$(docker inspect -f '{{.HostConfig.Init}}' seerr) || [ -z "$seerr_init" ]; then
+            echo "::error::couldn't inspect seerr's container for its init flag"
+            exit 1
+          fi
+          if [ "$seerr_init" != "true" ]; then
+            echo "::error::seerr's container did not run with an init process"
+            exit 1
+          fi
+
+          if ! seerr_port=$(docker inspect -f '{{index .HostConfig.PortBindings "5055/tcp"}}' seerr) || [ -z "$seerr_port" ]; then
+            echo "::error::couldn't inspect seerr's container for its port binding"
+            exit 1
+          fi
+
+          if ! seerr_gateway=$(docker inspect -f '{{(index .NetworkSettings.Networks "marrquee").Gateway}}' seerr) || [ -z "$seerr_gateway" ]; then
+            echo "::error::couldn't inspect seerr's own gateway address on the marrquee network"
+            exit 1
+          fi
+
+          compose_file="$RUNNER_TEMP/marrquee-smoke/media/marrquee/compose.yaml"
+          if ! command -v grep > /dev/null; then
+            echo "::error::grep is not available on the runner to check compose.yaml for seerr"
+            exit 1
+          fi
+          if ! grep -F -q 'seerr:' "$compose_file"; then
+            echo "::error::the positive control failed - seerr: is missing from compose.yaml, so the check below would prove nothing"
+            exit 1
+          fi
+          set +e
+          grep -F -q 'init: true' "$compose_file"
+          seerr_init_rendered=$?
+          set -e
+          case "$seerr_init_rendered" in
+            0) ;;
+            1) echo "::error::seerr's compose service was never rendered with init: true"; exit 1 ;;
+            *) echo "::error::couldn't check compose.yaml for seerr's init: true (grep exit ${seerr_init_rendered})"; exit 1 ;;
+          esac
+
+          cat > "$RUNNER_TEMP/ci_seerr_setup.py" <<'PY'
+          import asyncio
+          import os
+
+          from marrquee.config import Settings
+          from marrquee.login import load_login
+          from marrquee.seerr import HttpSeerrClient, seerr_base_url
+          from marrquee.state import load_state
+
+
+          async def main() -> None:
+              settings = Settings.from_env()
+              state = load_state(settings.config_dir)
+              if state is None:
+                  raise SystemExit("no install.json to read seerr's key from")
+              api_key = state.api_keys["seerr"]
+
+              login = load_login(settings.config_dir).login
+              if login is None:
+                  raise SystemExit("no login saved to sign seerr in with")
+
+              seerr_gateway = os.environ["SEERR_GATEWAY"]
+              base_url = seerr_base_url()
+              client = HttpSeerrClient()
+
+              public = await client.request("GET", base_url, "api/v1/settings/public", api_key=None)
+              if not public.ok or not isinstance(public.payload, dict):
+                  raise SystemExit(f"seerr's public settings were unreachable (status {public.status})")
+              if public.payload.get("initialized") is not True:
+                  raise SystemExit("seerr was never marked initialized")
+              if public.payload.get("mediaServerType") != 2:
+                  raise SystemExit("seerr's media server type is not jellyfin")
+              if public.payload.get("localLogin") is not False:
+                  raise SystemExit("seerr still allows a local sign-in")
+
+              main_settings = await client.request("GET", base_url, "api/v1/settings/main", api_key=api_key)
+              if not main_settings.ok or not isinstance(main_settings.payload, dict):
+                  raise SystemExit(f"seerr's main settings were unreachable (status {main_settings.status})")
+              if main_settings.payload.get("defaultPermissions") != 32:
+                  raise SystemExit("seerr's requests do not wait for the owner's approval")
+              if main_settings.payload.get("newPlexLogin") is not True:
+                  raise SystemExit("seerr does not let people it's shared with sign in")
+
+              jellyfin_settings = await client.request(
+                  "GET", base_url, "api/v1/settings/jellyfin", api_key=api_key
+              )
+              if not jellyfin_settings.ok or not isinstance(jellyfin_settings.payload, dict):
+                  raise SystemExit(
+                      f"seerr's jellyfin settings were unreachable (status {jellyfin_settings.status})"
+                  )
+              if jellyfin_settings.payload.get("ip") != seerr_gateway:
+                  raise SystemExit("seerr's jellyfin connection does not point at its own gateway")
+              if jellyfin_settings.payload.get("port") != 8096:
+                  raise SystemExit("seerr's jellyfin connection is not on port 8096")
+              if jellyfin_settings.payload.get("externalHostname") != "http://marrquee-ci.local:8096":
+                  raise SystemExit("seerr's jellyfin connection does not use the remembered address")
+              libraries = jellyfin_settings.payload.get("libraries")
+              enabled_count = (
+                  sum(
+                      1
+                      for library in libraries
+                      if isinstance(library, dict) and library.get("enabled") is True
+                  )
+                  if isinstance(libraries, list)
+                  else 0
+              )
+              if enabled_count != 2:
+                  raise SystemExit("seerr does not have exactly two enabled jellyfin libraries")
+
+              sonarr_settings = await client.request(
+                  "GET", base_url, "api/v1/settings/sonarr", api_key=api_key
+              )
+              sonarr_entries = sonarr_settings.payload if isinstance(sonarr_settings.payload, list) else []
+              if not sonarr_settings.ok or len(sonarr_entries) != 1:
+                  raise SystemExit("seerr does not have exactly one sonarr entry")
+              sonarr_entry = sonarr_entries[0]
+              if sonarr_entry.get("hostname") != "sonarr":
+                  raise SystemExit("seerr's sonarr entry does not point at sonarr")
+              if sonarr_entry.get("activeDirectory") != "/data/media/tv":
+                  raise SystemExit("seerr's sonarr entry does not use the tv library folder")
+              if sonarr_entry.get("activeProfileName") != "WEB-1080p":
+                  raise SystemExit("seerr's sonarr entry is not on Recyclarr's chosen profile")
+
+              radarr_settings = await client.request(
+                  "GET", base_url, "api/v1/settings/radarr", api_key=api_key
+              )
+              radarr_entries = radarr_settings.payload if isinstance(radarr_settings.payload, list) else []
+              if not radarr_settings.ok or len(radarr_entries) != 1:
+                  raise SystemExit("seerr does not have exactly one radarr entry")
+              radarr_entry = radarr_entries[0]
+              if radarr_entry.get("activeDirectory") != "/data/media/movies":
+                  raise SystemExit("seerr's radarr entry does not use the movies library folder")
+              if radarr_entry.get("activeProfileName") != "UHD Bluray + WEB":
+                  raise SystemExit("seerr's radarr entry is not on Recyclarr's chosen profile")
+
+              auth = await client.request(
+                  "POST",
+                  base_url,
+                  "api/v1/auth/jellyfin",
+                  api_key=None,
+                  json_body={
+                      "username": login.username,
+                      "password": login.password,
+                      "hostname": seerr_gateway,
+                      "port": 8096,
+                      "useSsl": False,
+                      "urlBase": "",
+                      "serverType": 2,
+                  },
+              )
+              if not auth.ok:
+                  raise SystemExit(f"signing in to seerr with the one login failed (status {auth.status})")
+
+              # Each printed verdict is its own real comparison, never a bare
+              # `True` - a mutation that hollowed one of the `if` checks
+              # above out to `if False:` would still leave the raise
+              # unreached, but it cannot also make ITS OWN line here read as
+              # passing, because this expression is evaluated fresh.
+              initialized_ok = public.payload.get("initialized") is True
+              local_login_off = public.payload.get("localLogin") is False
+              default_permissions_ok = main_settings.payload.get("defaultPermissions") == 32
+              sonarr_ok = sonarr_entry.get("activeProfileName") == "WEB-1080p"
+              radarr_ok = radarr_entry.get("activeProfileName") == "UHD Bluray + WEB"
+              auth_ok = auth.ok
+
+              print(f"initialized_ok={initialized_ok}")
+              print(f"local_login_off={local_login_off}")
+              print(f"default_permissions_ok={default_permissions_ok}")
+              print(f"enabled_library_count={enabled_count}")
+              print(f"sonarr_ok={sonarr_ok}")
+              print(f"radarr_ok={radarr_ok}")
+              print(f"auth_ok={auth_ok}")
+
+
+          asyncio.run(main())
+          PY
+          docker cp "$RUNNER_TEMP/ci_seerr_setup.py" marrquee-stack-smoke:/tmp/ci_seerr_setup.py
+
+          if ! setup_output=$(docker exec -e SEERR_GATEWAY="$seerr_gateway" marrquee-stack-smoke python3 /tmp/ci_seerr_setup.py 2>&1) || [ -z "$setup_output" ]; then
+            echo "$setup_output"
+            MESSAGE="Seerr's own setup check failed: ${setup_output}" \
+              python3 -c "import os; text = os.environ['MESSAGE'][:800].replace('%', '%25').replace(chr(13), '%0D').replace(chr(10), '%0A').replace('::', ': :'); print('::error::' + text)"
+            exit 1
+          fi
+          echo "$setup_output"
+
+      # TMDB 603 (The Matrix) and 13 (Forrest Gump) are long-stable ids - no
+      # indexer exists in this job, so Radarr searches and finds nothing,
+      # which is harmless. Runner internet to TMDB is itself an
+      # unverifiable condition, and gets its own ::error:: below rather than
+      # being folded into a generic failure.
+      - name: A request in Seerr reaches Radarr, and a shared person's request waits for you
+        run: |
+          set -euo pipefail
+
+          cat > "$RUNNER_TEMP/ci_seerr_request.py" <<'PY'
+          import asyncio
+          import secrets
+
+          import httpx
+
+          from marrquee.config import Settings
+          from marrquee.docker_client import SocketDockerEngine
+          from marrquee.jellyfin import HttpJellyfinServer, jellyfin_base_url, load_jellyfin
+          from marrquee.plex import plex_host_address
+          from marrquee.seerr import HttpSeerrClient, seerr_base_url
+          from marrquee.state import load_state
+
+
+          async def main() -> None:
+              settings = Settings.from_env()
+              state = load_state(settings.config_dir)
+              if state is None:
+                  raise SystemExit("no install.json to read the api keys from")
+              seerr_key = state.api_keys["seerr"]
+              radarr_key = state.api_keys["radarr"]
+              seerr_url = seerr_base_url()
+
+              seerr_client = HttpSeerrClient()
+              owner_request = await seerr_client.request(
+                  "POST",
+                  seerr_url,
+                  "api/v1/request",
+                  api_key=seerr_key,
+                  json_body={"mediaType": "movie", "mediaId": 603},
+              )
+              if not owner_request.ok or owner_request.status != 201:
+                  raise SystemExit(f"the owner's request was refused (status {owner_request.status})")
+              if not isinstance(owner_request.payload, dict) or owner_request.payload.get("status") != 2:
+                  raise SystemExit("the owner's own request was not auto-approved")
+
+              # Radarr's key travels only in the header - never the query
+              # string, which curl-style tools and access logs both echo in
+              # the clear.
+              radarr_headers = {"X-Api-Key": radarr_key}
+              radarr_got_it = False
+              async with httpx.AsyncClient(timeout=10.0) as radarr_client:
+                  profiles_response = await radarr_client.get(
+                      "http://radarr:7878/api/v3/qualityprofile", headers=radarr_headers
+                  )
+                  if profiles_response.status_code != 200:
+                      raise SystemExit(
+                          "couldn't read Radarr's quality profiles "
+                          f"(status {profiles_response.status_code})"
+                      )
+                  profile_names = {
+                      profile["id"]: profile["name"] for profile in profiles_response.json()
+                  }
+
+                  for _ in range(24):
+                      radarr_response = await radarr_client.get(
+                          "http://radarr:7878/api/v3/movie",
+                          params={"tmdbId": "603"},
+                          headers=radarr_headers,
+                      )
+                      if radarr_response.status_code == 200:
+                          movies = radarr_response.json()
+                          if movies:
+                              profile_id = movies[0].get("qualityProfileId")
+                              radarr_got_it = profile_names.get(profile_id) == "UHD Bluray + WEB"
+                              if radarr_got_it:
+                                  break
+                      await asyncio.sleep(5)
+
+              engine = SocketDockerEngine(settings.docker_socket, compose_binary=settings.compose_binary)
+              self_id = await engine.self_container_id()
+              address = await plex_host_address(engine, self_id)
+              if address is None:
+                  raise SystemExit("Marrquee could not work out its own reachable address for Jellyfin")
+              jellyfin_url = jellyfin_base_url(address)
+              jellyfin_record = load_jellyfin(settings.config_dir)
+              if jellyfin_record is None:
+                  raise SystemExit("no jellyfin.json was saved to create the friend's account")
+
+              seerr_gateway = await engine.host_gateway("seerr")
+              if seerr_gateway is None:
+                  raise SystemExit("could not read seerr's own gateway address to sign the friend in")
+
+              friend_password = secrets.token_hex(16)
+              jellyfin_server = HttpJellyfinServer()
+              new_user = await jellyfin_server.request(
+                  "POST",
+                  jellyfin_url,
+                  "/Users/New",
+                  token=jellyfin_record.api_key,
+                  json_body={"Name": "marrquee-ci-friend", "Password": friend_password},
+              )
+              if not new_user.ok:
+                  raise SystemExit(f"couldn't create the friend's Jellyfin account (status {new_user.status})")
+
+              friend_waits = False
+              async with httpx.AsyncClient(base_url=seerr_url) as friend_session:
+                  friend_auth = await friend_session.post(
+                      "/api/v1/auth/jellyfin",
+                      json={
+                          "username": "marrquee-ci-friend",
+                          "password": friend_password,
+                          "hostname": seerr_gateway,
+                          "port": 8096,
+                          "useSsl": False,
+                          "urlBase": "",
+                          "serverType": 2,
+                      },
+                  )
+                  if friend_auth.status_code != 200:
+                      raise SystemExit(
+                          f"signing the friend in to seerr failed (status {friend_auth.status_code})"
+                      )
+
+                  friend_request = await friend_session.post(
+                      "/api/v1/request", json={"mediaType": "movie", "mediaId": 13}
+                  )
+                  if friend_request.status_code != 201:
+                      raise SystemExit(
+                          f"the friend's request did not answer 201 (got {friend_request.status_code})"
+                      )
+                  friend_payload = friend_request.json()
+                  friend_waits = friend_payload.get("status") == 1
+
+              print(f"radarr_got_it={radarr_got_it}")
+              print(f"friend_waits={friend_waits}")
+
+
+          asyncio.run(main())
+          PY
+          docker cp "$RUNNER_TEMP/ci_seerr_request.py" marrquee-stack-smoke:/tmp/ci_seerr_request.py
+
+          if ! request_output=$(docker exec marrquee-stack-smoke python3 /tmp/ci_seerr_request.py 2>&1) || [ -z "$request_output" ]; then
+            echo "$request_output"
+            echo "::error::the seerr request script failed to run"
+            exit 1
+          fi
+          echo "$request_output"
+
+          if ! echo "$request_output" | grep -qF "radarr_got_it=True"; then
+            echo "::error::The owner's request didn't reach Radarr (Seerr needs TMDB - check the runner's internet)"
+            exit 1
+          fi
+          if ! echo "$request_output" | grep -qF "friend_waits=True"; then
+            echo "::error::A shared person's request didn't wait for approval"
+            exit 1
+          fi
+
       # The one place technical detail is allowed to show up, and exactly
       # where a first-time developer needs it: a red run here is debuggable
       # from the workflow's own log, not just "it failed". The same text
@@ -3118,11 +3539,13 @@ jobs:
           docker logs plex || true
           echo "---- docker logs jellyfin ----"
           docker logs jellyfin || true
+          echo "---- docker logs seerr ----"
+          docker logs seerr || true
 
       - name: Clean up every container, network and temp folder this job made
         if: always()
         run: |
-          docker rm -f prowlarr sonarr radarr gluetun qbittorrent recyclarr plex jellyfin marrquee-graphics-check marrquee-stack-smoke 2>/dev/null || true
+          docker rm -f prowlarr sonarr radarr gluetun qbittorrent recyclarr plex jellyfin seerr marrquee-graphics-check marrquee-stack-smoke 2>/dev/null || true
           docker network rm marrquee 2>/dev/null || true
           # A device node this job mknod'd on the runner's own /dev - never
           # removed when the runner already had a real one, and `|| true`

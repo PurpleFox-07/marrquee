@@ -498,6 +498,21 @@ _EXPECTED_INVENTORY = (
     "EXISTING_PLEX_CHECK_AGAIN",
     "EXISTING_PLEX_DISCONNECT",
     "EXISTING_PLEX_DISCONNECT_NOTE",
+    "SEERR_DESCRIPTION",
+    "SEERR_NEEDS_PLEX_OR_JELLYFIN",
+    "SEERR_NEEDS_ARR",
+    "SEERR_COMPOSE_COMMENT",
+    "SEERR_CONFIG_MOUNT_COMMENT",
+    "FAILURE_SEERR_NOT_OURS",
+    "FAILURE_SEERR_SETUP_REFUSED",
+    "wiring_line_seerr",
+    "seerr_note_libraries",
+    "seerr_note_no_libraries",
+    "seerr_note_profile",
+    "seerr_failure_cant_reach",
+    "seerr_failure_no_folder",
+    "seerr_failure_no_profiles",
+    "SEERR_FAILURE_WRONG_PLEX",
 )
 
 _DEPLOY_ENGINE_WORD_COUNT = 40
@@ -516,6 +531,7 @@ _RECYCLARR_WORD_COUNT = 24
 _PLEX_WORD_COUNT = 23
 _JELLYFIN_WORD_COUNT = 21
 _EXISTING_PLEX_WORD_COUNT = 32
+_SEERR_WORD_COUNT = 15
 
 
 def test_words_inventory_is_pinned() -> None:
@@ -954,9 +970,9 @@ def test_the_jellyfin_section_precedes_the_existing_plex_section() -> None:
     assert "EXISTING_PLEX_DESCRIPTION" not in jellyfin_names
 
 
-def test_the_existing_plex_section_is_last() -> None:
-    """ "Your own Plex" is the newest section. Later chunks in this story
-    bump `_EXISTING_PLEX_WORD_COUNT` as they append more words to it.
+def test_the_existing_plex_section_precedes_the_seerr_section() -> None:
+    """ "Your own Plex" used to be the newest section - Seerr now follows
+    it, the same bounded-slice move every earlier story made.
     """
     existing_plex_start = (
         _DEPLOY_ENGINE_WORD_COUNT
@@ -975,14 +991,68 @@ def test_the_existing_plex_section_is_last() -> None:
         + _PLEX_WORD_COUNT
         + _JELLYFIN_WORD_COUNT
     )
+    existing_plex_end = existing_plex_start + _EXISTING_PLEX_WORD_COUNT
 
-    existing_plex_names = words.WORDS_INVENTORY[existing_plex_start:]
+    existing_plex_names = words.WORDS_INVENTORY[existing_plex_start:existing_plex_end]
 
-    assert existing_plex_names == _EXPECTED_INVENTORY[existing_plex_start:]
+    assert existing_plex_names == _EXPECTED_INVENTORY[existing_plex_start:existing_plex_end]
     assert existing_plex_names[0] == "EXISTING_PLEX_DESCRIPTION"
-    assert len(words.WORDS_INVENTORY) == len(_EXPECTED_INVENTORY)
     assert len(existing_plex_names) == _EXISTING_PLEX_WORD_COUNT
     assert "JELLYFIN_DESCRIPTION" not in existing_plex_names
+    assert "SEERR_DESCRIPTION" not in existing_plex_names
+
+
+def test_the_seerr_section_is_last() -> None:
+    """Seerr is the newest section. Later chunks in this story bump
+    `_SEERR_WORD_COUNT` as they append more words to it.
+    """
+    seerr_start = (
+        _DEPLOY_ENGINE_WORD_COUNT
+        + _WIZARD_WORD_COUNT
+        + _WIRING_WORD_COUNT
+        + _DEPLOY_SCREEN_WORD_COUNT
+        + _HUB_WORD_COUNT
+        + _HUB_LINK_WORD_COUNT
+        + _HUB_INSTALL_WORD_COUNT
+        + _LOGIN_WORD_COUNT
+        + _VPN_WORD_COUNT
+        + _QBIT_WORD_COUNT
+        + _VPN_CHANGE_WORD_COUNT
+        + _DRIVE_WORD_COUNT
+        + _RECYCLARR_WORD_COUNT
+        + _PLEX_WORD_COUNT
+        + _JELLYFIN_WORD_COUNT
+        + _EXISTING_PLEX_WORD_COUNT
+    )
+
+    seerr_names = words.WORDS_INVENTORY[seerr_start:]
+
+    assert seerr_names == _EXPECTED_INVENTORY[seerr_start:]
+    assert seerr_names[0] == "SEERR_DESCRIPTION"
+    assert len(words.WORDS_INVENTORY) == len(_EXPECTED_INVENTORY)
+    assert len(seerr_names) == _SEERR_WORD_COUNT
+    assert "EXISTING_PLEX_DESCRIPTION" not in seerr_names
+
+
+def test_seerr_words_never_call_plex_or_jellyfin_a_media_server() -> None:
+    """The same Alignment rule as Plex's, Jellyfin's and Your own Plex's
+    sections: only the whole setup is ever called a "media server".
+    """
+    assert "media server" not in words.SEERR_DESCRIPTION.lower()
+    assert "media server" not in words.SEERR_NEEDS_PLEX_OR_JELLYFIN.lower()
+    assert "media server" not in words.SEERR_NEEDS_ARR.lower()
+    assert "media server" not in words.SEERR_COMPOSE_COMMENT.lower()
+    assert "media server" not in words.SEERR_CONFIG_MOUNT_COMMENT.lower()
+    assert "media server" not in words.FAILURE_SEERR_NOT_OURS.lower()
+    assert "media server" not in words.FAILURE_SEERR_SETUP_REFUSED.lower()
+    assert "media server" not in words.wiring_line_seerr("Plex").lower()
+    assert "media server" not in words.seerr_note_libraries("Plex").lower()
+    assert "media server" not in words.seerr_note_no_libraries("Jellyfin").lower()
+    assert "media server" not in words.seerr_note_profile("Sonarr", "HD-1080p").lower()
+    assert "media server" not in words.seerr_failure_cant_reach("Sonarr").lower()
+    assert "media server" not in words.seerr_failure_no_folder("Radarr").lower()
+    assert "media server" not in words.seerr_failure_no_profiles("Radarr").lower()
+    assert "media server" not in words.SEERR_FAILURE_WRONG_PLEX.lower()
 
 
 def test_existing_plex_words_never_call_it_a_media_server() -> None:

@@ -740,6 +740,58 @@ def test_only_folders_we_created_are_chowned(tmp_path: Path) -> None:
     assert all(mode == 0o775 for _, mode in recorded_chmod)
 
 
+def test_seerr_folder_goes_to_1000_1000_others_to_puid_pgid(tmp_path: Path) -> None:
+    """FIRST TEST: Seerr's catalog entry names a fixed `config_owner`
+    (`(1000, 1000)`, the image's own uid) - `build_folders`'s created-only
+    chown loop must honour it while every other created folder keeps the
+    drive's ordinary puid:pgid.
+    """
+    settings = Settings(host_mount=tmp_path)
+    root = PurePosixPath("/volume1/media")
+    container_root = tmp_path / "volume1" / "media"
+    container_root.mkdir(parents=True)
+
+    recorded_chown: list[tuple[Path, int, int]] = []
+
+    storage.build_folders(
+        settings,
+        root,
+        ("sonarr", "jellyfin", "seerr"),
+        1026,
+        100,
+        chown=lambda path, uid, gid: recorded_chown.append((path, uid, gid)),
+        chmod=lambda path, mode: None,
+    )
+
+    chown_by_path = {path: (uid, gid) for path, uid, gid in recorded_chown}
+    assert chown_by_path[container_root / "marrquee" / "apps" / "seerr"] == (1000, 1000)
+    assert chown_by_path[container_root / "marrquee" / "apps" / "sonarr"] == (1026, 100)
+    assert chown_by_path[container_root / "marrquee" / "apps" / "jellyfin"] == (1026, 100)
+
+
+def test_a_pre_existing_seerr_folder_is_never_chowned(tmp_path: Path) -> None:
+    settings = Settings(host_mount=tmp_path)
+    root = PurePosixPath("/volume1/media")
+    container_root = tmp_path / "volume1" / "media"
+    seerr_folder = container_root / "marrquee" / "apps" / "seerr"
+    seerr_folder.mkdir(parents=True)
+
+    recorded_chown: list[tuple[Path, int, int]] = []
+
+    report = storage.build_folders(
+        settings,
+        root,
+        ("seerr",),
+        1026,
+        100,
+        chown=lambda path, uid, gid: recorded_chown.append((path, uid, gid)),
+        chmod=lambda path, mode: None,
+    )
+
+    assert seerr_folder not in report.created
+    assert seerr_folder not in {path for path, _, _ in recorded_chown}
+
+
 def _no_op_chown(path: Path, uid: int, gid: int) -> None:
     """A stand-in for os.chown: tests don't run as root, so a real chown to
     an arbitrary uid/gid would fail with PermissionError regardless of

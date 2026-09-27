@@ -605,6 +605,7 @@ def test_installable_is_the_catalog_minus_the_deploy_in_catalog_order() -> None:
         "plex",
         "jellyfin",
         "existing-plex",
+        "seerr",
     ]
 
     every_id = [app.id for app in CATALOG]
@@ -773,11 +774,34 @@ def test_install_rows_exclude_the_app_being_added_and_grey_an_unavailable_one(
         "plex",
         "jellyfin",
         "existing-plex",
+        "seerr",
     ]
     by_id = {row.app.id: row for row in view.install_rows}
     assert isinstance(by_id["radarr"], InstallRow)
     assert by_id["prowlarr"].unavailable is None
     assert by_id["radarr"].unavailable == "needs Prowlarr first"
+
+
+def test_seerr_row_greyed_without_plex_or_jellyfin() -> None:
+    view = hub_view(
+        ["prowlarr", "sonarr"],
+        [_health("prowlarr"), _health("sonarr")],
+        authority=_AUTHORITY,
+        proxied=False,
+        now=_NOW,
+    )
+
+    by_id = {row.app.id: row for row in view.install_rows}
+    assert by_id["seerr"].unavailable == words.SEERR_NEEDS_PLEX_OR_JELLYFIN
+
+
+def test_seerr_row_greyed_without_sonarr_or_radarr() -> None:
+    view = hub_view(
+        ["jellyfin"], [_health("jellyfin")], authority=_AUTHORITY, proxied=False, now=_NOW
+    )
+
+    by_id = {row.app.id: row for row in view.install_rows}
+    assert by_id["seerr"].unavailable == words.SEERR_NEEDS_ARR
 
 
 def test_install_rows_carry_each_apps_registered_question_steps() -> None:
