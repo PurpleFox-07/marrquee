@@ -21,6 +21,7 @@ from marrquee.config import Settings
 from marrquee.deploy import DeployManager
 from marrquee.deploy_screen import deploy_view
 from marrquee.login import load_login
+from marrquee.questions import load_answers, uses_graphics_chip
 from marrquee.state import load_state
 from marrquee.wizard import step_number, wizard_steps
 
@@ -47,7 +48,10 @@ async def get_deploy(request: Request) -> Response:
     authority = authority_from_headers(request.headers)
     view = deploy_view(state, manager.snapshot(), authority=authority)
 
-    steps = wizard_steps(state.app_ids)
+    # No probe here - once a deploy has started, the chip question is
+    # whatever was already answered and saved, never asked again.
+    chip = uses_graphics_chip(load_answers(settings.config_dir))
+    steps = wizard_steps(state.app_ids, graphics_chip=chip)
     context = {
         "view": view,
         "steps": steps,

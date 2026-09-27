@@ -20,15 +20,17 @@ from pathlib import Path, PurePosixPath
 from typing import Final, Protocol
 
 from marrquee.catalog import CATALOG, CatalogApp, apps_in_order
+from marrquee.jellyfin import HttpJellyfinServer, JellyfinServer, jellyfin_base_url, load_jellyfin
 from marrquee.plex import HttpPlexServer, PlexServer, load_plex_account, plex_base_url
 from marrquee.qbittorrent import QBIT_BASE_PREFERENCES
-from marrquee.questions import load_answers
+from marrquee.questions import load_answers, uses_graphics_chip
 from marrquee.seeding import seeding_preferences
 from marrquee.state import InstallState
 from marrquee.storage import container_media_path, host_media_path
 from marrquee.vpn_control import GluetunControl, NoGluetunControl
 from marrquee.wiring import WiringStep, WiringStepState
 from marrquee.wiring.arr_client import ArrClient, HttpArrClient
+from marrquee.wiring.jellyfin_steps import ensure_jellyfin_graphics, ensure_jellyfin_libraries
 from marrquee.wiring.plex_steps import ensure_plex_direct_play, ensure_plex_libraries
 from marrquee.wiring.qbit_client import HttpQbitClient, QbitClient
 from marrquee.wiring.steps import (
@@ -46,6 +48,8 @@ from marrquee.words import (
     WIRING_CHIP_ERROR,
     WIRING_CHIP_RUNNING,
     WIRING_CHIP_SKIPPED,
+    WIRING_JELLYFIN_NOT_SET_UP,
+    WIRING_LINE_JELLYFIN_GRAPHICS,
     WIRING_LINE_PLEX_DIRECT_PLAY,
     WIRING_NOTHING_TO_CONNECT,
     WIRING_PLEX_SIGN_IN_NEEDED,
@@ -87,9 +91,11 @@ class WiringContext:
     ordinary arr-only run never touches either. `answers` is read fresh at
     the start of every `run()` (see `WiringEngine.run`), never cached across
     runs, so a "Change seeding" saved a moment ago is what the very next
-    wiring run actually applies. `plex_base_url`/`plex_token` are resolved
-    once per run, only when a Plex task is actually planned - both stay
-    None otherwise, and a plan with no Plex task never reads `plex` at all.
+    wiring run actually applies. `plex_base_url`/`plex_token` and
+    `jellyfin_base_url`/`jellyfin_key` are each resolved once per run, only
+    when a Plex or Jellyfin task is actually planned - all four stay None
+    otherwise, and a plan with neither task never reads `plex`/`jellyfin`
+    at all.
     """
 
     client: ArrClient
@@ -101,6 +107,9 @@ class WiringContext:
     plex: PlexServer | None = None
     plex_base_url: str | None = None
     plex_token: str | None = None
+    jellyfin: JellyfinServer | None = None
+    jellyfin_base_url: str | None = None
+    jellyfin_key: str | None = None
 
 
 class WiringTask(Protocol):
@@ -367,6 +376,82 @@ class PlexDirectPlayTask:
         return await ensure_plex_direct_play(ctx.plex, ctx.plex_base_url, ctx.plex_token)
 
 
+def _jellyfin_precheck(ctx: WiringContext) -> StepOutcome | None:
+    """The one check both Jellyfin tasks make before calling their own
+    `ensure_*` function - mirrors `_plex_precheck`. Never transient: the
+    engine's own retry budget has nothing to gain from repeating a check
+    that never talks to Jellyfin at all.
+    """
+    if ctx.jellyfin_base_url is None:
+        return StepOutcome(
+            state="error",
+            note=wiring_failure_unreachable("Jellyfin"),
+            technical="no address for jellyfin",
+            changed=False,
+            transient=False,
+        )
+    if ctx.jellyfin_key is None:
+        return StepOutcome(
+            state="error",
+            note=WIRING_JELLYFIN_NOT_SET_UP,
+            technical="no jellyfin key saved",
+            changed=False,
+            transient=False,
+        )
+    return None
+
+
+@dataclass(frozen=True)
+class JellyfinLibrariesTask:
+    """Jellyfin gains its Movies and TV Shows libraries, pointing at the
+    shared data root's own media folders.
+    """
+
+    key: str
+    line: str
+    involved: tuple[str, ...]
+
+    @property
+    def about(self) -> tuple[str, ...]:
+        return self.involved
+
+    async def apply(self, ctx: WiringContext) -> StepOutcome:
+        outcome = _jellyfin_precheck(ctx)
+        if outcome is not None:
+            return outcome
+        assert ctx.jellyfin is not None
+        assert ctx.jellyfin_base_url is not None
+        assert ctx.jellyfin_key is not None
+        return await ensure_jellyfin_libraries(
+            ctx.jellyfin, ctx.jellyfin_base_url, ctx.jellyfin_key
+        )
+
+
+@dataclass(frozen=True)
+class JellyfinGraphicsTask:
+    """Jellyfin's VA-API hardware-transcode setting, read back to prove it
+    actually took - planned only when the owner said yes to the graphics
+    chip question.
+    """
+
+    key: str
+    line: str
+    involved: tuple[str, ...]
+
+    @property
+    def about(self) -> tuple[str, ...]:
+        return self.involved
+
+    async def apply(self, ctx: WiringContext) -> StepOutcome:
+        outcome = _jellyfin_precheck(ctx)
+        if outcome is not None:
+            return outcome
+        assert ctx.jellyfin is not None
+        assert ctx.jellyfin_base_url is not None
+        assert ctx.jellyfin_key is not None
+        return await ensure_jellyfin_graphics(ctx.jellyfin, ctx.jellyfin_base_url, ctx.jellyfin_key)
+
+
 @dataclass(frozen=True)
 class ExplainTask:
     """A step whose outcome is always `skipped`, with a fixed plain-language note.
@@ -390,7 +475,12 @@ class ExplainTask:
         )
 
 
-def plan_wiring(state: InstallState, *, only_app: str | None = None) -> tuple[WiringTask, ...]:
+def plan_wiring(
+    state: InstallState,
+    *,
+    only_app: str | None = None,
+    answers: Mapping[str, Mapping[str, str]] = {},
+) -> tuple[WiringTask, ...]:
     """The honest list of steps the owner's chosen apps justify. Pure - no client.
 
     Application-sync steps (or their graceful explanations) come first, in
@@ -401,7 +491,10 @@ def plan_wiring(state: InstallState, *, only_app: str | None = None) -> tuple[Wi
     `only_app` narrows the result to the steps *about* that one app (used
     by an add or a reconnect), keeping the same relative order. `None`
     (the default) returns every step, unchanged from before this parameter
-    existed.
+    existed. `answers` decides only whether Jellyfin's graphics task is
+    planned at all - an install with no Jellyfin never reads it, so the
+    plan for every other combination of apps is byte-identical to before
+    this parameter existed.
     """
     apps = apps_in_order(state.app_ids)
     prowlarr = next((app for app in apps if app.id == "prowlarr"), None)
@@ -490,6 +583,23 @@ def plan_wiring(state: InstallState, *, only_app: str | None = None) -> tuple[Wi
             )
         )
 
+    if "jellyfin" in state.app_ids:
+        tasks.append(
+            JellyfinLibrariesTask(
+                key="libraries:jellyfin",
+                line=wiring_line_libraries("Jellyfin"),
+                involved=("jellyfin",),
+            )
+        )
+        if uses_graphics_chip(answers):
+            tasks.append(
+                JellyfinGraphicsTask(
+                    key="graphics:jellyfin",
+                    line=WIRING_LINE_JELLYFIN_GRAPHICS,
+                    involved=("jellyfin",),
+                )
+            )
+
     if only_app is None:
         return tuple(tasks)
     return tuple(task for task in tasks if only_app in task.about)
@@ -513,6 +623,8 @@ class WiringEngine:
         config_dir: Path | None = None,
         plex: PlexServer | None = None,
         plex_address: Callable[[], Awaitable[str | None]] | None = None,
+        jellyfin: JellyfinServer | None = None,
+        jellyfin_address: Callable[[], Awaitable[str | None]] | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         clock: Callable[[], float] = time.monotonic,
         ready_timeout: float = 180.0,
@@ -527,6 +639,8 @@ class WiringEngine:
         self._config_dir = config_dir
         self._plex = plex if plex is not None else HttpPlexServer()
         self._plex_address = plex_address
+        self._jellyfin = jellyfin if jellyfin is not None else HttpJellyfinServer()
+        self._jellyfin_address = jellyfin_address
         self._sleep = sleep
         self._clock = clock
         self._ready_timeout = ready_timeout
@@ -542,7 +656,13 @@ class WiringEngine:
         *,
         only_app: str | None = None,
     ) -> None:
-        tasks = plan_wiring(state, only_app=only_app)
+        # Read fresh at the start of every run, never cached - a "Change
+        # seeding" saved a moment ago must be what this very run applies,
+        # and it also decides whether Jellyfin's graphics task belongs in
+        # this run's plan at all.
+        answers = load_answers(self._config_dir) if self._config_dir is not None else {}
+
+        tasks = plan_wiring(state, only_app=only_app, answers=answers)
         if not tasks:
             emit(
                 WiringStep(
@@ -559,10 +679,6 @@ class WiringEngine:
             )
             return
 
-        # Read fresh at the start of every run, never cached - a "Change
-        # seeding" saved a moment ago must be what this very run applies.
-        answers = load_answers(self._config_dir) if self._config_dir is not None else {}
-
         # Resolved once per run, and only when a Plex task is actually
         # planned - an arr-only run never calls `plex_address()` or reads
         # plex.json at all.
@@ -577,6 +693,22 @@ class WiringEngine:
                 if account is not None:
                     resolved_plex_token = account.token
 
+        # Same shape as Plex above, and for the same reason - an install
+        # with no Jellyfin never calls `jellyfin_address()` or reads
+        # jellyfin.json at all.
+        resolved_jellyfin_base_url: str | None = None
+        resolved_jellyfin_key: str | None = None
+        if any("jellyfin" in task.about for task in tasks):
+            jellyfin_address = (
+                await self._jellyfin_address() if self._jellyfin_address is not None else None
+            )
+            if jellyfin_address is not None:
+                resolved_jellyfin_base_url = jellyfin_base_url(jellyfin_address)
+            if self._config_dir is not None:
+                record = load_jellyfin(self._config_dir)
+                if record is not None:
+                    resolved_jellyfin_key = record.api_key
+
         ctx = WiringContext(
             client=self._client,
             state=state,
@@ -587,6 +719,9 @@ class WiringEngine:
             plex=self._plex,
             plex_base_url=resolved_plex_base_url,
             plex_token=resolved_plex_token,
+            jellyfin=self._jellyfin,
+            jellyfin_base_url=resolved_jellyfin_base_url,
+            jellyfin_key=resolved_jellyfin_key,
         )
         ready_apps: set[str] = set()
         total = len(tasks)

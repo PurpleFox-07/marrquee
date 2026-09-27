@@ -34,6 +34,8 @@ from typing import ClassVar, Literal, Protocol, cast
 import httpx
 
 from marrquee.catalog import (
+    JELLYFIN_APP_ID,
+    PLEX_APP_ID,
     RECYCLARR_APP_ID,
     CatalogApp,
     apps_in_order,
@@ -55,6 +57,13 @@ from marrquee.config import Settings
 from marrquee.docker_client import ComposeResult, DockerEngine
 from marrquee.hardlinks import HardlinkTrigger
 from marrquee.install import with_app_added, with_app_removed
+from marrquee.jellyfin import (
+    HttpJellyfinServer,
+    JellyfinServer,
+    ensure_jellyfin_admin,
+    jellyfin_base_url,
+    load_jellyfin,
+)
 from marrquee.login import SavedLogin, load_login, pending_app_ids, record_applied
 from marrquee.login_apply import LoginApplier, NoLoginApplier
 from marrquee.plex import (
@@ -106,10 +115,14 @@ from marrquee.wiring.steps import app_base_url
 from marrquee.without_vpn import clear_without_vpn, without_vpn_confirmed
 from marrquee.words import (
     FAILURE_DOCKER_UNREACHABLE,
+    FAILURE_JELLYFIN_NOT_OURS,
+    FAILURE_JELLYFIN_PORT_TAKEN,
+    FAILURE_JELLYFIN_SETUP_REFUSED,
     FAILURE_PLEX_NOT_CLAIMED,
     FAILURE_PLEX_PORT_TAKEN,
     FAILURE_PLEX_SIGN_IN_NEEDED,
     FAILURE_VPN_NO_TUN,
+    JELLYFIN_SERVER_NAME,
     PHASE_HEADLINE_FINALE,
     PHASE_HEADLINE_READY,
     PHASE_HEADLINE_RUNNING,
@@ -168,6 +181,9 @@ FailureCode = Literal[
     "plex_sign_in_needed",
     "plex_not_claimed",
     "plex_port_taken",
+    "jellyfin_port_taken",
+    "jellyfin_not_ours",
+    "jellyfin_setup_refused",
 ]
 
 # An add's own tiny state machine - never "done": once wiring finishes, the
@@ -198,6 +214,7 @@ _REDACTED_PASSWORD_PLACEHOLDER = "<redacted-password>"
 _REDACTED_VPN_PLACEHOLDER = "<redacted-vpn-login>"
 _REDACTED_PLEX_TOKEN_PLACEHOLDER = "<redacted-plex-token>"
 _REDACTED_PLEX_CLAIM_PLACEHOLDER = "<redacted-plex-claim>"
+_REDACTED_JELLYFIN_PLACEHOLDER = "<redacted-jellyfin-key>"
 # A claim code's own shape (see `plex.write_plex_claim`) - matched by value
 # would miss a code this process never wrote itself (an earlier, unrelated
 # run's leftover in an old log line), so every diagnostics write is swept
@@ -413,6 +430,7 @@ class DeployManager:
         recyclarr: RecyclarrTrigger | None = None,
         plex_tv: PlexTv | None = None,
         plex_server: PlexServer | None = None,
+        jellyfin: JellyfinServer | None = None,
     ) -> None:
         self._settings = settings
         self._engine = engine
@@ -427,6 +445,7 @@ class DeployManager:
         self._recyclarr = recyclarr
         self._plex_tv = plex_tv if plex_tv is not None else HttpPlexTv()
         self._plex_server = plex_server if plex_server is not None else HttpPlexServer()
+        self._jellyfin = jellyfin if jellyfin is not None else HttpJellyfinServer()
         self._task: asyncio.Task[None] | None = None
         # The login run's own in-memory progress line - never persisted and
         # never resumed after a restart (the pending names plus Try again
@@ -773,7 +792,11 @@ class DeployManager:
                     clear_vpn_secrets(self._settings, root)
                 if any(removed_app.kind == "sync" for removed_app in brought):
                     remove_recyclarr_config(self._settings, root)
-                if any(removed_app.kind == "media_server" for removed_app in brought):
+                if any(removed_app.id == PLEX_APP_ID for removed_app in brought):
+                    # Jellyfin's own cancel keeps its settings folder (and so
+                    # its key) exactly where a full deploy or the next add
+                    # would find it - only Plex's short-lived claim code
+                    # needs clearing here.
                     clear_plex_claim(self._settings, root)
 
         if current.moves:
@@ -1299,6 +1322,10 @@ class DeployManager:
             )
 
         if app.kind == "media_server":
+            if app.id == JELLYFIN_APP_ID:
+                return await self._bring_up_jellyfin(
+                    app, install, root, compose_path, self_id, report, recreate=recreate
+                )
             return await self._bring_up_plex(
                 app, install, root, compose_path, self_id, report, recreate=recreate
             )
@@ -1793,6 +1820,146 @@ class DeployManager:
         if not result.ok:
             return _compose_failure(app, False, result)
         return None
+
+    # --- Jellyfin's own bring-up: Marrquee's first-time setup proves it ----
+
+    async def _bring_up_jellyfin(
+        self,
+        app: CatalogApp,
+        install: InstallState,
+        root: PurePosixPath,
+        compose_path: Path,
+        self_id: str,
+        report: Callable[[AppState, str, str | None], Awaitable[None]],
+        *,
+        recreate: bool = False,
+    ) -> Failure | None:
+        """Jellyfin's own branch of `_bring_up_app`: host networking (the
+        same reachable address Plex uses), and "ready" means Marrquee's own
+        first-time setup made the one login its admin - not merely that a
+        probe answered.
+
+        Simpler than Plex's own branch: there is no claim code and no
+        grace-period retry, so the loop below never touches
+        `connect_network` or the arr `_app_ready` probe either.
+        """
+        login = load_login(self._settings.config_dir).login
+        if login is None:
+            return self._jellyfin_failure(
+                "jellyfin_setup_refused",
+                FAILURE_JELLYFIN_SETUP_REFUSED,
+                technical="no login is saved",
+            )
+
+        address = await plex_host_address(self._engine, self_id)
+        if address is None:
+            headline, what_to_do = _split_failure_text(failure_compose_failed(app.name))
+            return Failure(
+                code="compose_failed",
+                headline=headline,
+                what_to_do=what_to_do,
+                technical="could not work out this machine's address from Marrquee's own networks",
+            )
+        base_url = jellyfin_base_url(address)
+
+        existing = await self._engine.inspect(app.id)
+        if not existing.exists:
+            pre_flight = await self._jellyfin.request(
+                "GET", base_url, "/System/Info/Public", token=None
+            )
+            if pre_flight.status != 0:
+                return self._jellyfin_failure(
+                    "jellyfin_port_taken",
+                    FAILURE_JELLYFIN_PORT_TAKEN,
+                    technical=f"something already answers on port {require_port(app)}",
+                )
+
+        fetching_image = not await self._engine.image_present(app.image)
+        line = app_line_getting(app.name) if fetching_image else app_line_starting(app.name)
+        await report("starting", line, None)
+
+        result = await self._engine.compose_up(
+            self._settings.stack_project, compose_path, app.id, recreate=recreate
+        )
+        if not result.ok:
+            return _compose_failure(app, fetching_image, result)
+
+        return await self._await_jellyfin_admin(app, login, base_url, report)
+
+    def _jellyfin_failure(self, code: FailureCode, message: str, *, technical: str) -> Failure:
+        headline, what_to_do = _split_failure_text(message)
+        return Failure(code=code, headline=headline, what_to_do=what_to_do, technical=technical)
+
+    async def _await_jellyfin_admin(
+        self,
+        app: CatalogApp,
+        login: SavedLogin,
+        base_url: str,
+        report: Callable[[AppState, str, str | None], Awaitable[None]],
+    ) -> Failure | None:
+        """Wait for Docker to report the container running AND Marrquee's
+        own first-time setup to have made `login` the admin - modelled on
+        `_await_plex_claimed`'s own loop, minus the claim code and its
+        grace-period retry (Jellyfin's setup has neither).
+        """
+        start = self._clock()
+        reassured = False
+        line = app_line_starting(app.name)
+        note: str | None = None
+        await report("starting", line, note)
+
+        while True:
+            elapsed = self._clock() - start
+            if elapsed >= self.NEVER_READY_AFTER_SECONDS:
+                logs = await self._engine.logs(app.id, tail=50)
+                headline, what_to_do = _split_failure_text(failure_never_became_ready(app.name))
+                return Failure(
+                    code="never_became_ready",
+                    headline=headline,
+                    what_to_do=what_to_do,
+                    technical=logs,
+                )
+
+            container = await self._engine.inspect(app.id)
+            candidate_line = line
+            if container.state == "running":
+                setup = await ensure_jellyfin_admin(
+                    self._jellyfin,
+                    base_url,
+                    login,
+                    self._settings.config_dir,
+                    server_name=JELLYFIN_SERVER_NAME,
+                )
+                if setup.state == "done":
+                    await report("done", app_line_done(app.name), None)
+                    return None
+                if setup.state == "not_ours":
+                    return self._jellyfin_failure(
+                        "jellyfin_not_ours",
+                        FAILURE_JELLYFIN_NOT_OURS,
+                        technical=setup.technical or "jellyfin: admin is not ours",
+                    )
+                if setup.state == "refused":
+                    return self._jellyfin_failure(
+                        "jellyfin_setup_refused",
+                        FAILURE_JELLYFIN_SETUP_REFUSED,
+                        technical=setup.technical or "jellyfin: setup refused",
+                    )
+                # "waiting": Jellyfin is running but hasn't answered a real
+                # request yet - the same "still booting" story the warming-up
+                # line already tells for every other app.
+                candidate_line = app_line_warming_up(app.name)
+
+            candidate_note = note
+            if not reassured and elapsed >= self.REASSURANCE_AFTER_SECONDS:
+                reassured = True
+                candidate_note = app_note_slow_start(app.name)
+
+            if candidate_line != line or candidate_note != note:
+                line, note = candidate_line, candidate_note
+                await report("starting", line, note)
+
+            await self._sleep(self.POLL_INTERVAL_SECONDS)
 
     # --- Running an add or a retry -----------------------------------------
 
@@ -2457,8 +2624,8 @@ class DeployManager:
         """The one place every diagnostics write, snapshot failure and log
         line in this class goes through - keys first, then the saved login
         password, then the saved VPN login, then the owner's Plex account
-        token (all read fresh, never cached, and never passed in by a
-        caller that might get them stale).
+        token, then Jellyfin's own saved API key (all read fresh, never
+        cached, and never passed in by a caller that might get them stale).
         """
         saved = load_login(self._settings.config_dir).login
         passwords = (saved.password,) if saved is not None else ()
@@ -2467,12 +2634,15 @@ class DeployManager:
         plex_values = (
             (plex_account.token,) if plex_account is not None and plex_account.token else ()
         )
+        jellyfin_record = load_jellyfin(self._settings.config_dir)
+        jellyfin_values = (jellyfin_record.api_key,) if jellyfin_record is not None else ()
         return _redact_secrets(
             text,
             install.api_keys,
             passwords=passwords,
             vpn_values=secret_values(vpn_answers),
             plex_values=plex_values,
+            jellyfin_values=jellyfin_values,
         )
 
     # --- Putting the saved login on one app --------------------------------
@@ -2835,13 +3005,15 @@ def _redact_secrets(
     passwords: Iterable[str] = (),
     vpn_values: Iterable[str] = (),
     plex_values: Iterable[str] = (),
+    jellyfin_values: Iterable[str] = (),
 ) -> str:
     """Replace every known API key, then every known password, then every
-    known VPN credential, then the owner's Plex account token, with a
-    placeholder before text reaches a log line, a diagnostics file or a
-    snapshot's failure detail - and, last of all, sweep for a claim code's
-    own shape, which this process may never have loaded as a value at all
-    (an already-expired one, echoed back in a container's own logs).
+    known VPN credential, then the owner's Plex account token, then
+    Jellyfin's own saved API key, with a placeholder before text reaches a
+    log line, a diagnostics file or a snapshot's failure detail - and, last
+    of all, sweep for a claim code's own shape, which this process may never
+    have loaded as a value at all (an already-expired one, echoed back in a
+    container's own logs).
 
     Docker or an app's own error output could echo back an environment
     value we set ourselves - redacting by value here is what keeps "a secret
@@ -2863,6 +3035,9 @@ def _redact_secrets(
     for value in plex_values:
         if value:
             redacted = redacted.replace(value, _REDACTED_PLEX_TOKEN_PLACEHOLDER)
+    for value in jellyfin_values:
+        if value:
+            redacted = redacted.replace(value, _REDACTED_JELLYFIN_PLACEHOLDER)
     return _PLEX_CLAIM_PATTERN.sub(_REDACTED_PLEX_CLAIM_PLACEHOLDER, redacted)
 
 
@@ -2952,6 +3127,9 @@ def _failure_from_payload(payload: dict[str, object]) -> Failure:
                     "plex_sign_in_needed",
                     "plex_not_claimed",
                     "plex_port_taken",
+                    "jellyfin_port_taken",
+                    "jellyfin_not_ours",
+                    "jellyfin_setup_refused",
                 ),
             ),
         ),

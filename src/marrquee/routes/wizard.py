@@ -12,7 +12,7 @@ post, answered with a real redirect or a real re-render.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
 from typing import Annotated, Literal
 
@@ -34,6 +34,7 @@ from marrquee.catalog import (
 from marrquee.config import Settings
 from marrquee.deploy import DeployManager
 from marrquee.docker_client import DockerEngine, detect_host_kind
+from marrquee.graphics_chip import GraphicsChipCheck
 from marrquee.install import install_apps
 from marrquee.login import LOGIN_STEP, LoginRecord, load_login, save_login
 from marrquee.questions import (
@@ -102,6 +103,17 @@ async def _platform_warning(request: Request) -> str | None:
     engine: DockerEngine = request.app.state.docker_engine
     status = await engine.status()
     return platform_warning(detect_host_kind(status))
+
+
+async def _graphics_chip(request: Request, app_ids: Iterable[str]) -> bool:
+    """Whether the chip question could matter for this run, probed only
+    when it actually could - every other ticked app plays everything
+    regardless, so asking Docker on their behalf would only cost time.
+    """
+    if "jellyfin" not in app_ids:
+        return False
+    check: GraphicsChipCheck = request.app.state.graphics_chip
+    return await check.has_chip()
 
 
 def _offered_apps() -> tuple[CatalogApp, ...]:
@@ -236,7 +248,7 @@ async def _login_context(
     problem_field: str | None,
 ) -> dict[str, object]:
     apps_csv = ",".join(app_ids)
-    steps = wizard_steps(app_ids)
+    steps = wizard_steps(app_ids, graphics_chip=await _graphics_chip(request, app_ids))
     return {
         "steps": steps,
         "current_step": step_number(steps, "login"),
@@ -300,7 +312,8 @@ async def post_setup_login(request: Request) -> Response:
     )
 
     apps_csv = ",".join(app_ids)
-    first_question = question_steps_for(app_ids)
+    chip = await _graphics_chip(request, app_ids)
+    first_question = question_steps_for(app_ids, graphics_chip=chip)
     if first_question:
         step = first_question[0]
         return RedirectResponse(
@@ -318,12 +331,14 @@ async def post_setup_login(request: Request) -> Response:
 # step nobody registered.
 
 
-def _step_index(app_ids: tuple[str, ...], app_id: str, step_id: str) -> int:
+def _step_index(
+    app_ids: tuple[str, ...], app_id: str, step_id: str, *, graphics_chip: bool = False
+) -> int:
     """Where `(app_id, step_id)` falls in `question_steps_for(app_ids)`, or
     -1 when it isn't there at all (an app that fell off the ticked list
     between one page and the next).
     """
-    registered = question_steps_for(app_ids)
+    registered = question_steps_for(app_ids, graphics_chip=graphics_chip)
     for index, candidate in enumerate(registered):
         if candidate.app_id == app_id and candidate.step_id == step_id:
             return index
@@ -340,10 +355,11 @@ async def _questions_context(
     problem_field: str | None,
 ) -> dict[str, object]:
     apps_csv = ",".join(app_ids)
-    steps = wizard_steps(app_ids)
+    chip = await _graphics_chip(request, app_ids)
+    steps = wizard_steps(app_ids, graphics_chip=chip)
     key = f"q:{step.app_id}:{step.step_id}"
-    index = _step_index(app_ids, step.app_id, step.step_id)
-    registered = question_steps_for(app_ids)
+    index = _step_index(app_ids, step.app_id, step.step_id, graphics_chip=chip)
+    registered = question_steps_for(app_ids, graphics_chip=chip)
     if index > 0:
         previous = registered[index - 1]
         back_url = f"/setup/questions/{previous.app_id}/{previous.step_id}?apps={apps_csv}"
@@ -382,8 +398,9 @@ async def get_setup_question(app_id: str, step_id: str, request: Request) -> Res
     templates: Jinja2Templates = request.app.state.templates
 
     app_ids = parse_app_ids(request.query_params.get("apps", ""))
+    chip = await _graphics_chip(request, app_ids)
     step = find_step(app_id, step_id) if app_id in app_ids else None
-    if step is None or _step_index(app_ids, app_id, step_id) < 0:
+    if step is None or _step_index(app_ids, app_id, step_id, graphics_chip=chip) < 0:
         return RedirectResponse("/setup/apps", status_code=303)
 
     saved = load_answers(settings.config_dir).get(app_id, {})
@@ -419,8 +436,9 @@ async def post_setup_question(app_id: str, step_id: str, request: Request) -> Re
     form = await request.form()
 
     app_ids = parse_app_ids(_form_value(form, "apps"))
+    chip = await _graphics_chip(request, app_ids)
     step = find_step(app_id, step_id) if app_id in app_ids else None
-    if step is None or _step_index(app_ids, app_id, step_id) < 0:
+    if step is None or _step_index(app_ids, app_id, step_id, graphics_chip=chip) < 0:
         return RedirectResponse("/setup/apps", status_code=303)
 
     saved = load_answers(settings.config_dir).get(app_id, {})
@@ -440,8 +458,8 @@ async def post_setup_question(app_id: str, step_id: str, request: Request) -> Re
     save_step_answers(settings.config_dir, app_id, check.answers)
 
     apps_csv = ",".join(app_ids)
-    index = _step_index(app_ids, app_id, step_id)
-    registered = question_steps_for(app_ids)
+    index = _step_index(app_ids, app_id, step_id, graphics_chip=chip)
+    registered = question_steps_for(app_ids, graphics_chip=chip)
     if 0 <= index < len(registered) - 1:
         next_step = registered[index + 1]
         return RedirectResponse(
@@ -465,7 +483,7 @@ async def _without_vpn_context(
     request: Request, *, app_ids: tuple[str, ...], stage: Literal[1, 2, 3], problem: str | None
 ) -> dict[str, object]:
     apps_csv = ",".join(app_ids)
-    steps = wizard_steps(app_ids)
+    steps = wizard_steps(app_ids, graphics_chip=await _graphics_chip(request, app_ids))
     return {
         "steps": steps,
         "current_step": step_number(steps, "q:gluetun:vpn"),
@@ -521,7 +539,8 @@ async def post_setup_without_vpn(request: Request) -> Response:
     # a companion never posted in the first place would.
     remaining_ids = tuple(app_id for app_id in app_ids if app_id != "gluetun")
     apps_csv = ",".join(remaining_ids)
-    first_question = question_steps_for(remaining_ids)
+    chip = await _graphics_chip(request, remaining_ids)
+    first_question = question_steps_for(remaining_ids, graphics_chip=chip)
     if first_question:
         step = first_question[0]
         return RedirectResponse(
@@ -541,12 +560,12 @@ async def post_setup_without_vpn(request: Request) -> Response:
 _TIMEZONE_ALIASES_JSON = json.dumps(TIMEZONE_ALIASES)
 
 
-def _drive_back_url(app_ids: tuple[str, ...], apps_csv: str) -> str:
+def _drive_back_url(app_ids: tuple[str, ...], apps_csv: str, *, graphics_chip: bool = False) -> str:
     """The last registered question step's own page when one exists, else
     the apps screen these ids came from - so Back never skips a step the
     owner is walking forward through.
     """
-    registered = question_steps_for(app_ids)
+    registered = question_steps_for(app_ids, graphics_chip=graphics_chip)
     if registered:
         last = registered[-1]
         return f"/setup/questions/{last.app_id}/{last.step_id}?apps={apps_csv}"
@@ -567,7 +586,9 @@ def _login_missing_redirect(settings: Settings, app_ids: tuple[str, ...]) -> Res
     return RedirectResponse(f"/setup/login?apps={apps_csv}", status_code=303)
 
 
-def _missing_step_redirect(settings: Settings, app_ids: tuple[str, ...]) -> Response | None:
+def _missing_step_redirect(
+    settings: Settings, app_ids: tuple[str, ...], *, graphics_chip: bool = False
+) -> Response | None:
     """A 303 to the first unanswered question step, or `None` when every
     registered step for `app_ids` already has its answers saved.
 
@@ -575,7 +596,7 @@ def _missing_step_redirect(settings: Settings, app_ids: tuple[str, ...]) -> Resp
     `install_apps` can never run with a question this app still needs to
     ask left unanswered.
     """
-    blocking = missing_step(app_ids, load_answers(settings.config_dir))
+    blocking = missing_step(app_ids, load_answers(settings.config_dir), graphics_chip=graphics_chip)
     if blocking is None:
         return None
     apps_csv = ",".join(app_ids)
@@ -597,12 +618,13 @@ async def _drive_context(
 ) -> dict[str, object]:
     settings: Settings = request.app.state.settings
     apps_csv = ",".join(app_ids)
-    steps = wizard_steps(app_ids)
+    chip = await _graphics_chip(request, app_ids)
+    steps = wizard_steps(app_ids, graphics_chip=chip)
     return {
         "steps": steps,
         "current_step": step_number(steps, "drive"),
         "apps_csv": apps_csv,
-        "back_url": _drive_back_url(app_ids, apps_csv),
+        "back_url": _drive_back_url(app_ids, apps_csv, graphics_chip=chip),
         "path": path,
         "hint": words.wizard_path_hint([str(root) for root in shared_roots(settings)]),
         "message": message,
@@ -631,7 +653,9 @@ async def get_setup_drive(request: Request) -> Response:
     if login_blocked is not None:
         return login_blocked
 
-    blocked = _missing_step_redirect(settings, app_ids)
+    blocked = _missing_step_redirect(
+        settings, app_ids, graphics_chip=await _graphics_chip(request, app_ids)
+    )
     if blocked is not None:
         return blocked
 
@@ -666,7 +690,9 @@ async def post_setup_drive(request: Request) -> Response:
     if login_blocked is not None:
         return login_blocked
 
-    blocked = _missing_step_redirect(settings, app_ids)
+    blocked = _missing_step_redirect(
+        settings, app_ids, graphics_chip=await _graphics_chip(request, app_ids)
+    )
     if blocked is not None:
         return blocked
 

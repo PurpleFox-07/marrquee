@@ -43,6 +43,7 @@ from marrquee.deploy import (
     WiringGap,
 )
 from marrquee.docker_client import ComposeResult
+from marrquee.jellyfin import FakeJellyfinServer, JellyfinResponse
 from marrquee.login import SavedLogin, load_login, save_login
 from marrquee.login_apply import FakeLoginApplier, LoginApplyResult
 from marrquee.plex import (
@@ -544,6 +545,34 @@ async def test_cancel_of_a_failed_plex_add_clears_the_claim_file(tmp_path: Path)
     # Cancel undoes the ADD, never the sign-in - plex.json survives so the
     # owner isn't asked to sign in with Plex again on the next attempt.
     assert load_plex_account(settings.config_dir) is not None
+
+
+async def test_adding_jellyfin_mints_an_ordinary_api_key(tmp_path: Path) -> None:
+    """Jellyfin has no `api_key_source` field either - it mints an ordinary,
+    unused hex32 key the same way Plex does, through the exact same
+    `with_app_added` growth every other add goes through.
+    """
+    manager, engine, settings = await _deployed_to_finale(tmp_path, ("prowlarr", "sonarr"))
+    manager._jellyfin = FakeJellyfinServer(  # type: ignore[attr-defined]
+        {
+            ("GET", "/System/Info/Public"): [
+                JellyfinResponse(ok=False, status=0, payload=None, detail="connection refused")
+            ]
+        }
+    )
+    # Jellyfin's own bring-up isn't the point of this test - a fast, scripted
+    # compose failure (past the pre-flight check above) is enough to prove
+    # the key was already minted and saved before Docker did anything else.
+    engine._compose_results["jellyfin"] = ComposeResult(  # type: ignore[attr-defined]
+        ok=False, exit_code=1, output="Error: something went wrong"
+    )
+
+    manager.add_app("jellyfin")
+    await _finish_add(manager)
+
+    grown = load_state(settings.config_dir)
+    assert grown is not None
+    assert re.fullmatch(r"[0-9a-f]{32}", grown.api_keys.get("jellyfin", ""))
 
 
 async def test_cancel_of_a_failed_add_rewrites_compose_still_holding_gluetun(

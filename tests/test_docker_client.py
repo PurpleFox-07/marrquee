@@ -27,6 +27,7 @@ from marrquee.docker_client import (
     ExecStartResult,
     ExecState,
     FakeDockerEngine,
+    HostPathProbe,
     NetworkConnectResult,
     SocketDockerEngine,
     detect_host_kind,
@@ -1055,6 +1056,237 @@ async def test_host_gateway_returns_none_on_a_connection_error(tmp_path: Path) -
     assert await engine.host_gateway("self") is None
 
 
+# --- probe_host_path() --------------------------------------------------------
+
+
+async def test_probe_host_path_classifies_a_missing_bind_source_as_absent(docker_stub):
+    """FIRST TEST - the exact request shape: inspect self for its own image
+    id, an ignored cleanup DELETE, then the one POST whose CREATE-time
+    refusal is what decides "does the host have this path". Docker's own
+    substring for a missing `Mounts` bind source is what turns a 400 into
+    "absent" rather than "couldn't tell".
+    """
+    stub, socket_path = docker_stub
+    stub.respond_with_sequence(
+        [
+            ("HTTP/1.1 200 OK", b'{"Image": "sha256:x"}'),
+            ("HTTP/1.1 404 Not Found", b'{"message": "no such container"}'),
+            (
+                "HTTP/1.1 400 Bad Request",
+                b'{"message": "invalid mount config for type \\"bind\\": '
+                b'bind source path does not exist: /dev/dri/renderD128"}',
+            ),
+        ]
+    )
+    engine = SocketDockerEngine(socket_path=socket_path)
+
+    result = await engine.probe_host_path("self", "/dev/dri/renderD128")
+
+    assert result == HostPathProbe(result="absent", detail=None)
+    assert stub.request_lines == [
+        "GET /containers/self/json HTTP/1.1",
+        "DELETE /containers/marrquee-graphics-check?force=true HTTP/1.1",
+        "POST /containers/create?name=marrquee-graphics-check HTTP/1.1",
+    ]
+    created_body = json.loads(stub.request_bodies[-1])
+    assert created_body == {
+        "Image": "sha256:x",
+        "Labels": {"com.marrquee.purpose": "graphics-check"},
+        "HostConfig": {
+            "Mounts": [
+                {
+                    "Type": "bind",
+                    "Source": "/dev/dri/renderD128",
+                    "Target": "/marrquee-check",
+                    "ReadOnly": True,
+                }
+            ]
+        },
+    }
+
+
+async def test_probe_host_path_classifies_a_successful_create_as_present_and_removes_it(
+    docker_stub,
+):
+    stub, socket_path = docker_stub
+    stub.respond_with_sequence(
+        [
+            ("HTTP/1.1 200 OK", b'{"Image": "sha256:x"}'),
+            ("HTTP/1.1 404 Not Found", b'{"message": "no such container"}'),
+            ("HTTP/1.1 201 Created", b'{"Id": "c1"}'),
+            ("HTTP/1.1 204 No Content", b""),
+        ]
+    )
+    engine = SocketDockerEngine(socket_path=socket_path)
+
+    result = await engine.probe_host_path("self", "/dev/dri/renderD128")
+
+    assert result == HostPathProbe(result="present", detail=None)
+    assert stub.request_lines[-1] == "DELETE /containers/c1?force=true HTTP/1.1"
+
+
+async def test_probe_host_path_still_answers_present_when_its_own_cleanup_delete_fails(
+    docker_stub, caplog: pytest.LogCaptureFixture
+):
+    """A cleanup DELETE that fails is logged, never surfaced as an error -
+    the check's own answer is already decided by the CREATE that came
+    before it, and a leftover container never runs (it was never started),
+    so it is harmless rather than something the owner must be told about.
+    """
+    stub, socket_path = docker_stub
+    stub.respond_with_sequence(
+        [
+            ("HTTP/1.1 200 OK", b'{"Image": "sha256:x"}'),
+            ("HTTP/1.1 404 Not Found", b'{"message": "no such container"}'),
+            ("HTTP/1.1 201 Created", b'{"Id": "c1"}'),
+            ("HTTP/1.1 500 Internal Server Error", b'{"message": "daemon is busy"}'),
+        ]
+    )
+    engine = SocketDockerEngine(socket_path=socket_path)
+
+    with caplog.at_level("WARNING"):
+        result = await engine.probe_host_path("self", "/dev/dri/renderD128")
+
+    assert result == HostPathProbe(result="present", detail=None)
+    assert stub.request_lines[-1] == "DELETE /containers/c1?force=true HTTP/1.1"
+    assert "c1" in caplog.text
+
+
+async def test_probe_host_path_never_starts_the_container_it_creates(docker_stub):
+    """No matter the classification, `/start` is never called - the whole
+    point of the probe is that the check container never runs.
+    """
+    stub, socket_path = docker_stub
+    stub.respond_with_sequence(
+        [
+            ("HTTP/1.1 200 OK", b'{"Image": "sha256:x"}'),
+            ("HTTP/1.1 404 Not Found", b'{"message": "no such container"}'),
+            ("HTTP/1.1 201 Created", b'{"Id": "c1"}'),
+            ("HTTP/1.1 204 No Content", b""),
+        ]
+    )
+    engine = SocketDockerEngine(socket_path=socket_path)
+
+    await engine.probe_host_path("self", "/dev/dri/renderD128")
+
+    assert not any(line.split(" ")[1].endswith("/start") for line in stub.request_lines)
+
+
+async def test_probe_host_path_classifies_a_daemon_error_as_unknown(docker_stub):
+    stub, socket_path = docker_stub
+    stub.respond_with_sequence(
+        [
+            ("HTTP/1.1 200 OK", b'{"Image": "sha256:x"}'),
+            ("HTTP/1.1 404 Not Found", b'{"message": "no such container"}'),
+            ("HTTP/1.1 500 Internal Server Error", b'{"message": "daemon is busy"}'),
+        ]
+    )
+    engine = SocketDockerEngine(socket_path=socket_path)
+
+    result = await engine.probe_host_path("self", "/dev/dri/renderD128")
+
+    assert result.result == "unknown"
+    assert result.detail is not None
+
+
+async def test_probe_host_path_classifies_an_unrelated_400_as_unknown_not_absent(docker_stub):
+    """A 400 is only "absent" when Docker's own message is specifically
+    about a missing bind source - any other 400 (a malformed body, an
+    unknown image, a request Docker refused for some other reason) must
+    never be read as a definitive "no chip".
+    """
+    stub, socket_path = docker_stub
+    stub.respond_with_sequence(
+        [
+            ("HTTP/1.1 200 OK", b'{"Image": "sha256:x"}'),
+            ("HTTP/1.1 404 Not Found", b'{"message": "no such container"}'),
+            ("HTTP/1.1 400 Bad Request", b'{"message": "invalid reference format"}'),
+        ]
+    )
+    engine = SocketDockerEngine(socket_path=socket_path)
+
+    result = await engine.probe_host_path("self", "/dev/dri/renderD128")
+
+    assert result.result == "unknown"
+    assert result.detail is not None
+
+
+async def test_probe_host_path_classifies_a_409_name_conflict_as_unknown(docker_stub):
+    stub, socket_path = docker_stub
+    stub.respond_with_sequence(
+        [
+            ("HTTP/1.1 200 OK", b'{"Image": "sha256:x"}'),
+            ("HTTP/1.1 404 Not Found", b'{"message": "no such container"}'),
+            (
+                "HTTP/1.1 409 Conflict",
+                b'{"message": "Conflict. The container name '
+                b'\\"/marrquee-graphics-check\\" is already in use"}',
+            ),
+        ]
+    )
+    engine = SocketDockerEngine(socket_path=socket_path)
+
+    result = await engine.probe_host_path("self", "/dev/dri/renderD128")
+
+    assert result.result == "unknown"
+
+
+async def test_probe_host_path_reports_unknown_when_the_self_inspect_has_no_image(docker_stub):
+    stub, socket_path = docker_stub
+    stub.respond_with_json({"State": {"Status": "running"}})
+    engine = SocketDockerEngine(socket_path=socket_path)
+
+    result = await engine.probe_host_path("self", "/dev/dri/renderD128")
+
+    assert result.result == "unknown"
+    # Never gets far enough to touch create or delete at all.
+    assert stub.request_lines == ["GET /containers/self/json HTTP/1.1"]
+
+
+async def test_probe_host_path_reports_unknown_on_a_connection_error(tmp_path: Path) -> None:
+    engine = SocketDockerEngine(socket_path=tmp_path / "no-such.sock")
+
+    result = await engine.probe_host_path("self", "/dev/dri/renderD128")
+
+    assert result.result == "unknown"
+    assert result.detail is not None
+
+
+# --- FakeDockerEngine.probe_host_path() ---------------------------------------
+
+
+async def test_fake_probe_host_path_present_absent_and_unknown() -> None:
+    fake = FakeDockerEngine(
+        DockerStatus(connected=True),
+        self_container_id="marrquee",
+        host_paths={"/dev/dri/renderD128"},
+    )
+
+    present = await fake.probe_host_path("marrquee", "/dev/dri/renderD128")
+    absent = await fake.probe_host_path("marrquee", "/dev/dri/card0")
+    unknown = await fake.probe_host_path("someone-else", "/dev/dri/renderD128")
+
+    assert present == HostPathProbe(result="present", detail=None)
+    assert absent == HostPathProbe(result="absent", detail=None)
+    assert unknown == HostPathProbe(result="unknown", detail=None)
+    assert fake.calls == [
+        ("probe_host_path", ("marrquee", "/dev/dri/renderD128")),
+        ("probe_host_path", ("marrquee", "/dev/dri/card0")),
+        ("probe_host_path", ("someone-else", "/dev/dri/renderD128")),
+    ]
+
+
+async def test_fake_probe_host_path_defaults_to_no_chip() -> None:
+    """Every existing test's `FakeDockerEngine()` gets no `host_paths=` at
+    all - the default keeps every one of them chip-free.
+    """
+    fake = FakeDockerEngine(DockerStatus(connected=True), self_container_id="marrquee")
+
+    result = await fake.probe_host_path("marrquee", "/dev/dri/renderD128")
+
+    assert result == HostPathProbe(result="absent", detail=None)
+
+
 # --- FakeDockerEngine.host_gateway() -----------------------------------------
 
 
@@ -1153,6 +1385,7 @@ async def test_the_fake_satisfies_the_widened_protocol_and_records_its_calls() -
     await fake.remove_container("sonarr")
     await fake.stop_container("sonarr")
     await fake.host_gateway("abc")
+    await fake.probe_host_path("abc", "/dev/dri/renderD128")
 
     assert [name for name, _args in fake.calls] == [
         "status",
@@ -1165,6 +1398,7 @@ async def test_the_fake_satisfies_the_widened_protocol_and_records_its_calls() -
         "remove_container",
         "stop_container",
         "host_gateway",
+        "probe_host_path",
     ]
 
 

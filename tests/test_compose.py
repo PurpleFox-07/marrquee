@@ -719,6 +719,110 @@ def test_plex_does_not_disturb_an_arr_service_rendered_beside_it() -> None:
     assert _service_block(text, "sonarr") == _service_block(_GOLDEN_THREE_APP_COMPOSE, "sonarr")
 
 
+# --- Jellyfin's own compose branch: host networking, the graphics chip ------
+
+_JELLYFIN_KEY = "8" * 32
+
+
+def _jellyfin_state(app_ids: tuple[str, ...] = ("jellyfin",)) -> InstallState:
+    all_keys = {"sonarr": _SONARR_KEY, "jellyfin": _JELLYFIN_KEY}
+    return InstallState(
+        version=STATE_VERSION,
+        storage_root="/volume1/media",
+        app_ids=app_ids,
+        api_keys={app_id: all_keys[app_id] for app_id in app_ids},
+        puid=1000,
+        pgid=1000,
+        umask="002",
+        timezone="Etc/UTC",
+        created="2026-09-19T00:00:00+00:00",
+    )
+
+
+def test_jellyfin_service_shape_with_and_without_the_graphics_chip() -> None:
+    """The name-the-network rule, and the Triage's host-networking decision:
+    a "yes" answer passes the device through; "no" and no answer at all
+    render no `devices:` key.
+    """
+    state = _jellyfin_state(("sonarr", "jellyfin"))
+    doc = _rendered_doc(state, {"jellyfin": {"graphics_chip": "yes"}})
+    services = _services(doc)
+    jellyfin = services["jellyfin"]
+
+    assert jellyfin["network_mode"] == "host"
+    assert "networks" not in jellyfin
+    assert "ports" not in jellyfin
+    assert list(_environment(jellyfin).keys()) == ["PUID", "PGID", "TZ", "UMASK"]
+    assert _volumes(jellyfin) == [
+        "/volume1/media/marrquee/apps/jellyfin:/config",
+        "/volume1/media/data/media:/data/media:ro",
+    ]
+    assert jellyfin["devices"] == ["/dev/dri:/dev/dri"]
+    assert services["sonarr"]["networks"] == ["marrquee"]
+
+    without_answer = _services(_rendered_doc(state))["jellyfin"]
+    assert "devices" not in without_answer
+
+    with_no = _services(_rendered_doc(state, {"jellyfin": {"graphics_chip": "no"}}))["jellyfin"]
+    assert "devices" not in with_no
+
+
+def test_jellyfin_env_is_exact_and_carries_no_key() -> None:
+    state = _jellyfin_state()
+    doc = _rendered_doc(state)
+    jellyfin = _services(doc)["jellyfin"]
+
+    assert _environment(jellyfin) == {
+        "PUID": "1000",
+        "PGID": "1000",
+        "TZ": "Etc/UTC",
+        "UMASK": "002",
+    }
+
+    text = compose.render_compose(compose.build_stack_plan(state))
+    jellyfin_block = _service_block(text, "jellyfin")
+    for key in state.api_keys.values():
+        assert key not in jellyfin_block
+    assert "__AUTH__" not in jellyfin_block
+
+
+def test_jellyfin_media_mount_is_read_only_and_gets_its_own_comment() -> None:
+    """Design correction: the shared `:/data/media:ro` suffix comment names
+    Plex by default - Jellyfin's own block must read its own wording
+    instead, and never Plex's.
+    """
+    text = compose.render_compose(compose.build_stack_plan(_jellyfin_state()))
+    jellyfin_block = _service_block(text, "jellyfin")
+    comments = _comment_text(jellyfin_block)
+
+    assert words.JELLYFIN_MEDIA_LIBRARY_MOUNT_COMMENT in comments
+    assert "Plex" not in jellyfin_block
+    assert words.MEDIA_LIBRARY_MOUNT_COMMENT not in comments
+
+
+def test_jellyfin_compose_comment_names_the_setup_and_the_graphics_chip() -> None:
+    with_chip = compose.render_compose(
+        compose.build_stack_plan(_jellyfin_state(), {"jellyfin": {"graphics_chip": "yes"}})
+    )
+    without_chip = compose.render_compose(compose.build_stack_plan(_jellyfin_state()))
+
+    with_chip_comments = _comment_text(_service_block(with_chip, "jellyfin"))
+    without_chip_comments = _comment_text(_service_block(without_chip, "jellyfin"))
+
+    assert words.JELLYFIN_COMPOSE_COMMENT in with_chip_comments
+    assert words.JELLYFIN_GRAPHICS_DEVICE_COMMENT in with_chip_comments
+    assert words.JELLYFIN_COMPOSE_COMMENT in without_chip_comments
+    assert words.JELLYFIN_GRAPHICS_DEVICE_COMMENT not in without_chip_comments
+
+
+def test_jellyfin_does_not_disturb_an_arr_service_rendered_beside_it() -> None:
+    state = _jellyfin_state(("sonarr", "jellyfin"))
+
+    text = compose.render_compose(compose.build_stack_plan(state))
+
+    assert _service_block(text, "sonarr") == _service_block(_GOLDEN_THREE_APP_COMPOSE, "sonarr")
+
+
 # --- the single highest-consequence path bug in the story --------------------
 
 

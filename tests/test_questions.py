@@ -12,6 +12,8 @@ import pytest
 from marrquee import questions, vpn, words
 from marrquee.login import LOGIN_STEP
 from marrquee.questions import (
+    GRAPHICS_CHIP_FIELD,
+    JELLYFIN_GRAPHICS_STEP,
     MOVIE_QUALITY_STEP,
     PLEX_ACCOUNT_FIELD,
     PLEX_STEP,
@@ -23,12 +25,14 @@ from marrquee.questions import (
     QuestionField,
     QuestionOption,
     QuestionStep,
+    asks_about_graphics_chip,
     check_step,
     find_step,
     load_answers,
     missing_step,
     question_steps_for,
     save_step_answers,
+    uses_graphics_chip,
 )
 from marrquee.words import QUESTION_PICK_ONE
 
@@ -55,6 +59,7 @@ def test_question_steps_holds_the_registered_vpn_and_seeding_steps() -> None:
         TV_QUALITY_STEP,
         MOVIE_QUALITY_STEP,
         PLEX_STEP,
+        JELLYFIN_GRAPHICS_STEP,
     )
 
 
@@ -503,7 +508,8 @@ def test_check_step_never_reads_posted_for_any_sign_in_field() -> None:
 
 
 def test_plex_step_is_registered_last_and_asks_one_sign_in_field() -> None:
-    assert QUESTION_STEPS[-1] is PLEX_STEP
+    assert QUESTION_STEPS[-2] is PLEX_STEP
+    assert QUESTION_STEPS[-1] is JELLYFIN_GRAPHICS_STEP
     assert PLEX_STEP.app_id == "plex"
     assert PLEX_STEP.step_id == "sign-in"
     assert len(PLEX_STEP.fields) == 1
@@ -512,4 +518,64 @@ def test_plex_step_is_registered_last_and_asks_one_sign_in_field() -> None:
     assert field.kind == "sign_in"
     assert field.label == words.PLEX_ACCOUNT_LABEL
     assert field.hint == words.PLEX_SIGN_IN_HINT
+
+
+# --- The Jellyfin graphics-chip step: a choice step that hides itself ------
+# unless a caller says the NAS actually has a chip ---------------------------
+
+
+def test_question_steps_for_hides_the_jellyfin_chip_step_by_default() -> None:
+    """FIRST TEST - the registry holds the step, but a caller that forgets
+    `graphics_chip=True` never sees it, so a chip-less NAS never plays it.
+    """
+    assert question_steps_for(("jellyfin",)) == ()
+    assert question_steps_for(("jellyfin",), graphics_chip=True) == (JELLYFIN_GRAPHICS_STEP,)
+
+
+def test_question_steps_for_without_graphics_chip_keeps_every_old_result() -> None:
+    assert question_steps_for(("plex",)) == (PLEX_STEP,)
+    assert question_steps_for(("radarr", "recyclarr")) == (MOVIE_QUALITY_STEP,)
+    assert question_steps_for(()) == ()
+
+
+def test_missing_step_ignores_a_hidden_chip_step() -> None:
+    assert missing_step(("jellyfin",), {}) is None
+    assert missing_step(("jellyfin",), {}, graphics_chip=True) is JELLYFIN_GRAPHICS_STEP
+    assert (
+        missing_step(("jellyfin",), {"jellyfin": {"graphics_chip": "yes"}}, graphics_chip=True)
+        is None
+    )
+
+
+def test_asks_about_graphics_chip_only_when_the_step_would_show() -> None:
+    assert asks_about_graphics_chip(("jellyfin",)) is True
+    assert asks_about_graphics_chip(("plex",)) is False
+    assert asks_about_graphics_chip(()) is False
+    assert asks_about_graphics_chip(("radarr",), present=("jellyfin",)) is False
+
+
+def test_jellyfin_graphics_step_refuses_no_answer() -> None:
+    refused = check_step(JELLYFIN_GRAPHICS_STEP, {}, {})
+
+    assert refused.ok is False
+    assert refused.problem == QUESTION_PICK_ONE
+    assert refused.field == GRAPHICS_CHIP_FIELD
+
+
+def test_jellyfin_graphics_step_accepts_yes_or_no() -> None:
+    accepted_yes = check_step(JELLYFIN_GRAPHICS_STEP, {GRAPHICS_CHIP_FIELD: "yes"}, {})
+    accepted_no = check_step(JELLYFIN_GRAPHICS_STEP, {GRAPHICS_CHIP_FIELD: "no"}, {})
+
+    assert accepted_yes.ok is True
+    assert accepted_yes.answers[GRAPHICS_CHIP_FIELD] == "yes"
+    assert accepted_no.ok is True
+    assert accepted_no.answers[GRAPHICS_CHIP_FIELD] == "no"
+
+
+def test_uses_graphics_chip_only_for_a_saved_yes() -> None:
+    assert uses_graphics_chip({"jellyfin": {"graphics_chip": "yes"}}) is True
+    assert uses_graphics_chip({"jellyfin": {"graphics_chip": "no"}}) is False
+    assert uses_graphics_chip({"jellyfin": {"graphics_chip": "YES"}}) is False
+    assert uses_graphics_chip({"jellyfin": {}}) is False
+    assert uses_graphics_chip({}) is False
     assert PLEX_STEP.asked_with is None

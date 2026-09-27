@@ -2454,3 +2454,562 @@ def test_stack_smoke_plex_secrets_step_clears_the_claim_and_confirms_the_folder_
         'if [ -n "$remaining" ]; then',
         "Plex's secrets folder was not empty after clear_plex_claim",
     )
+
+
+# --- stack-smoke: Jellyfin on a real daemon - the graphics chip probe never
+# starts a container or creates a host path, the Hub's own install endpoint
+# finishes Jellyfin's first-time setup with the one login and its libraries,
+# and changing that login changes Jellyfin's admin without restarting it.
+# Real hardware transcoding stays PENDING the owner's own NAS. --------------
+
+
+def test_stack_smoke_jellyfin_step_names_avoid_forbidden_needles() -> None:
+    """Same reasoning as the Recyclarr and Plex steps above: a name that
+    collides with an earlier step's own name (or the generic "developer
+    test" phrase) would silently resolve `_step_named` to that earlier
+    step instead of Jellyfin's own.
+    """
+    job = _stack_smoke_job()
+    forbidden = (
+        "developer test",
+        "recyclarr",
+        "sync turns amber",
+        "stop radarr",
+        "start radarr again",
+        "cancel",
+        "clean up",
+        "dump diagnostics",
+        "plex runs on the host network",
+        "link code stays root-only",
+        "throwaway",
+    )
+    for needles in [
+        ("graphics chip check",),
+        ("jellyfin is set up",),
+        ("changes jellyfin's admin",),
+    ]:
+        name = str(_step_named(job, *needles)["name"]).lower()
+        for phrase in forbidden:
+            assert phrase not in name, f"step {name!r} contains the forbidden phrase {phrase!r}"
+
+
+def test_stack_smoke_jellyfin_steps_run_after_plex_and_before_dump() -> None:
+    job = _stack_smoke_job()
+    names = [str(step.get("name", "")) for step in _steps(job)]
+
+    plex_secret_index = names.index(_step_named(job, "link code stays root-only")["name"])
+    chip_index = names.index(_step_named(job, "graphics chip check")["name"])
+    jf_setup_index = names.index(_step_named(job, "jellyfin is set up")["name"])
+    jf_login_index = names.index(_step_named(job, "changes jellyfin's admin")["name"])
+    dump_index = names.index(_step_named(job, "dump diagnostics")["name"])
+
+    assert plex_secret_index < chip_index < jf_setup_index < jf_login_index < dump_index
+
+
+def test_stack_smoke_every_new_jellyfin_step_emits_error_on_failure() -> None:
+    job = _stack_smoke_job()
+    needle_groups = [
+        ("graphics chip check",),
+        ("jellyfin is set up",),
+        ("changes jellyfin's admin",),
+    ]
+    for needles in needle_groups:
+        step = _step_named(job, *needles)
+        assert "::error::" in step["run"], f"step {step['name']!r} never emits ::error::"
+
+
+def test_stack_smoke_dump_step_now_also_dumps_jellyfins_logs() -> None:
+    step = _step_named(_stack_smoke_job(), "dump diagnostics")
+    assert "docker logs jellyfin || true" in step["run"]
+
+
+def test_stack_smoke_cleanup_removes_jellyfin_and_the_graphics_check_container() -> None:
+    step = _step_named(_stack_smoke_job(), "clean up")
+    run = step["run"]
+    assert "jellyfin" in run
+    assert "marrquee-graphics-check" in run
+
+
+def test_stack_smoke_cleanup_removes_the_made_up_device_node_only_when_marked() -> None:
+    """A device node this job mknod'd on the runner is its own to remove -
+    one it found already there (a real NAS-hosted runner, say) is never
+    touched, so the marker file gates the whole block.
+    """
+    step = _step_named(_stack_smoke_job(), "clean up")
+    run = step["run"]
+
+    assert 'if [ -f "$RUNNER_TEMP/marrquee-made-dri" ]; then' in run
+    assert "sudo rm -f /dev/dri/renderD128 || true" in run
+    assert "sudo rmdir /dev/dri 2>/dev/null || true" in run
+
+
+# --- The graphics chip check: absent/present classification against the
+# real Docker daemon, no leftover container, no created path, and the fake
+# device node made (and marked) only when the runner doesn't already have
+# one. -----------------------------------------------------------------------
+
+
+def test_stack_smoke_graphics_chip_step_removes_leftover_plex_before_probing() -> None:
+    """Plex was only ever added to the compose plan in memory, so its
+    container has to go here before Jellyfin's own proof begins - the
+    product's one-of rule means the two never really run together.
+    """
+    run = _step_named(_stack_smoke_job(), "graphics chip check")["run"]
+
+    assert "docker rm -f plex > /dev/null 2>&1 || true" in run
+    _assert_post_loop_verdict(
+        run,
+        'if [ -n "$plex_leftover" ]; then',
+        "Plex's container was still present after docker rm -f plex",
+    )
+
+    rm_index = run.index("docker rm -f plex")
+    probe_index = run.index('cat > "$RUNNER_TEMP/ci_graphics_probe.py"')
+    assert rm_index < probe_index
+
+
+def test_stack_smoke_graphics_chip_step_anchors_the_plex_filter_exactly() -> None:
+    """`--filter name=plex` is a substring match - it would also match a
+    hypothetical `plex-something` container. Anchored with `^...$`, the
+    same shape the rest of this job already uses for an exact container
+    name (`docker ps --filter "name=^${name}$" ...`).
+    """
+    run = _step_named(_stack_smoke_job(), "graphics chip check")["run"]
+
+    assert "docker ps -aq --filter name=^plex$" in run
+    assert "docker ps -aq --filter name=plex)" not in run
+
+
+def test_stack_smoke_graphics_chip_step_probe_script_calls_the_real_engine() -> None:
+    """Real, parseable Python, scoped to this one heredoc - `ast.parse`
+    catches a mangled or hollowed-out probe script even though an
+    identical-looking `probe_host_path` call could exist in some other
+    step's own heredoc elsewhere in this file.
+    """
+    run = _step_named(_stack_smoke_job(), "graphics chip check")["run"]
+    body = _heredoc_body(run, "ci_graphics_probe.py")
+
+    assert "from marrquee.docker_client import SocketDockerEngine" in run
+    assert 'await engine.probe_host_path(self_id, "/marrquee-ci-no-such-device")' in body
+    assert 'await engine.probe_host_path(self_id, "/dev/null")' in body
+
+    tree = ast.parse(body)
+    calls = [
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "probe_host_path"
+    ]
+    assert len(calls) == 2, "the probe script must call probe_host_path exactly twice"
+
+
+def test_stack_smoke_graphics_chip_step_pins_the_absent_and_present_verdicts_as_case_arms() -> None:
+    """Each verdict is its own `case` arm - a `*)` catch-all swallowing the
+    real label (or an arm hollowed to a no-op) shows up as a plain string
+    diff here, not a substring match either shape would still satisfy.
+    """
+    run = _step_named(_stack_smoke_job(), "graphics chip check")["run"]
+
+    absent_block = _text_between(run, 'case "$absent_result" in', "esac")
+    absent_arms = _shell_case_arms(absent_block)
+    assert absent_arms == {
+        "absent": "",
+        "*": (
+            'echo "::error::The graphics chip check read ${absent_result} for '
+            '/marrquee-ci-no-such-device"; exit 1'
+        ),
+    }
+
+    present_block = _text_between(run, 'case "$present_result" in', "esac")
+    present_arms = _shell_case_arms(present_block)
+    assert present_arms == {
+        "present": "",
+        "*": (
+            'echo "::error::The graphics chip check read ${present_result} for /dev/null"; exit 1'
+        ),
+    }
+
+
+def test_stack_smoke_graphics_chip_step_leaves_no_container_and_creates_no_path() -> None:
+    run = _step_named(_stack_smoke_job(), "graphics chip check")["run"]
+
+    assert "docker ps -aq --filter name=marrquee-graphics-check" in run
+    _assert_post_loop_verdict(
+        run,
+        'if [ -n "$leftover" ]; then',
+        "The graphics chip check left a container behind",
+    )
+    _assert_post_loop_verdict(
+        run,
+        "if ! test ! -e /marrquee-ci-no-such-device; then",
+        "The graphics chip check created the path it was only ever meant to probe",
+    )
+
+
+def test_stack_smoke_graphics_chip_step_mknods_the_device_only_when_missing_and_marks_it() -> None:
+    run = _step_named(_stack_smoke_job(), "graphics chip check")["run"]
+
+    if_block = _text_between(run, "if [ -e /dev/dri/renderD128 ]; then", "fi")
+    assert "sudo mkdir -p /dev/dri" not in _text_between(
+        run, "if [ -e /dev/dri/renderD128 ]; then", "else"
+    )
+    assert "sudo mknod -m 0666 /dev/dri/renderD128 c 226 128" in if_block
+    assert 'touch "$RUNNER_TEMP/marrquee-made-dri"' in if_block
+
+
+def test_stack_smoke_graphics_chip_step_restarts_and_waits_bounded_for_healthz() -> None:
+    """`docker restart` (never a recreate) is the only way the in-memory
+    `GraphicsChipCheck` cache - already settled on "absent" by every earlier
+    Hub load in this job - gets asked again now that the node exists.
+    """
+    run = _step_named(_stack_smoke_job(), "graphics chip check")["run"]
+
+    assert "docker restart marrquee-stack-smoke" in run
+    assert "for _ in $(seq 1 30); do" in run
+    assert "while true" not in run
+
+    restart_index = run.index("docker restart marrquee-stack-smoke")
+    wait_index = run.index("for _ in $(seq 1 30); do")
+    assert restart_index < wait_index
+
+    _assert_post_loop_verdict(
+        run,
+        'if [ "$healthz_ready" != "true" ]; then',
+        "Marrquee never answered /healthz within 60s after restarting for the graphics chip",
+    )
+
+
+# --- Jellyfin is set up with the one login, its libraries and the graphics
+# chip: the Hub's own install endpoint, real host networking and device
+# pass-through, and Jellyfin's own API read back through the saved key. -----
+
+
+def test_stack_smoke_jellyfin_setup_step_checks_the_chip_question_is_offered() -> None:
+    run = _step_named(_stack_smoke_job(), "jellyfin is set up")["run"]
+
+    assert "http://127.0.0.1:7788/?panel=install" in run
+    _assert_post_loop_verdict(
+        run,
+        'if ! echo "$install_html" | grep -qF \'data-question-step="jellyfin:graphics"\'; then',
+        "The graphics question wasn't offered although /dev/dri/renderD128 exists",
+    )
+
+
+def test_stack_smoke_jellyfin_setup_step_installs_through_the_hub_endpoint_answering_yes() -> None:
+    run = _step_named(_stack_smoke_job(), "jellyfin is set up")["run"]
+
+    assert "/api/hub/apps/jellyfin/install" in run
+    assert '{"answers":{"graphics_chip":"yes"}}' in run
+    assert (
+        'if [ "$code" != "202" ]; then' in run
+        and "POST /api/hub/apps/jellyfin/install returned ${code}, expected 202" in run
+    )
+
+
+def test_stack_smoke_jellyfin_setup_step_install_post_guards_a_dead_connection() -> None:
+    """`curl -s` without `-f` exits non-zero on a connection refused, and
+    under `set -euo pipefail` that would abort the step with no `::error::`
+    at all - the assignment itself has to be guarded, not just the HTTP
+    status read out of it afterwards.
+    """
+    run = _step_named(_stack_smoke_job(), "jellyfin is set up")["run"]
+
+    _assert_post_loop_verdict(
+        run,
+        "if ! response=$(curl -s -w '\\n%{http_code}' -X POST "
+        "http://127.0.0.1:7788/api/hub/apps/jellyfin/install "
+        '-H "Content-Type: application/json" '
+        '-d \'{"answers":{"graphics_chip":"yes"}}\'); then',
+        "couldn't reach Marrquee to install Jellyfin",
+    )
+
+
+def test_stack_smoke_jellyfin_setup_step_polls_bounded_and_pins_the_final_verdict() -> None:
+    run = _step_named(_stack_smoke_job(), "jellyfin is set up")["run"]
+
+    assert "for _ in $(seq 1 120); do" in run
+    assert 'select(.app_id == "jellyfin")' in run
+    assert (
+        'if [ "$state" = "up" ] && [ "$add_state" = "null" ] && [ -z "$note" ] '
+        '&& [ "$busy" = "false" ]; then' in run
+    )
+    _assert_post_loop_verdict(
+        run,
+        'if [ "$state" != "up" ] || [ "$add_state" != "null" ] || [ -n "$note" ] '
+        '|| [ "$busy" != "false" ]; then',
+        "Jellyfin never finished adding within 10 minutes",
+    )
+    assert "::notice::Jellyfin's image pull and first-time setup took" in run
+
+
+def test_stack_smoke_jellyfin_setup_step_pins_the_network_mode_and_device_verdicts() -> None:
+    run = _step_named(_stack_smoke_job(), "jellyfin is set up")["run"]
+
+    assert "docker inspect -f '{{.HostConfig.NetworkMode}}' jellyfin" in run
+    _assert_post_loop_verdict(
+        run,
+        "if ! network_mode=$(docker inspect -f '{{.HostConfig.NetworkMode}}' jellyfin) "
+        '|| [ -z "$network_mode" ]; then',
+        "couldn't inspect the jellyfin container's network mode",
+    )
+    _assert_post_loop_verdict(
+        run,
+        'if [ "$network_mode" != "host" ]; then',
+        "Jellyfin is not on the host network",
+    )
+
+    assert "docker inspect -f '{{range .HostConfig.Devices}}{{.PathOnHost}}{{end}}' jellyfin" in run
+    _assert_post_loop_verdict(
+        run,
+        'if [ "$device_path" != "/dev/dri" ]; then',
+        "Jellyfin's graphics chip device was not passed through as /dev/dri",
+    )
+    _assert_post_loop_verdict(
+        run,
+        "if ! docker exec jellyfin test -c /dev/dri/renderD128; then",
+        "/dev/dri/renderD128 is not a character device inside the jellyfin container",
+    )
+
+
+def test_stack_smoke_jellyfin_setup_step_checks_script_reaches_it_through_the_host_address() -> (
+    None
+):
+    """Never a Docker-network name like `http://jellyfin:8096` - a
+    Jellyfin-only install may never create that network at all, so this
+    reaches it the same way Plex's own proof does, through its own gateway
+    address.
+    """
+    run = _step_named(_stack_smoke_job(), "jellyfin is set up")["run"]
+    body = _heredoc_body(run, "ci_jellyfin_checks.py")
+
+    assert "from marrquee.plex import plex_host_address" in run
+    assert "from marrquee.jellyfin import (" in run
+    assert "address = await plex_host_address(engine, self_id)" in body
+    assert "base_url = jellyfin_base_url(address)" in body
+    assert "http://jellyfin:8096" not in run
+
+
+def test_stack_smoke_jellyfin_setup_step_checks_script_pins_every_decisive_guard() -> None:
+    """Scoped to this one heredoc (`_heredoc_body`) - an identical-looking
+    `is not True` or `!= "Marrquee"` comparison could exist in some other
+    step's own script elsewhere in this file, and a mutation hollowing one
+    of these guards must be caught even so.
+    """
+    run = _step_named(_stack_smoke_job(), "jellyfin is set up")["run"]
+    body = _heredoc_body(run, "ci_jellyfin_checks.py")
+    tree = ast.parse(body)
+
+    source_lines = body.splitlines()
+
+    def _guard_line(text: str) -> str:
+        matches = [line for line in source_lines if line.strip() == text]
+        assert matches, f"guard {text!r} not found verbatim in the checks script"
+        return matches[0]
+
+    _guard_line('if public_info.payload.get("StartupWizardCompleted") is not True:')
+    _guard_line('if public_info.payload.get("ServerName") != "Marrquee":')
+    _guard_line('if ("movies", (movies_path,)) not in units:')
+    _guard_line('if ("tvshows", (tv_path,)) not in units:')
+    _guard_line('if accel not in ("vaapi", 5):')
+    _guard_line('if encoding.payload.get("VaapiDevice") != GRAPHICS_DEVICE_NODE:')
+
+    # Belt and suspenders: real Python, not just adjacent-looking lines.
+    raises = [node for node in ast.walk(tree) if isinstance(node, ast.Raise)]
+    assert len(raises) >= 6
+
+
+def test_stack_smoke_jellyfin_setup_step_checks_libraries_use_the_shared_path_helper() -> None:
+    run = _step_named(_stack_smoke_job(), "jellyfin is set up")["run"]
+    body = _heredoc_body(run, "ci_jellyfin_checks.py")
+
+    assert "from marrquee.storage import container_media_path" in run
+    assert 'movies_path = str(container_media_path("movies"))' in body
+    assert 'tv_path = str(container_media_path("tv"))' in body
+    assert "parse_virtual_folders" in run
+
+
+def test_stack_smoke_jellyfin_setup_step_checks_the_link_target_and_file_permissions() -> None:
+    run = _step_named(_stack_smoke_job(), "jellyfin is set up")["run"]
+
+    assert "http://127.0.0.1:8096/" in run
+    _assert_post_loop_verdict(
+        run,
+        'if [ "$web_code" != "200" ]; then',
+        "Jellyfin's own sign-in page did not answer 200",
+    )
+
+    assert "command -v stat" in run
+    _assert_post_loop_verdict(
+        run,
+        'if [ "$jellyfin_json_perms" != "600 0" ]; then',
+        "jellyfin.json was not 0600 owned by root",
+    )
+
+
+def test_stack_smoke_jellyfin_setup_step_key_check_runs_the_positive_control_first() -> None:
+    """A positive control that could never find anything (the key not even
+    in its own raw file) must fail loudly, before the real leak check below
+    it ever gets a chance to pass by accident.
+    """
+    run = _step_named(_stack_smoke_job(), "jellyfin is set up")["run"]
+    body = _heredoc_body(run, "ci_jellyfin_key_check.py")
+
+    assert "if key not in raw_jellyfin_json:" in body
+    assert "the positive control failed" in body
+
+    positive_control_index = body.index("the positive control failed")
+    leak_check_index = body.index(
+        'print("verdict=leak" if key in compose_text else "verdict=clean")'
+    )
+    assert positive_control_index < leak_check_index
+
+
+def test_stack_smoke_jellyfin_setup_step_pins_the_key_check_case_arms() -> None:
+    run = _step_named(_stack_smoke_job(), "jellyfin is set up")["run"]
+
+    case_block = _text_between(run, 'case "$verdict" in', "esac")
+    arms = _shell_case_arms(case_block)
+    assert arms == {
+        "clean": "",
+        "leak": 'echo "::error::the Jellyfin API key leaked into compose.yaml"; exit 1',
+        "*": (
+            'echo "::error::the Jellyfin key check produced an unexpected verdict '
+            '(${verdict})"; exit 1'
+        ),
+    }
+
+
+def test_stack_smoke_jellyfin_setup_step_key_check_never_echoes_the_key_itself() -> None:
+    """Only a clean/leak verdict and a length ever leave the Python process -
+    the key itself is read, compared and discarded entirely inside it.
+    """
+    run = _step_named(_stack_smoke_job(), "jellyfin is set up")["run"]
+    body = _heredoc_body(run, "ci_jellyfin_key_check.py")
+
+    # Pinned to the exact two prints this script may ever make - a third
+    # print, or either one widened to interpolate `key` itself instead of a
+    # verdict or a length, would fail this exact-set comparison.
+    print_lines = [line.strip() for line in body.splitlines() if line.strip().startswith("print(")]
+    assert print_lines == [
+        'print("verdict=leak" if key in compose_text else "verdict=clean")',
+        'print(f"key_length={len(key)}")',
+    ]
+
+    for line in run.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("echo"):
+            assert not re.search(r"\$\{?key\}?(?![_a-zA-Z])", stripped), (
+                f"a bare $key reference appears in an echoed line: {line!r}"
+            )
+
+
+# --- Changing the one login changes Jellyfin's admin: a second throwaway
+# password, the Hub's own change route, and a real sign-in proving the old
+# login no longer works - all without ever restarting Jellyfin. ------------
+
+
+def test_stack_smoke_jellyfin_login_step_generates_and_masks_a_second_password() -> None:
+    run = _step_named(_stack_smoke_job(), "changes jellyfin's admin")["run"]
+
+    assert "new_password=$(openssl rand -hex 16)" in run
+    assert "::add-mask::$new_password" in run
+
+    generate_index = run.index("openssl rand -hex 16")
+    mask_index = run.index("::add-mask::$new_password")
+    assert generate_index < mask_index
+
+
+def test_stack_smoke_jellyfin_login_step_never_restarts_jellyfin_and_never_echoes_a_secret() -> (
+    None
+):
+    step = _step_named(_stack_smoke_job(), "changes jellyfin's admin")
+    run = step["run"]
+
+    assert "docker restart jellyfin" not in run
+    assert "docker rm -f jellyfin" not in run
+
+    for line in run.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("echo") and "::add-mask::" not in stripped:
+            assert "$new_password" not in stripped
+            assert "$MARRQUEE_CI_PASSWORD" not in stripped
+
+
+def test_stack_smoke_jellyfin_login_step_posts_the_change_with_the_right_fields() -> None:
+    run = _step_named(_stack_smoke_job(), "changes jellyfin's admin")["run"]
+
+    assert "http://127.0.0.1:7788/hub/login/change" in run
+    assert '--data-urlencode "current_password=${MARRQUEE_CI_PASSWORD}"' in run
+    assert '--data-urlencode "username=marrquee-ci-two"' in run
+    assert '--data-urlencode "password=${new_password}"' in run
+    assert '--data-urlencode "password_again=${new_password}"' in run
+
+    _assert_post_loop_verdict(
+        run,
+        'if [ "$change_code" != "303" ]; then',
+        "POST /hub/login/change returned",
+    )
+
+
+def test_stack_smoke_jellyfin_login_step_change_post_guards_a_dead_connection() -> None:
+    """Same reasoning as the install POST above: `curl -s` without `-f`
+    exits non-zero on a connection refused, and under `set -euo pipefail`
+    that would abort the step silently unless the assignment itself is
+    guarded.
+    """
+    run = _step_named(_stack_smoke_job(), "changes jellyfin's admin")["run"]
+
+    _assert_post_loop_verdict(
+        run,
+        "if ! change_code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "
+        "http://127.0.0.1:7788/hub/login/change "
+        '--data-urlencode "current_password=${MARRQUEE_CI_PASSWORD}" '
+        '--data-urlencode "username=marrquee-ci-two" '
+        '--data-urlencode "password=${new_password}" '
+        '--data-urlencode "password_again=${new_password}"); then',
+        "couldn't reach Marrquee to change the login",
+    )
+
+
+def test_stack_smoke_jellyfin_login_step_polls_busy_and_banner_bounded() -> None:
+    run = _step_named(_stack_smoke_job(), "changes jellyfin's admin")["run"]
+
+    assert "for _ in $(seq 1 90); do" in run
+    assert "while true" not in run
+    assert 'if [ "$busy" = "false" ] && [ "$banner" = "none" ]; then' in run
+    _assert_post_loop_verdict(
+        run,
+        'if [ "$busy" != "false" ] || [ "$banner" != "none" ]; then',
+        "the login change never finished within 3 minutes",
+    )
+
+
+def test_stack_smoke_jellyfin_login_step_checks_new_login_works_and_old_login_fails() -> None:
+    run = _step_named(_stack_smoke_job(), "changes jellyfin's admin")["run"]
+    body = _heredoc_body(run, "ci_jellyfin_login_change.py")
+
+    assert '"Username": "marrquee-ci-two", "Pw": new_password' in body
+    assert '"Username": "marrquee-ci", "Pw": old_password' in body
+
+    stripped_lines = [line.strip() for line in body.splitlines()]
+    assert "if not new_auth.ok:" in stripped_lines
+    assert "if old_auth.status != 401:" in stripped_lines
+
+    tree = ast.parse(body)
+    raises = [node for node in ast.walk(tree) if isinstance(node, ast.Raise)]
+    assert len(raises) >= 2
+
+
+def test_stack_smoke_jellyfin_login_step_passes_secrets_only_through_docker_exec_env() -> None:
+    """The password only ever appears inside `docker exec -e`, the same
+    shape qBittorrent's own key check already uses - never printed, and
+    never passed as a bare argument a process listing could show.
+    """
+    run = _step_named(_stack_smoke_job(), "changes jellyfin's admin")["run"]
+
+    assert (
+        'docker exec -e JELLYFIN_NEW_PASSWORD="$new_password" '
+        '-e JELLYFIN_OLD_PASSWORD="$MARRQUEE_CI_PASSWORD" marrquee-stack-smoke '
+        "python3 /tmp/ci_jellyfin_login_change.py" in run
+    )

@@ -30,6 +30,7 @@ from marrquee.docker_client import (
     ExecStartResult,
     ExecState,
     FakeDockerEngine,
+    HostPathProbe,
     NetworkConnectResult,
 )
 from marrquee.hardlinks import HardlinkMonitor, HardlinkResult
@@ -89,6 +90,9 @@ class _CountingDockerEngine:
     async def host_gateway(self, container: str) -> str | None:
         raise NotImplementedError("the alive page never looks up a host gateway")
 
+    async def probe_host_path(self, self_container: str, host_path: str) -> HostPathProbe:
+        raise NotImplementedError("the alive page never probes for a graphics chip")
+
 
 class _ExplodingDockerEngine:
     """A DockerEngine whose every method always raises.
@@ -132,6 +136,9 @@ class _ExplodingDockerEngine:
         raise RuntimeError("healthz must never call the Docker engine")
 
     async def host_gateway(self, container: str) -> str | None:
+        raise RuntimeError("healthz must never call the Docker engine")
+
+    async def probe_host_path(self, self_container: str, host_path: str) -> HostPathProbe:
         raise RuntimeError("healthz must never call the Docker engine")
 
 

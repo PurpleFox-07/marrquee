@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from typing import Final, Literal
 
 from marrquee.words import (
+    JELLYFIN_DESCRIPTION,
+    JELLYFIN_EXCLUDES_PLEX,
     PLEX_DESCRIPTION,
     PLEX_EXCLUDES_JELLYFIN,
     PROWLARR_DESCRIPTION,
@@ -54,8 +56,12 @@ class AppRule:
 # own kind rather than reusing "arr": it takes the login through its API
 # key (`app/setPreferences`), never Sonarr/Radarr's cookie login, and it is
 # never recreated by the login run's arr-only second phase (its login is
-# already live once the first phase's POST succeeds).
-LoginKind = Literal["arr", "none", "qbittorrent"]
+# already live once the first phase's POST succeeds). "jellyfin" is its own
+# kind too: the login becomes Jellyfin's admin through its own API key
+# (Marrquee's first-time setup door), never Sonarr/Radarr's cookie login,
+# and - like qBittorrent - it is never recreated by the arr-only second
+# phase either.
+LoginKind = Literal["arr", "none", "qbittorrent", "jellyfin"]
 
 # What kind of app this is, so the compose builder, the deploy engine and
 # the Hub's poster all know which branch to take instead of an "arr" app
@@ -142,6 +148,7 @@ class CatalogApp:
 
 RECYCLARR_APP_ID: Final = "recyclarr"
 PLEX_APP_ID: Final = "plex"
+JELLYFIN_APP_ID: Final = "jellyfin"
 
 # The id every media-server door registers under - read by `media_server_of`
 # and, later, Stories 9/10's connect/Seerr flows, so a media-server-shaped
@@ -149,16 +156,19 @@ PLEX_APP_ID: Final = "plex"
 MEDIA_SERVER_APP_IDS: Final = ("plex", "jellyfin")
 
 # Prowlarr, Sonarr, Radarr, Gluetun (the VPN tunnel), qBittorrent (the
-# downloader), Recyclarr (quality settings from the TRaSH guides) and Plex
-# (a media server, linked to the owner's own Plex account).
+# downloader), Recyclarr (quality settings from the TRaSH guides), Plex
+# (a media server, linked to the owner's own Plex account) and Jellyfin (a
+# media server, signed in with the owner's own Marrquee login).
 # Gluetun is `offered=False`: it never appears as its own "+" choice or
 # wizard tick - whatever needs it (qBittorrent, today) adds it as a
 # companion instead. qBittorrent's `network_via="gluetun"` is what enforces
 # "the downloader must never run outside the tunnel": it has no network or
 # API key of its own, and `build_stack_plan` refuses any install that has
-# it without Gluetun. Plex keeps an ordinary, unused Marrquee API key (like
-# Recyclarr) - it authenticates only with the owner's own Plex account
-# token, never Marrquee's key.
+# it without Gluetun. Plex and Jellyfin both keep an ordinary, unused
+# Marrquee API key (like Recyclarr) - Plex authenticates only with the
+# owner's own Plex account token, and Jellyfin keeps its own admin API key
+# in its own settings file, never Marrquee's key. Each excludes the other
+# (`AppRule("excludes_any", ...)`): only one media server per install.
 CATALOG: tuple[CatalogApp, ...] = (
     CatalogApp(
         id="prowlarr",
@@ -281,6 +291,26 @@ CATALOG: tuple[CatalogApp, ...] = (
         kind="media_server",
         offered=True,
         web_path="/web",
+        library_folders=("movies", "tv"),
+    ),
+    CatalogApp(
+        id=JELLYFIN_APP_ID,
+        name="Jellyfin",
+        description=JELLYFIN_DESCRIPTION,
+        image="lscr.io/linuxserver/jellyfin:latest",
+        port=8096,
+        env_prefix="JELLYFIN",
+        api_base="",
+        media_folders=(),
+        needs_data_mount=False,
+        glyph="JF",
+        order=7,
+        default_ticked=False,
+        web_page=True,
+        rules=(AppRule(kind="excludes_any", app_ids=("plex",), reason=JELLYFIN_EXCLUDES_PLEX),),
+        login_kind="jellyfin",
+        kind="media_server",
+        offered=True,
         library_folders=("movies", "tv"),
     ),
 )

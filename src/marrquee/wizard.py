@@ -67,21 +67,21 @@ class WizardStep:
     key: str = ""
 
 
-def wizard_steps(app_ids: Iterable[str]) -> tuple[WizardStep, ...]:
+def wizard_steps(app_ids: Iterable[str], *, graphics_chip: bool = False) -> tuple[WizardStep, ...]:
     """The full progress row for a wizard run that has ticked `app_ids`.
 
     Always "Your apps" then "Your login" first, then one pill per
     registered question step those apps carry (in `question_steps_for`'s
-    own catalog-then-declared order), then "Your drive" and "Deploy". No
-    catalog app has a question yet, so today this is byte-identical to the
-    four fixed pills the wizard always shows - a later app's question step
-    inserts itself here without either screen changing.
+    own catalog-then-declared order), then "Your drive" and "Deploy".
+    `graphics_chip` is passed straight through to `question_steps_for` -
+    Jellyfin's own graphics pill only ever appears once a caller has
+    confirmed the NAS actually has the chip.
     """
     steps = [
         WizardStep(number=1, label=words.WIZARD_STEP_APPS, key="apps"),
         WizardStep(number=2, label=words.WIZARD_STEP_LOGIN, key="login"),
     ]
-    for step in question_steps_for(app_ids):
+    for step in question_steps_for(app_ids, graphics_chip=graphics_chip):
         steps.append(
             WizardStep(
                 number=len(steps) + 1,

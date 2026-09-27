@@ -490,6 +490,7 @@ def hub_view(
     recyclarr: SyncStatus | None = None,
     sync_late_after: timedelta = SYNC_LATE_AFTER,
     answers: Mapping[str, Mapping[str, str]] = {},
+    graphics_chip: bool = False,
 ) -> HubView:
     healths_by_id = {health.app_id: health for health in healths}
     gaps_by_id = {gap.app_id: gap for gap in wiring_gaps}
@@ -557,6 +558,7 @@ def hub_view(
         steps = question_steps_for(
             (*companions_for(app.id, deployed_ids, without_vpn=without_vpn), app.id),
             present=deployed_ids,
+            graphics_chip=graphics_chip,
         )
         needs_sign_in, sign_in_answers = _sign_in_status(steps, answers)
         return InstallRow(

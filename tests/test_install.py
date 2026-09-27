@@ -69,6 +69,26 @@ def test_plex_gets_an_ordinary_unused_key_like_every_other_app(tmp_path: Path) -
     assert len(grown.api_keys["plex"]) == 32
 
 
+def test_jellyfin_gets_an_ordinary_unused_key_like_every_other_app(tmp_path: Path) -> None:
+    """Jellyfin, like Plex, has no `api_key_source` field - it mints an
+    ordinary, unused hex32 key. Jellyfin's own admin API key (Chunk 2) is
+    kept in `jellyfin.json`, never in `install.json`.
+    """
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+
+    result = install_apps(settings, str(root), ["sonarr", "jellyfin"])
+
+    assert result.ok
+    assert result.state is not None
+    assert set(result.state.api_keys) == {"sonarr", "jellyfin"}
+    assert len(result.state.api_keys["jellyfin"]) == 32
+    assert result.state.api_keys["jellyfin"] != result.state.api_keys["sonarr"]
+
+    grown = with_app_added(_state((), {}), "jellyfin")
+    assert len(grown.api_keys["jellyfin"]) == 32
+
+
 def test_install_apps_keeps_an_existing_key_on_a_repost(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     root = _fresh_root(settings)

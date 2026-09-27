@@ -43,6 +43,7 @@ from marrquee.deploy import (
     WiringGap,
 )
 from marrquee.docker_client import ContainerSnapshot, DockerStatus, FakeDockerEngine
+from marrquee.graphics_chip import GRAPHICS_DEVICE_NODE
 from marrquee.hardlinks import HardlinkMonitor, HardlinkResult, save_hardlink_result
 from marrquee.health import FakeLinkProbe
 from marrquee.hub import LOGIN_HELP_URL
@@ -1141,7 +1142,7 @@ def test_panel_nonsense_and_edit_unknown_link_draw_it_closed(tmp_path: Path) -> 
 
 def test_install_pane_is_truthful(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
-    all_offered = ("prowlarr", "sonarr", "radarr", "qbittorrent", "recyclarr", "plex")
+    all_offered = ("prowlarr", "sonarr", "radarr", "qbittorrent", "recyclarr", "plex", "jellyfin")
     save_state(settings.config_dir, _install_state(all_offered))
     _write_snapshot(settings, _finale_snapshot(all_offered))
     save_login(settings.config_dir, "owner", "s3cret-password-1", honor_reset=None)
@@ -1162,6 +1163,50 @@ def test_install_pane_is_truthful(tmp_path: Path) -> None:
     assert words.HUB_INSTALL_ALL_DONE not in partial.text
     assert "Prowlarr" in partial.text
     assert "Radarr" in partial.text
+
+
+def test_jellyfins_install_row_gets_the_graphics_step_only_with_a_chip(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr",)))
+    _write_snapshot(settings, _finale_snapshot(("sonarr",)))
+    save_login(settings.config_dir, "owner", "s3cret-password-1", honor_reset=None)
+
+    no_chip_engine = FakeDockerEngine(
+        DockerStatus(connected=True, version="27.3.1"),
+        containers=_running_containers(("sonarr",)),
+    )
+    no_chip_page = _client(settings, no_chip_engine).get("/?panel=install").text
+    assert 'data-question-step="jellyfin:graphics"' not in no_chip_page
+
+    with_chip_engine = FakeDockerEngine(
+        DockerStatus(connected=True, version="27.3.1"),
+        containers=_running_containers(("sonarr",)),
+        host_paths={GRAPHICS_DEVICE_NODE},
+    )
+    with_chip_page = _client(settings, with_chip_engine).get("/?panel=install").text
+    assert 'data-question-step="jellyfin:graphics"' in with_chip_page
+
+
+def test_the_hub_never_probes_for_a_chip_once_jellyfin_is_already_installed(
+    tmp_path: Path,
+) -> None:
+    """The chip could no longer matter for an already-installed Jellyfin -
+    the predicate that guards the probe must skip it before it ever asks
+    Docker, not merely discard whatever answer comes back.
+    """
+    settings = _settings(tmp_path)
+    save_state(settings.config_dir, _install_state(("sonarr", "jellyfin")))
+    _write_snapshot(settings, _finale_snapshot(("sonarr", "jellyfin")))
+    save_login(settings.config_dir, "owner", "s3cret-password-1", honor_reset=None)
+    engine = FakeDockerEngine(
+        DockerStatus(connected=True, version="27.3.1"),
+        containers=_running_containers(("sonarr", "jellyfin")),
+        host_paths={GRAPHICS_DEVICE_NODE},
+    )
+
+    _client(settings, engine).get("/?panel=install")
+
+    assert "probe_host_path" not in [name for name, _args in engine.calls]
 
 
 def _install_row_html(page_html: str, app_id: str) -> str:

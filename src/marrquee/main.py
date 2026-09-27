@@ -18,8 +18,10 @@ from fastapi.templating import Jinja2Templates
 from marrquee.config import Settings
 from marrquee.deploy import DeployManager, HttpReadinessProbe, ReadinessProbe
 from marrquee.docker_client import DockerEngine, SocketDockerEngine
+from marrquee.graphics_chip import GraphicsChipCheck
 from marrquee.hardlinks import HardlinkMonitor
 from marrquee.health import HttpLinkProbe, LinkProbe
+from marrquee.jellyfin import HttpJellyfinServer, JellyfinServer
 from marrquee.login_apply import HttpLoginApplier, LoginApplier
 from marrquee.plex import HttpPlexServer, HttpPlexTv, PlexServer, PlexTv, plex_host_address
 from marrquee.recyclarr import RecyclarrControl, RecyclarrMonitor
@@ -59,6 +61,8 @@ def create_app(
     recyclarr: RecyclarrControl | None = None,
     plex_tv: PlexTv | None = None,
     plex_server: PlexServer | None = None,
+    jellyfin: JellyfinServer | None = None,
+    graphics_chip: GraphicsChipCheck | None = None,
 ) -> FastAPI:
     """Build the Marrquee app.
 
@@ -106,7 +110,15 @@ def create_app(
     needs its own `plex_tv=`/`plex_server=` too if a route under test should
     see that same fake. `app.state.plex_sign_in` is a fresh, in-memory
     `PlexSignInStore` every time - the sign-in round trip's own pending pins
-    are never worth injecting or persisting.
+    are never worth injecting or persisting. `jellyfin=None` builds one real
+    `HttpJellyfinServer()` the same way, handed to a freshly-built
+    `DeployManager` as `jellyfin=` AND kept on `app.state.jellyfin` for the
+    same reachable-address closure Plex's own bring-up already resolves
+    fresh on every wiring run - Jellyfin runs on the host's own network too,
+    so it needs no network name of its own. `graphics_chip=None` builds one
+    real `GraphicsChipCheck(engine)`, kept on `app.state.graphics_chip` for
+    the wizard and Hub routes to share - the one instance whose own cache
+    means the graphics-chip question is only ever probed for once.
     """
     if settings is None:
         settings = Settings.from_env()
@@ -124,11 +136,17 @@ def create_app(
         plex_tv = HttpPlexTv()
     if plex_server is None:
         plex_server = HttpPlexServer()
+    if jellyfin is None:
+        jellyfin = HttpJellyfinServer()
+    if graphics_chip is None:
+        graphics_chip = GraphicsChipCheck(engine)
 
-    async def _plex_address() -> str | None:
+    async def _host_address() -> str | None:
         # Resolved fresh on every wiring run (see `WiringEngine.run`), never
         # cached here - Marrquee's own container can in principle change
         # which network's gateway is reachable between one run and the next.
+        # Shared by Plex and Jellyfin: both run on the host's own network,
+        # so both are reached at the same address.
         return await plex_host_address(engine, await engine.self_container_id())
 
     if manager is None:
@@ -144,11 +162,20 @@ def create_app(
                     vpn=vpn_control,
                     config_dir=settings.config_dir,
                     plex=plex_server,
-                    plex_address=_plex_address,
+                    plex_address=_host_address,
+                    jellyfin=jellyfin,
+                    jellyfin_address=_host_address,
                 )
             ),
             login=(
-                login_applier if login_applier is not None else HttpLoginApplier(qbit=qbit_client)
+                login_applier
+                if login_applier is not None
+                else HttpLoginApplier(
+                    qbit=qbit_client,
+                    jellyfin=jellyfin,
+                    jellyfin_address=_host_address,
+                    config_dir=settings.config_dir,
+                )
             ),
             vpn=vpn_control,
             qbit=qbit_client,
@@ -156,6 +183,7 @@ def create_app(
             recyclarr=recyclarr,
             plex_tv=plex_tv,
             plex_server=plex_server,
+            jellyfin=jellyfin,
         )
     if link_probe is None:
         link_probe = HttpLinkProbe()
@@ -177,6 +205,8 @@ def create_app(
     app.state.recyclarr = recyclarr
     app.state.plex_tv = plex_tv
     app.state.plex_server = plex_server
+    app.state.jellyfin = jellyfin
+    app.state.graphics_chip = graphics_chip
     app.state.plex_sign_in = PlexSignInStore()
     app.state.templates = Jinja2Templates(directory=_TEMPLATES_DIR)
 

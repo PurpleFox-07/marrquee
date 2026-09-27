@@ -15,7 +15,9 @@ from pathlib import Path
 import pytest
 
 from marrquee import questions, words
+from marrquee.jellyfin import FakeJellyfinServer, JellyfinResponse, save_jellyfin
 from marrquee.plex import FakePlexServer, PlexResponse, save_plex_sign_in
+from marrquee.questions import save_step_answers
 from marrquee.state import STATE_VERSION, InstallState
 from marrquee.vpn_control import FakeGluetunControl
 from marrquee.wiring import WiringRunner, WiringStep
@@ -24,6 +26,8 @@ from marrquee.wiring.engine import (
     AppSyncTask,
     DownloadClientTask,
     ExplainTask,
+    JellyfinGraphicsTask,
+    JellyfinLibrariesTask,
     PlexDirectPlayTask,
     PlexLibrariesTask,
     QbitSettingsTask,
@@ -1010,6 +1014,264 @@ async def test_plex_free_run_never_resolves_the_plex_address_or_reads_plex_json(
         }
     )
     engine = WiringEngine(client=fake, config_dir=tmp_path, plex_address=_recording_address)
+    steps: list[WiringStep] = []
+
+    await engine.run(_install_state(("sonarr",)), steps.append)
+
+    assert address_calls == []
+    assert load_calls == []
+    assert _frames_by_key(steps)["root-folder:sonarr"][-1].state == "done"
+
+
+# --- plan_wiring: Jellyfin's libraries and graphics tasks -------------------
+
+
+def _jellyfin_ok(payload: object = None, status: int = 200) -> JellyfinResponse:
+    return JellyfinResponse(ok=True, status=status, payload=payload, detail=None)
+
+
+def _jellyfin_no_libraries() -> JellyfinResponse:
+    return _jellyfin_ok([])
+
+
+def _jellyfin_vaapi_already_set() -> JellyfinResponse:
+    return _jellyfin_ok({"HardwareAccelerationType": "vaapi", "VaapiDevice": "/dev/dri/renderD128"})
+
+
+def test_plan_wiring_appends_the_jellyfin_tasks_last_after_plex() -> None:
+    state = _install_state(("prowlarr", "sonarr", "plex", "jellyfin"))
+
+    keys = [task.key for task in plan_wiring(state, answers={"jellyfin": {"graphics_chip": "yes"}})]
+
+    assert keys == [
+        "app-sync:sonarr",
+        "root-folder:sonarr",
+        "libraries:plex",
+        "direct-play:plex",
+        "libraries:jellyfin",
+        "graphics:jellyfin",
+    ]
+
+
+@pytest.mark.parametrize(
+    "app_ids",
+    [
+        (),
+        ("prowlarr",),
+        ("prowlarr", "sonarr", "radarr"),
+        ("prowlarr", "sonarr", "qbittorrent"),
+        ("plex",),
+        ("prowlarr", "sonarr", "plex"),
+    ],
+)
+def test_no_jellyfin_leaves_the_plan_byte_identical(app_ids: tuple[str, ...]) -> None:
+    """A jellyfin-free install must cost nothing: adding the `answers`
+    parameter, and Jellyfin's own tasks, must never change one key of an
+    existing plan - even when `answers` claims the graphics chip is wanted.
+    """
+    state = _install_state(app_ids)
+
+    before = [task.key for task in plan_wiring(state)]
+    after = [
+        task.key for task in plan_wiring(state, answers={"jellyfin": {"graphics_chip": "yes"}})
+    ]
+
+    assert before == after
+    assert "libraries:jellyfin" not in after
+    assert "graphics:jellyfin" not in after
+
+
+def test_no_graphics_task_without_a_yes_answer() -> None:
+    state = _install_state(("jellyfin",))
+
+    assert [task.key for task in plan_wiring(state)] == ["libraries:jellyfin"]
+    assert [task.key for task in plan_wiring(state, answers={})] == ["libraries:jellyfin"]
+    assert [
+        task.key for task in plan_wiring(state, answers={"jellyfin": {"graphics_chip": "no"}})
+    ] == ["libraries:jellyfin"]
+    assert [
+        task.key for task in plan_wiring(state, answers={"jellyfin": {"graphics_chip": "yes"}})
+    ] == ["libraries:jellyfin", "graphics:jellyfin"]
+
+
+def test_jellyfin_tasks_about_equals_involved() -> None:
+    state = _install_state(("jellyfin",))
+    tasks = {
+        task.key: task
+        for task in plan_wiring(state, answers={"jellyfin": {"graphics_chip": "yes"}})
+    }
+
+    libraries = tasks["libraries:jellyfin"]
+    assert isinstance(libraries, JellyfinLibrariesTask)
+    assert libraries.involved == ("jellyfin",)
+    assert libraries.about == libraries.involved
+
+    graphics = tasks["graphics:jellyfin"]
+    assert isinstance(graphics, JellyfinGraphicsTask)
+    assert graphics.involved == ("jellyfin",)
+    assert graphics.about == graphics.involved
+
+
+def test_jellyfin_task_lines_match_content_direction() -> None:
+    state = _install_state(("jellyfin",))
+    tasks = {
+        task.key: task
+        for task in plan_wiring(state, answers={"jellyfin": {"graphics_chip": "yes"}})
+    }
+
+    assert tasks["libraries:jellyfin"].line == words.wiring_line_libraries("Jellyfin")
+    assert tasks["graphics:jellyfin"].line == words.WIRING_LINE_JELLYFIN_GRAPHICS
+
+
+def test_only_app_jellyfin_keeps_both_jellyfin_tasks() -> None:
+    state = _install_state(("prowlarr", "sonarr", "jellyfin"))
+
+    keys = [
+        task.key
+        for task in plan_wiring(
+            state, only_app="jellyfin", answers={"jellyfin": {"graphics_chip": "yes"}}
+        )
+    ]
+
+    assert keys == ["libraries:jellyfin", "graphics:jellyfin"]
+
+
+# --- WiringEngine.run: resolving Jellyfin's address and saved key -----------
+
+
+async def _no_jellyfin_address() -> str | None:
+    return None
+
+
+async def _fake_jellyfin_address() -> str | None:
+    return "192.168.1.6"
+
+
+async def test_missing_jellyfin_address_reports_unreachable_for_both_tasks(
+    tmp_path: Path,
+) -> None:
+    save_step_answers(tmp_path, "jellyfin", {"graphics_chip": "yes"})
+    engine = WiringEngine(
+        client=FakeArrClient({}),
+        jellyfin=FakeJellyfinServer(script={}),
+        jellyfin_address=_no_jellyfin_address,
+        config_dir=tmp_path,
+    )
+    steps: list[WiringStep] = []
+
+    await engine.run(_install_state(("jellyfin",)), steps.append)
+
+    frames = _frames_by_key(steps)
+    assert frames["libraries:jellyfin"][-1].state == "error"
+    assert frames["libraries:jellyfin"][-1].note == words.wiring_failure_unreachable("Jellyfin")
+    assert frames["graphics:jellyfin"][-1].state == "error"
+    assert frames["graphics:jellyfin"][-1].note == words.wiring_failure_unreachable("Jellyfin")
+
+
+async def test_missing_jellyfin_key_reports_not_set_up(tmp_path: Path) -> None:
+    save_step_answers(tmp_path, "jellyfin", {"graphics_chip": "yes"})
+    engine = WiringEngine(
+        client=FakeArrClient({}),
+        jellyfin=FakeJellyfinServer(script={}),
+        jellyfin_address=_fake_jellyfin_address,
+        config_dir=tmp_path,
+    )
+    steps: list[WiringStep] = []
+
+    await engine.run(_install_state(("jellyfin",)), steps.append)
+
+    frames = _frames_by_key(steps)
+    assert frames["libraries:jellyfin"][-1].state == "error"
+    assert frames["libraries:jellyfin"][-1].note == words.WIRING_JELLYFIN_NOT_SET_UP
+    assert frames["graphics:jellyfin"][-1].state == "error"
+    assert frames["graphics:jellyfin"][-1].note == words.WIRING_JELLYFIN_NOT_SET_UP
+
+
+async def test_jellyfin_tasks_use_the_resolved_address_and_saved_key(tmp_path: Path) -> None:
+    save_jellyfin(tmp_path, "the-jellyfin-key", "admin-id")
+    save_step_answers(tmp_path, "jellyfin", {"graphics_chip": "yes"})
+    server = FakeJellyfinServer(
+        script={
+            ("GET", "/Library/VirtualFolders"): [_jellyfin_no_libraries()],
+            ("POST", "/Library/VirtualFolders"): [_jellyfin_ok(), _jellyfin_ok()],
+            ("GET", "/System/Configuration/encoding"): [_jellyfin_vaapi_already_set()],
+        }
+    )
+    engine = WiringEngine(
+        client=FakeArrClient({}),
+        jellyfin=server,
+        jellyfin_address=_fake_jellyfin_address,
+        config_dir=tmp_path,
+    )
+    steps: list[WiringStep] = []
+
+    await engine.run(_install_state(("jellyfin",)), steps.append)
+
+    frames = _frames_by_key(steps)
+    assert frames["libraries:jellyfin"][-1].state == "done"
+    assert frames["graphics:jellyfin"][-1].state == "done"
+    assert all(call[3] for call in server.calls)  # every call carried the saved key
+
+
+async def test_a_401_from_jellyfin_libraries_is_not_retried_and_errors(tmp_path: Path) -> None:
+    save_jellyfin(tmp_path, "the-jellyfin-key", "admin-id")
+    unauthorized = JellyfinResponse(ok=False, status=401, payload=None, detail=None)
+    server = FakeJellyfinServer(
+        script={("GET", "/Library/VirtualFolders"): [unauthorized for _ in range(4)]}
+    )
+    engine = WiringEngine(
+        client=FakeArrClient({}),
+        jellyfin=server,
+        jellyfin_address=_fake_jellyfin_address,
+        config_dir=tmp_path,
+        attempts=4,
+    )
+    steps: list[WiringStep] = []
+
+    await engine.run(_install_state(("jellyfin",)), steps.append)
+
+    frames = _frames_by_key(steps)
+    assert frames["libraries:jellyfin"][-1].state == "error"
+    assert frames["libraries:jellyfin"][-1].note == words.wiring_failure_refused("Jellyfin")
+    gets = [
+        call for call in server.calls if call[0] == "GET" and call[1] == "/Library/VirtualFolders"
+    ]
+    assert len(gets) == 1  # a 401 is a considered refusal, never retried
+
+
+async def test_jellyfin_free_run_never_resolves_the_jellyfin_address_or_reads_jellyfin_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A jellyfin-free install must cost nothing extra: `jellyfin_address()`
+    and the jellyfin.json loader must never even be CALLED, not merely
+    "answer nothing" - the cost of the Jellyfin feature must be zero for
+    every install that never added Jellyfin.
+    """
+    import marrquee.wiring.engine as engine_module
+
+    address_calls: list[None] = []
+
+    async def _recording_address() -> str | None:
+        address_calls.append(None)
+        return None
+
+    load_calls: list[Path] = []
+
+    def _recording_load(config_dir: Path) -> None:
+        load_calls.append(config_dir)
+        return None
+
+    monkeypatch.setattr(engine_module, "load_jellyfin", _recording_load)
+
+    fake = FakeArrClient(
+        {
+            ("GET", "http://sonarr:8989", "api/v3/system/status"): [_ok(None)],
+            ("GET", "http://sonarr:8989", "api/v3/rootfolder"): [
+                _ok([{"id": 1, "path": "/data/media/tv"}])
+            ],
+        }
+    )
+    engine = WiringEngine(client=fake, config_dir=tmp_path, jellyfin_address=_recording_address)
     steps: list[WiringStep] = []
 
     await engine.run(_install_state(("sonarr",)), steps.append)

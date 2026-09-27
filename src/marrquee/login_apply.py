@@ -16,11 +16,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal, Protocol
 
 from marrquee.catalog import CatalogApp
+from marrquee.jellyfin import (
+    HttpJellyfinServer,
+    JellyfinResponse,
+    JellyfinServer,
+    jellyfin_base_url,
+    load_jellyfin,
+)
 from marrquee.login import SavedLogin
 from marrquee.state import InstallState
 from marrquee.wiring.arr_client import ArrClient, ArrResponse, HttpArrClient
@@ -141,6 +149,20 @@ def _qbit_failure_technical(app_id: str, path: str, response: QbitResponse) -> s
     return " ".join(parts)
 
 
+def _jellyfin_failure_technical(
+    app_id: str, method: str, path: str, response: JellyfinResponse
+) -> str:
+    """Built only from the app id, method, path, status and `detail` -
+    `detail` is only ever a dead-transport message (see
+    `jellyfin.JellyfinResponse`), never a Jellyfin response body, so this
+    can never echo back the admin's key or password either.
+    """
+    parts = [f"{app_id}: {method} {path} -> HTTP {response.status}"]
+    if response.detail:
+        parts.append(response.detail)
+    return " ".join(parts)
+
+
 class HttpLoginApplier:
     """The real `LoginApplier`, for `login_kind == "arr"` and `"qbittorrent"`
     apps.
@@ -161,12 +183,18 @@ class HttpLoginApplier:
         attempts: int = 3,
         retry_delay: float = 2.0,
         qbit: QbitClient | None = None,
+        jellyfin: JellyfinServer | None = None,
+        jellyfin_address: Callable[[], Awaitable[str | None]] | None = None,
+        config_dir: Path | None = None,
     ) -> None:
         self._client = client if client is not None else HttpArrClient()
         self._sleep = sleep
         self._attempts = attempts
         self._retry_delay = retry_delay
         self._qbit = qbit if qbit is not None else HttpQbitClient()
+        self._jellyfin = jellyfin if jellyfin is not None else HttpJellyfinServer()
+        self._jellyfin_address = jellyfin_address
+        self._config_dir = config_dir
 
     async def apply(
         self, app: CatalogApp, install: InstallState, login: SavedLogin
@@ -183,6 +211,9 @@ class HttpLoginApplier:
     async def _apply(
         self, app: CatalogApp, install: InstallState, login: SavedLogin
     ) -> LoginApplyResult:
+        if app.login_kind == "jellyfin":
+            return await self._apply_jellyfin(app, login)
+
         if app.login_kind == "qbittorrent":
             return await self._apply_qbittorrent(app, install, login)
 
@@ -248,6 +279,115 @@ class HttpLoginApplier:
             return LoginApplyResult(ok=False, technical=_redact_password(technical, login.password))
 
         return LoginApplyResult(ok=True, technical=None)
+
+    async def _apply_jellyfin(self, app: CatalogApp, login: SavedLogin) -> LoginApplyResult:
+        """Jellyfin takes the login through its admin API key, never its
+        own current password: a rename, a password reset, then a sign-in
+        to prove it took - the exact "no old password needed" contract
+        this applier already gives every other login-taking app. No
+        restart follows - the key alone is enough for Jellyfin to accept
+        the new login next time it's asked.
+        """
+        if self._jellyfin_address is None:
+            return LoginApplyResult(ok=False, technical=f"{app.id}: no address")
+        address = await self._jellyfin_address()
+        if address is None:
+            return LoginApplyResult(ok=False, technical=f"{app.id}: no address")
+        if self._config_dir is None:
+            return LoginApplyResult(ok=False, technical=f"{app.id}: no config dir")
+
+        record = load_jellyfin(self._config_dir)
+        if record is None:
+            return LoginApplyResult(ok=False, technical=f"{app.id}: no Jellyfin key saved")
+
+        base_url = jellyfin_base_url(address)
+        api_key = record.api_key
+        admin_id = record.admin_id
+        user_path = f"/Users/{admin_id}"
+
+        get_response = await self._jellyfin_request_with_retry("GET", base_url, user_path, api_key)
+        if not get_response.ok:
+            technical = _jellyfin_failure_technical(app.id, "GET", user_path, get_response)
+            return LoginApplyResult(ok=False, technical=_redact_password(technical, login.password))
+        if not isinstance(get_response.payload, dict):
+            return LoginApplyResult(
+                ok=False, technical=f"{app.id}: GET {user_path} bad payload shape"
+            )
+
+        user: dict[str, object] = dict(get_response.payload)
+        if user.get("Name") != login.username:
+            user["Name"] = login.username
+            rename_response = await self._jellyfin_request_with_retry(
+                "POST", base_url, "/Users", api_key, params=[("userId", admin_id)], json_body=user
+            )
+            if not rename_response.ok:
+                technical = _jellyfin_failure_technical(app.id, "POST", "/Users", rename_response)
+                return LoginApplyResult(
+                    ok=False, technical=_redact_password(technical, login.password)
+                )
+
+        password_response = await self._jellyfin_request_with_retry(
+            "POST",
+            base_url,
+            "/Users/Password",
+            api_key,
+            params=[("userId", admin_id)],
+            json_body={"NewPw": login.password},
+        )
+        if not password_response.ok:
+            technical = _jellyfin_failure_technical(
+                app.id, "POST", "/Users/Password", password_response
+            )
+            return LoginApplyResult(ok=False, technical=_redact_password(technical, login.password))
+
+        verify_response = await self._jellyfin_request_with_retry(
+            "POST",
+            base_url,
+            "/Users/AuthenticateByName",
+            None,
+            json_body={"Username": login.username, "Pw": login.password},
+        )
+        if not verify_response.ok:
+            technical = _jellyfin_failure_technical(
+                app.id, "POST", "/Users/AuthenticateByName", verify_response
+            )
+            return LoginApplyResult(ok=False, technical=_redact_password(technical, login.password))
+
+        session_token: str | None = None
+        if isinstance(verify_response.payload, dict):
+            token = verify_response.payload.get("AccessToken")
+            if isinstance(token, str) and token:
+                session_token = token
+        if session_token is not None:
+            # Best effort - the login already verified, so a failed logout
+            # never changes the outcome.
+            await self._jellyfin_request_with_retry(
+                "POST", base_url, "/Sessions/Logout", session_token
+            )
+
+        return LoginApplyResult(ok=True, technical=None)
+
+    async def _jellyfin_request_with_retry(
+        self,
+        method: Literal["GET", "POST"],
+        base_url: str,
+        path: str,
+        token: str | None,
+        *,
+        params: Sequence[tuple[str, str]] = (),
+        json_body: object | None = None,
+    ) -> JellyfinResponse:
+        response = await self._jellyfin.request(
+            method, base_url, path, token=token, params=params, json_body=json_body
+        )
+        attempt = 1
+        while _is_transient(response.status) and attempt < self._attempts:
+            await self._sleep(self._retry_delay)
+            response = await self._jellyfin.request(
+                method, base_url, path, token=token, params=params, json_body=json_body
+            )
+            attempt += 1
+        return response
 
     async def _qbit_request_with_retry(
         self, base_url: str, path: str, api_key: str, form: Mapping[str, str]

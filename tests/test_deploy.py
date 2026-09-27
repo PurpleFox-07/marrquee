@@ -44,6 +44,7 @@ from marrquee.docker_client import (
     ExecStartResult,
     ExecState,
     FakeDockerEngine,
+    HostPathProbe,
     NetworkConnectResult,
     _service_config_signature,
 )
@@ -300,6 +301,12 @@ class _StatefulEngine:
         if container == self._self_container_id:
             return "172.18.0.1"
         return None
+
+    async def probe_host_path(self, self_container: str, host_path: str) -> HostPathProbe:
+        self.calls.append(("probe_host_path", (self_container, host_path)))
+        if self_container != self._self_container_id:
+            return HostPathProbe(result="unknown", detail=None)
+        return HostPathProbe(result="absent", detail=None)
 
 
 def _happy_engine(app_ids: tuple[str, ...]) -> _StatefulEngine:

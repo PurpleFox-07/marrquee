@@ -601,6 +601,7 @@ def test_installable_is_the_catalog_minus_the_deploy_in_catalog_order() -> None:
         "qbittorrent",
         "recyclarr",
         "plex",
+        "jellyfin",
     ]
 
     every_id = [app.id for app in CATALOG]
@@ -755,7 +756,7 @@ def test_install_rows_exclude_the_app_being_added_and_grey_an_unavailable_one(
 
     ids = [row.app.id for row in view.install_rows]
     assert "sonarr" not in ids
-    assert ids == ["prowlarr", "radarr", "qbittorrent", "recyclarr", "plex"]
+    assert ids == ["prowlarr", "radarr", "qbittorrent", "recyclarr", "plex", "jellyfin"]
     by_id = {row.app.id: row for row in view.install_rows}
     assert isinstance(by_id["radarr"], InstallRow)
     assert by_id["prowlarr"].unavailable is None
@@ -781,6 +782,16 @@ def test_install_rows_carry_each_apps_registered_question_steps() -> None:
     by_id = {row.app.id: row for row in view.install_rows}
     assert by_id["prowlarr"].steps == (fixture_step,)
     assert by_id["sonarr"].steps == ()
+
+
+def test_jellyfins_install_row_gets_the_graphics_step_only_with_a_chip() -> None:
+    without_chip = hub_view([], [], authority=_AUTHORITY, proxied=False, now=_NOW)
+    with_chip = hub_view([], [], authority=_AUTHORITY, proxied=False, now=_NOW, graphics_chip=True)
+
+    without_by_id = {row.app.id: row for row in without_chip.install_rows}
+    with_by_id = {row.app.id: row for row in with_chip.install_rows}
+    assert without_by_id["jellyfin"].steps == ()
+    assert [step.step_id for step in with_by_id["jellyfin"].steps] == ["graphics"]
 
 
 def test_the_hub_install_row_for_recyclarr_carries_the_steps_for_installed_arr_apps() -> None:

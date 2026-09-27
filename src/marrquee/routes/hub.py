@@ -27,10 +27,11 @@ from starlette.datastructures import FormData
 
 from marrquee import words
 from marrquee.addresses import authority_from_headers, proxy_suspected
-from marrquee.catalog import RECYCLARR_APP_ID, get_app
+from marrquee.catalog import JELLYFIN_APP_ID, RECYCLARR_APP_ID, get_app, unavailable_reason
 from marrquee.config import Settings
 from marrquee.deploy import AddStart, DeployManager, DeploySnapshot
 from marrquee.docker_client import DockerEngine
+from marrquee.graphics_chip import GraphicsChipCheck
 from marrquee.hardlinks import HardlinkMonitor
 from marrquee.health import LinkProbe, read_health, read_link_health
 from marrquee.hub import (
@@ -134,6 +135,16 @@ async def read_hub_view(request: Request) -> HubView:
     app_ids = tuple(app.app_id for app in snapshot.apps)
     links = load_links(settings.config_dir)
 
+    # Probed only when Jellyfin could still be added AND isn't ruled out by
+    # some other ticked app (Plex) - asking Docker on behalf of a row that
+    # can never show the chip question would only cost time.
+    graphics_chip: GraphicsChipCheck = request.app.state.graphics_chip
+    chip = (
+        JELLYFIN_APP_ID not in app_ids
+        and unavailable_reason(get_app(JELLYFIN_APP_ID), app_ids) is None
+        and await graphics_chip.has_chip()
+    )
+
     async def _sync_status() -> SyncStatus | None:
         # Asked for only when Recyclarr is actually installed - the same
         # "ask nothing you don't need to" rule `read_link_health` already
@@ -191,6 +202,7 @@ async def read_hub_view(request: Request) -> HubView:
         drive=monitor.latest(),
         recyclarr=recyclarr_status,
         answers=load_answers(settings.config_dir),
+        graphics_chip=chip,
     )
 
 

@@ -23,6 +23,7 @@ from pathlib import Path, PurePosixPath
 
 from marrquee import storage
 from marrquee.catalog import (
+    JELLYFIN_APP_ID,
     CatalogApp,
     apps_in_order,
     description_for,
@@ -31,7 +32,9 @@ from marrquee.catalog import (
     riders_of,
 )
 from marrquee.config import Settings
+from marrquee.graphics_chip import GRAPHICS_DEVICE_DIR
 from marrquee.plex import plex_secrets_host_path
+from marrquee.questions import uses_graphics_chip
 from marrquee.state import InstallState
 from marrquee.storage import ChownFn, to_host_view
 from marrquee.vpn import GluetunConfig, build_gluetun_config
@@ -40,6 +43,9 @@ from marrquee.words import (
     DATA_MOUNT_COMMENT,
     DOWNLOADER_COMPOSE_COMMENT,
     DOWNLOADER_NO_VPN_COMPOSE_COMMENT,
+    JELLYFIN_COMPOSE_COMMENT,
+    JELLYFIN_GRAPHICS_DEVICE_COMMENT,
+    JELLYFIN_MEDIA_LIBRARY_MOUNT_COMMENT,
     MEDIA_LIBRARY_MOUNT_COMMENT,
     PLEX_COMPOSE_COMMENT,
     PLEX_SECRETS_MOUNT_COMMENT,
@@ -87,9 +93,10 @@ _COMMENT_WIDTH = 78
 class ServicePlan:
     """Everything the compose file needs to say about one running app.
 
-    `cap_add`/`devices` default to empty - only Gluetun's branch of
-    `_service_plan` ever sets them, so every arr service's rendered output
-    stays exactly as it was before this story. `network_mode`, when set
+    `cap_add`/`devices` default to empty. `cap_add` is only ever Gluetun's
+    branch; `devices` is Gluetun's tunnel device or, when the owner chose
+    the graphics chip, Jellyfin's - every other service's rendered output
+    is unaffected either way. `network_mode`, when set
     (qBittorrent's branch, riding Gluetun's network namespace instead of
     getting one of its own), makes `_render_service` write a
     `network_mode:` line and skip that service's `networks:` block entirely
@@ -203,6 +210,8 @@ def _service_plan(
         return _recyclarr_service_plan(app, state, root)
 
     if app.kind == "media_server":
+        if app.id == JELLYFIN_APP_ID:
+            return _jellyfin_service_plan(app, state, root, answers)
         return _plex_service_plan(app, state, root)
 
     try:
@@ -446,6 +455,51 @@ def _plex_service_plan(app: CatalogApp, state: InstallState, root: PurePosixPath
     )
 
 
+def _jellyfin_service_plan(
+    app: CatalogApp,
+    state: InstallState,
+    root: PurePosixPath,
+    answers: Mapping[str, Mapping[str, str]],
+) -> ServicePlan:
+    """Jellyfin's own branch: host networking (the same reason Plex's own
+    branch gives - TVs and phones must see Jellyfin's real LAN address, not
+    a bridge network's 172.x one), and the graphics chip passed through as a
+    device only once the owner has actually said yes to it.
+
+    Never reads `state.api_keys`: Jellyfin mints and keeps its own admin key
+    in its own settings file (Marrquee's first-time setup door), the way
+    Plex's own branch never reads it either.
+    """
+    config_mount = f"{root / 'marrquee' / 'apps' / app.id}{_CONFIG_MOUNT_SUFFIX}"
+    media_mount = f"{root / 'data' / 'media'}{_MEDIA_LIBRARY_MOUNT_SUFFIX}"
+
+    environment: tuple[tuple[str, str], ...] = (
+        ("PUID", str(state.puid)),
+        ("PGID", str(state.pgid)),
+        ("TZ", state.timezone),
+        ("UMASK", state.umask),
+    )
+
+    chip_chosen = uses_graphics_chip(answers)
+    devices = (f"{GRAPHICS_DEVICE_DIR}:{GRAPHICS_DEVICE_DIR}",) if chip_chosen else ()
+    comment = f"{app.description} {JELLYFIN_COMPOSE_COMMENT}"
+    if chip_chosen:
+        comment = f"{comment} {JELLYFIN_GRAPHICS_DEVICE_COMMENT}"
+
+    return ServicePlan(
+        app_id=app.id,
+        service=app.id,
+        image=app.image,
+        container_name=app.id,
+        ports=(),
+        environment=environment,
+        volumes=(config_mount, media_mount),
+        comment=comment,
+        devices=devices,
+        network_mode="host",
+    )
+
+
 def render_compose(plan: StackPlan) -> str:
     """Render `plan` as a human-readable Docker Compose file.
 
@@ -503,9 +557,15 @@ def _render_service(service: ServicePlan, network: str) -> list[str]:
         if volume.endswith(_DATA_MOUNT_SUFFIX):
             lines.extend(f"      {comment}" for comment in _comment_lines(DATA_MOUNT_COMMENT))
         elif volume.endswith(_MEDIA_LIBRARY_MOUNT_SUFFIX):
-            lines.extend(
-                f"      {comment}" for comment in _comment_lines(MEDIA_LIBRARY_MOUNT_COMMENT)
+            # Jellyfin's own read-only library mount gets its own wording -
+            # every other media server sharing this same mount suffix
+            # (Plex, today) keeps the original comment.
+            library_comment = (
+                JELLYFIN_MEDIA_LIBRARY_MOUNT_COMMENT
+                if service.app_id == JELLYFIN_APP_ID
+                else MEDIA_LIBRARY_MOUNT_COMMENT
             )
+            lines.extend(f"      {comment}" for comment in _comment_lines(library_comment))
         # Checked before `_VPN_SECRETS_MOUNT_SUFFIX` below: both end in the
         # same ":/run/secrets:ro", and this longer, host-path-anchored tail
         # is what tells Plex's own secrets mount apart from Gluetun's.

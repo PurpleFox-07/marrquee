@@ -26,6 +26,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from marrquee.catalog import (
     CATALOG,
+    JELLYFIN_APP_ID,
     AppKind,
     CatalogApp,
     companions_for,
@@ -44,6 +45,7 @@ from marrquee.deploy import (
     Failure,
     FailureCode,
 )
+from marrquee.graphics_chip import GraphicsChipCheck
 from marrquee.health import HubState, LinkState
 from marrquee.hub import HubTile, LinkTile, LoginBanner, TileAction, TunnelState
 from marrquee.install import install_apps
@@ -584,6 +586,16 @@ async def post_hub_install(
         )
 
     installed_ids = tuple(progress.app_id for progress in manager.snapshot().apps)
+    # Probed only when Jellyfin could still be added AND isn't ruled out by
+    # some other installed app (Plex) - the same predicate `read_hub_view`
+    # applies, so a chip answer never reaches this endpoint any earlier or
+    # later than it reaches the page that renders the step.
+    graphics_chip: GraphicsChipCheck = request.app.state.graphics_chip
+    chip = (
+        JELLYFIN_APP_ID not in installed_ids
+        and unavailable_reason(get_app(JELLYFIN_APP_ID), installed_ids) is None
+        and await graphics_chip.has_chip()
+    )
     steps = question_steps_for(
         (
             *companions_for(
@@ -592,6 +604,7 @@ async def post_hub_install(
             app_id,
         ),
         present=installed_ids,
+        graphics_chip=chip,
     )
     saved = load_answers(settings.config_dir)
     checks: list[tuple[QuestionStep, QuestionCheck]] = []

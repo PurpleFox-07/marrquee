@@ -169,6 +169,20 @@ def test_step_number_finds_the_matching_pill_and_raises_for_an_unknown_key() -> 
         wizard.step_number(steps, "not-a-real-key")
 
 
+def test_wizard_steps_adds_the_graphics_pill_only_when_a_chip_is_reported() -> None:
+    without_chip = wizard.wizard_steps(("jellyfin",))
+    assert "q:jellyfin:graphics" not in [step.key for step in without_chip]
+
+    with_chip = wizard.wizard_steps(("jellyfin",), graphics_chip=True)
+    assert [(step.number, step.label, step.key) for step in with_chip] == [
+        (1, words.WIZARD_STEP_APPS, "apps"),
+        (2, words.WIZARD_STEP_LOGIN, "login"),
+        (3, words.JELLYFIN_GRAPHICS_STEP_TITLE, "q:jellyfin:graphics"),
+        (4, words.WIZARD_STEP_DRIVE, "drive"),
+        (5, words.WIZARD_STEP_DEPLOY, "deploy"),
+    ]
+
+
 # --- free_space_words --------------------------------------------------------
 
 

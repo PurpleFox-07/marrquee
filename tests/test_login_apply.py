@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from pathlib import Path
 
 import pytest
 
 from marrquee.catalog import get_app
+from marrquee.jellyfin import FakeJellyfinServer, JellyfinResponse, save_jellyfin
 from marrquee.login import SavedLogin
 from marrquee.login_apply import (
     FakeLoginApplier,
@@ -457,3 +459,202 @@ async def test_the_qbittorrent_branch_runs_before_the_arr_only_guard() -> None:
     result = await applier.apply(_QBITTORRENT, _qbit_install(), _login())
 
     assert result.ok is True
+
+
+# --- the Jellyfin branch: rename, re-password, verify, never the old password -
+
+_JELLYFIN = get_app("jellyfin")
+
+
+def _ok(payload: object = None, *, status: int = 200) -> JellyfinResponse:
+    return JellyfinResponse(ok=True, status=status, payload=payload, detail=None)
+
+
+def _fail(status: int, payload: object = None) -> JellyfinResponse:
+    return JellyfinResponse(ok=False, status=status, payload=payload, detail=None)
+
+
+def _jellyfin_applier(
+    jellyfin: FakeJellyfinServer,
+    tmp_path: Path,
+    *,
+    address: str | None = "192.168.1.5",
+    sleep: object = None,
+    attempts: int = 3,
+    retry_delay: float = 0.01,
+) -> HttpLoginApplier:
+    async def jellyfin_address() -> str | None:
+        return address
+
+    kwargs: dict[str, object] = {
+        "jellyfin": jellyfin,
+        "jellyfin_address": jellyfin_address,
+        "config_dir": tmp_path,
+        "attempts": attempts,
+        "retry_delay": retry_delay,
+    }
+    if sleep is not None:
+        kwargs["sleep"] = sleep
+    return HttpLoginApplier(**kwargs)  # type: ignore[arg-type]
+
+
+async def test_applier_renames_then_re_passwords_then_verifies(tmp_path: Path) -> None:
+    save_jellyfin(tmp_path, "the-api-key", "u1")
+    jellyfin = FakeJellyfinServer(
+        {
+            ("GET", "/Users/u1"): [_ok({"Name": "old"})],
+            ("POST", "/Users"): [_ok(status=204)],
+            ("POST", "/Users/Password"): [_ok(status=204)],
+            ("POST", "/Users/AuthenticateByName"): [_ok({"AccessToken": "s"})],
+            ("POST", "/Sessions/Logout"): [_ok(status=204)],
+        }
+    )
+    applier = _jellyfin_applier(jellyfin, tmp_path)
+    login = _login(password="new-pw")
+
+    result = await applier.apply(_JELLYFIN, _install(app_ids=("jellyfin",), api_keys={}), login)
+
+    assert result.ok is True
+    called = [(method, path) for method, path, _params, _token in jellyfin.calls]
+    assert called == [
+        ("GET", "/Users/u1"),
+        ("POST", "/Users"),
+        ("POST", "/Users/Password"),
+        ("POST", "/Users/AuthenticateByName"),
+        ("POST", "/Sessions/Logout"),
+    ]
+    rename_call = next(c for c in jellyfin.calls if c[0] == "POST" and c[1] == "/Users")
+    assert rename_call[2] == (("userId", "u1"),)
+    assert jellyfin.bodies[1] == {"Name": "owner"}
+    password_call = next(c for c in jellyfin.calls if c[1] == "/Users/Password")
+    assert password_call[2] == (("userId", "u1"),)
+    assert jellyfin.bodies[2] == {"NewPw": "new-pw"}
+
+
+async def test_applier_skips_the_rename_when_the_name_already_matches(tmp_path: Path) -> None:
+    save_jellyfin(tmp_path, "the-api-key", "u1")
+    jellyfin = FakeJellyfinServer(
+        {
+            ("GET", "/Users/u1"): [_ok({"Name": "owner"})],
+            ("POST", "/Users/Password"): [_ok(status=204)],
+            ("POST", "/Users/AuthenticateByName"): [_ok({"AccessToken": "s"})],
+            ("POST", "/Sessions/Logout"): [_ok(status=204)],
+        }
+    )
+    applier = _jellyfin_applier(jellyfin, tmp_path)
+
+    result = await applier.apply(_JELLYFIN, _install(app_ids=("jellyfin",), api_keys={}), _login())
+
+    assert result.ok is True
+    called = [(method, path) for method, path, _params, _token in jellyfin.calls]
+    assert ("POST", "/Users") not in called
+
+
+async def test_applier_with_no_jellyfin_json_is_not_ok_and_makes_no_calls(tmp_path: Path) -> None:
+    jellyfin = FakeJellyfinServer({})
+    applier = _jellyfin_applier(jellyfin, tmp_path)
+
+    result = await applier.apply(_JELLYFIN, _install(app_ids=("jellyfin",), api_keys={}), _login())
+
+    assert result.ok is False
+    assert jellyfin.calls == []
+
+
+async def test_applier_with_no_address_is_not_ok_and_makes_no_calls(tmp_path: Path) -> None:
+    save_jellyfin(tmp_path, "the-api-key", "u1")
+    jellyfin = FakeJellyfinServer({})
+    applier = _jellyfin_applier(jellyfin, tmp_path, address=None)
+
+    result = await applier.apply(_JELLYFIN, _install(app_ids=("jellyfin",), api_keys={}), _login())
+
+    assert result.ok is False
+    assert result.technical == "jellyfin: no address"
+    assert jellyfin.calls == []
+
+
+async def test_applier_verify_401_is_not_ok(tmp_path: Path) -> None:
+    save_jellyfin(tmp_path, "the-api-key", "u1")
+    jellyfin = FakeJellyfinServer(
+        {
+            ("GET", "/Users/u1"): [_ok({"Name": "owner"})],
+            ("POST", "/Users/Password"): [_ok(status=204)],
+            ("POST", "/Users/AuthenticateByName"): [_fail(401)],
+        }
+    )
+    applier = _jellyfin_applier(jellyfin, tmp_path)
+
+    result = await applier.apply(_JELLYFIN, _install(app_ids=("jellyfin",), api_keys={}), _login())
+
+    assert result.ok is False
+    called = [(method, path) for method, path, _params, _token in jellyfin.calls]
+    assert ("POST", "/Sessions/Logout") not in called
+
+
+async def test_applier_retries_a_503_never_a_400(tmp_path: Path) -> None:
+    save_jellyfin(tmp_path, "the-api-key", "u1")
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    jellyfin = FakeJellyfinServer(
+        {
+            ("GET", "/Users/u1"): [_fail(503), _ok({"Name": "owner"})],
+            ("POST", "/Users/Password"): [_fail(400)],
+        }
+    )
+    applier = _jellyfin_applier(jellyfin, tmp_path, sleep=fake_sleep)
+
+    result = await applier.apply(_JELLYFIN, _install(app_ids=("jellyfin",), api_keys={}), _login())
+
+    assert result.ok is False
+    assert len(sleeps) == 1
+    get_calls = [c for c in jellyfin.calls if c[0] == "GET" and c[1] == "/Users/u1"]
+    assert len(get_calls) == 2
+    password_calls = [c for c in jellyfin.calls if c[1] == "/Users/Password"]
+    assert len(password_calls) == 1
+
+
+async def test_applier_technical_never_leaks_the_password_or_key(tmp_path: Path) -> None:
+    save_jellyfin(tmp_path, "the-super-secret-key", "u1")
+    jellyfin = FakeJellyfinServer({("GET", "/Users/u1"): [_fail(400, {"echo": "s3cret-newpass"})]})
+    applier = _jellyfin_applier(jellyfin, tmp_path)
+
+    result = await applier.apply(
+        _JELLYFIN,
+        _install(app_ids=("jellyfin",), api_keys={}),
+        _login(password="s3cret-newpass"),
+    )
+
+    assert result.ok is False
+    assert result.technical is not None
+    assert "s3cret-newpass" not in result.technical
+    assert "the-super-secret-key" not in result.technical
+
+
+async def test_applier_secrets_never_travel_as_query_params(tmp_path: Path) -> None:
+    save_jellyfin(tmp_path, "the-api-key", "u1")
+    jellyfin = FakeJellyfinServer(
+        {
+            ("GET", "/Users/u1"): [_ok({"Name": "old"})],
+            ("POST", "/Users"): [_ok(status=204)],
+            ("POST", "/Users/Password"): [_ok(status=204)],
+            ("POST", "/Users/AuthenticateByName"): [_ok({"AccessToken": "s"})],
+            ("POST", "/Sessions/Logout"): [_ok(status=204)],
+        }
+    )
+    applier = _jellyfin_applier(jellyfin, tmp_path)
+    login = _login(password="new-pw")
+
+    await applier.apply(_JELLYFIN, _install(app_ids=("jellyfin",), api_keys={}), login)
+
+    secrets = {login.password, "the-api-key", "s"}
+    for _method, _path, params, _had_token in jellyfin.calls:
+        for _name, value in params:
+            assert value not in secrets
+
+
+async def test_applier_defaults_jellyfin_to_a_real_http_client_when_none_is_given() -> None:
+    applier = HttpLoginApplier()
+
+    assert applier._jellyfin is not None

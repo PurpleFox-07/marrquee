@@ -28,6 +28,7 @@ DEFAULT_QUALITY: Final[Quality] = "1080p"
 TV_QUALITY_FIELD: Final = "tv_quality"
 MOVIE_QUALITY_FIELD: Final = "movie_quality"
 PLEX_ACCOUNT_FIELD: Final = "plex_account"
+GRAPHICS_CHIP_FIELD: Final = "graphics_chip"
 
 _ANSWERS_FILE_NAME = "answers.json"
 _ANSWERS_VERSION = 1
@@ -105,6 +106,13 @@ class QuestionStep:
     # when Recyclarr itself is added later. `None` for every step that is
     # only ever asked alongside its own app.
     asked_with: str | None = None
+    # True only for a step that must stay hidden until a caller has actually
+    # confirmed the hardware it asks about exists (Jellyfin's graphics-chip
+    # question) - kept as a plain flag rather than a callable predicate, so
+    # the registry itself stays pure data. False by default: a caller that
+    # forgets to pass `graphics_chip=True` through just never sees the step,
+    # never a step it can't answer.
+    needs_graphics_chip: bool = False
 
     def __post_init__(self) -> None:
         # `step_id` becomes a URL fragment, an HTML id and a data-attribute
@@ -369,6 +377,39 @@ PLEX_STEP = QuestionStep(
 )
 
 
+# --- The Jellyfin graphics-chip step: a plain yes/no choice, with no answer
+# pre-picked - the owner must say one or the other before the step accepts
+# it, the same rule `check_step` already gives every other `choice` field. --
+
+
+def _check_jellyfin_graphics_step(answers: Mapping[str, str]) -> QuestionCheck:
+    return QuestionCheck(ok=True, answers=answers, problem=None, field=None)
+
+
+JELLYFIN_GRAPHICS_STEP = QuestionStep(
+    app_id="jellyfin",
+    step_id="graphics",
+    title=words.JELLYFIN_GRAPHICS_STEP_TITLE,
+    lede=words.JELLYFIN_GRAPHICS_STEP_LEDE,
+    fields=(
+        QuestionField(
+            name=GRAPHICS_CHIP_FIELD,
+            label=words.JELLYFIN_GRAPHICS_LABEL,
+            kind="choice",
+            options=(
+                QuestionOption(
+                    "yes", words.JELLYFIN_GRAPHICS_YES, words.JELLYFIN_GRAPHICS_YES_HINT
+                ),
+                QuestionOption("no", words.JELLYFIN_GRAPHICS_NO, words.JELLYFIN_GRAPHICS_NO_HINT),
+            ),
+            default="",
+        ),
+    ),
+    check=_check_jellyfin_graphics_step,
+    needs_graphics_chip=True,
+)
+
+
 # Read only through `question_steps_for`/`find_step`, both of which look up
 # this name from the module's own globals at call time, so a test can
 # monkeypatch `marrquee.questions.QUESTION_STEPS` and have both functions
@@ -379,11 +420,12 @@ QUESTION_STEPS: tuple[QuestionStep, ...] = (
     TV_QUALITY_STEP,
     MOVIE_QUALITY_STEP,
     PLEX_STEP,
+    JELLYFIN_GRAPHICS_STEP,
 )
 
 
 def question_steps_for(
-    app_ids: Iterable[str], *, present: Iterable[str] = ()
+    app_ids: Iterable[str], *, present: Iterable[str] = (), graphics_chip: bool = False
 ) -> tuple[QuestionStep, ...]:
     """Every registered step that applies to `app_ids`, in catalog order
     and then in the order each app's own steps were declared.
@@ -397,6 +439,11 @@ def question_steps_for(
     `app_ids` alone, so a step whose own app is only in `present` (Sonarr,
     while adding Recyclarr) still has a catalog position to sort by instead
     of raising `KeyError`.
+
+    `graphics_chip` is applied last, after that include/sort logic: a step
+    with `needs_graphics_chip` is dropped unless the caller has actually
+    confirmed the NAS has one. A caller that forgets this keyword just
+    never sees the step - Jellyfin still plays everything either way.
     """
     adding = set(app_ids)
     present_ids = set(present)
@@ -409,7 +456,30 @@ def question_steps_for(
         or (step.asked_with in adding and step.app_id in everyone)
     ]
     matching.sort(key=lambda step: order_index[step.app_id])
+    if not graphics_chip:
+        matching = [step for step in matching if not step.needs_graphics_chip]
     return tuple(matching)
+
+
+def asks_about_graphics_chip(app_ids: Iterable[str], *, present: Iterable[str] = ()) -> bool:
+    """Whether adding `app_ids` could ever show a graphics-chip question.
+
+    A caller checks this BEFORE probing the host for the chip - `has_chip()`
+    is a real Docker round trip, not a free property, so it's only worth
+    running when a hidden step could actually turn visible.
+    """
+    return any(
+        step.needs_graphics_chip
+        for step in question_steps_for(app_ids, present=present, graphics_chip=True)
+    )
+
+
+def uses_graphics_chip(answers: Mapping[str, Mapping[str, str]]) -> bool:
+    """Whether the owner's saved answer actually turns Jellyfin's graphics
+    chip on - the one reader the compose builder and wiring both use, so
+    "yes" can never be spelled two different ways in two different places.
+    """
+    return answers.get("jellyfin", {}).get(GRAPHICS_CHIP_FIELD) == "yes"
 
 
 def find_step(app_id: str, step_id: str) -> QuestionStep | None:
@@ -456,12 +526,15 @@ def check_step(
 
 
 def missing_step(
-    app_ids: Iterable[str], answers: Mapping[str, Mapping[str, str]]
+    app_ids: Iterable[str],
+    answers: Mapping[str, Mapping[str, str]],
+    *,
+    graphics_chip: bool = False,
 ) -> QuestionStep | None:
     """The first registered step (catalog then declared order) that still
     has at least one of its fields unanswered for the given apps.
     """
-    for step in question_steps_for(app_ids):
+    for step in question_steps_for(app_ids, graphics_chip=graphics_chip):
         saved = answers.get(step.app_id, {})
         if any(field.name not in saved for field in step.fields):
             return step

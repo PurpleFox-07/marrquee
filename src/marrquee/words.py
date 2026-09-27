@@ -1962,6 +1962,102 @@ _PLEX_WORDS: tuple[str, ...] = (
 # end Plex section
 # =============================================================================
 
+# =============================================================================
+# Jellyfin - a media server signed in with the owner's one Marrquee login,
+# in the owner's own words. The same Alignment rule as Plex's section: never
+# call Jellyfin a "media server" on its own - that phrase stays reserved for
+# the whole setup.
+# =============================================================================
+
+JELLYFIN_DESCRIPTION = (
+    "Streams your movies and shows to your TV, phone and browser. Free and "
+    "open source - you sign in with your Marrquee login."
+)
+JELLYFIN_EXCLUDES_PLEX = (
+    "you already have Plex - you can have Plex or Jellyfin, and for now the choice stays"
+)
+
+JELLYFIN_GRAPHICS_STEP_TITLE = "Use your NAS's graphics chip?"
+JELLYFIN_GRAPHICS_STEP_LEDE = (
+    "Your NAS has a graphics chip. When a TV or phone can't play a video as "
+    "it is, Jellyfin converts it while you watch. The graphics chip does "
+    "that quickly and quietly. Without it, your NAS's main processor does "
+    "the work, which is slower and can stutter on big 4K files. For now, "
+    "this choice stays once Jellyfin is added."
+)
+JELLYFIN_GRAPHICS_LABEL = "Graphics chip"
+JELLYFIN_GRAPHICS_YES = "Yes, use the graphics chip"
+JELLYFIN_GRAPHICS_YES_HINT = "Faster video conversion, and less work for your NAS."
+JELLYFIN_GRAPHICS_NO = "No, don't use it"
+JELLYFIN_GRAPHICS_NO_HINT = "Jellyfin still plays everything - it just converts video more slowly."
+
+JELLYFIN_SERVER_NAME = "Marrquee"
+
+JELLYFIN_COMPOSE_COMMENT = (
+    "Jellyfin uses your NAS's own network (host networking) so your TVs and phones find "
+    "it at home. Marrquee finished Jellyfin's first-time setup for you: its admin is your "
+    "Marrquee login."
+)
+JELLYFIN_MEDIA_LIBRARY_MOUNT_COMMENT = (
+    "Your Movies and TV folders, read-only: Jellyfin can show and play everything, but "
+    "can never change or delete your files."
+)
+JELLYFIN_GRAPHICS_DEVICE_COMMENT = (
+    "Your NAS's graphics chip, passed to Jellyfin because you chose to use it for converting video."
+)
+
+FAILURE_JELLYFIN_NOT_OURS = (
+    "Jellyfin is already set up with a different admin - its settings folder, "
+    "marrquee/apps/jellyfin on your drive, is left over from an earlier Jellyfin. Sign in "
+    "to that Jellyfin as its admin and change the admin's name and password to your "
+    "Marrquee login, then press Try again."
+)
+FAILURE_JELLYFIN_SETUP_REFUSED = (
+    "Jellyfin started, but refused Marrquee's first-time setup. Press Try again - if it "
+    "happens again, the details are on the Diagnostics page."
+)
+FAILURE_JELLYFIN_PORT_TAKEN = (
+    "Something on your NAS already answers on Jellyfin's port, 8096 - usually a Jellyfin "
+    "you installed before. Stop it from your NAS's app list, then press Try again."
+)
+
+JELLYFIN_LIBRARY_MOVIES = "Movies"
+JELLYFIN_LIBRARY_TV = "TV Shows"
+WIRING_LINE_JELLYFIN_GRAPHICS = "Setting Jellyfin to use your graphics chip"
+JELLYFIN_NOTE_GRAPHICS = "Jellyfin now uses your NAS's graphics chip to convert video."
+WIRING_JELLYFIN_NOT_SET_UP = (
+    "Marrquee has no key for Jellyfin yet. Press Connect again after Jellyfin finishes starting."
+)
+
+
+_JELLYFIN_WORDS: tuple[str, ...] = (
+    "JELLYFIN_DESCRIPTION",
+    "JELLYFIN_EXCLUDES_PLEX",
+    "JELLYFIN_GRAPHICS_STEP_TITLE",
+    "JELLYFIN_GRAPHICS_STEP_LEDE",
+    "JELLYFIN_GRAPHICS_LABEL",
+    "JELLYFIN_GRAPHICS_YES",
+    "JELLYFIN_GRAPHICS_YES_HINT",
+    "JELLYFIN_GRAPHICS_NO",
+    "JELLYFIN_GRAPHICS_NO_HINT",
+    "JELLYFIN_SERVER_NAME",
+    "JELLYFIN_COMPOSE_COMMENT",
+    "JELLYFIN_MEDIA_LIBRARY_MOUNT_COMMENT",
+    "JELLYFIN_GRAPHICS_DEVICE_COMMENT",
+    "FAILURE_JELLYFIN_NOT_OURS",
+    "FAILURE_JELLYFIN_SETUP_REFUSED",
+    "FAILURE_JELLYFIN_PORT_TAKEN",
+    "JELLYFIN_LIBRARY_MOVIES",
+    "JELLYFIN_LIBRARY_TV",
+    "WIRING_LINE_JELLYFIN_GRAPHICS",
+    "JELLYFIN_NOTE_GRAPHICS",
+    "WIRING_JELLYFIN_NOT_SET_UP",
+)
+
+# =============================================================================
+# end Jellyfin section
+# =============================================================================
+
 # The full review surface: every public name above, in one tuple. A later
 # feature area adds its own fenced section above this line, then extends
 # this tuple with its own `_..._WORDS` name - never editing an earlier
@@ -1981,4 +2077,5 @@ WORDS_INVENTORY: tuple[str, ...] = (
     *_DRIVE_WORDS,
     *_RECYCLARR_WORDS,
     *_PLEX_WORDS,
+    *_JELLYFIN_WORDS,
 )

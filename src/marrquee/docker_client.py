@@ -12,6 +12,7 @@ test below.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import socket
 import struct
@@ -22,6 +23,8 @@ from pathlib import Path
 from typing import Literal, Protocol
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 # The Docker Engine API's container states, straight off `State.Status` in a
 # `GET /containers/{name}/json` reply.
@@ -46,6 +49,18 @@ _DEFAULT_TIMEOUT = 2.0
 # database migration - a real problem should still look like one well
 # before this fires.
 _DEFAULT_COMPOSE_TIMEOUT = 900.0
+
+# `probe_host_path`'s own throwaway container: never started, always
+# force-removed, and named so a leftover from a crashed run is unmistakably
+# ours to clean up rather than a real app.
+_GRAPHICS_CHECK_CONTAINER_NAME = "marrquee-graphics-check"
+_GRAPHICS_CHECK_MOUNT_TARGET = "/marrquee-check"
+_GRAPHICS_CHECK_LABELS = {"com.marrquee.purpose": "graphics-check"}
+# Docker's own wording (bind-mounts docs: "`--mount` does not automatically
+# create" the source) for a CREATE-time refusal of a `Mounts` bind whose
+# source doesn't exist on the host - the one substring that turns a 400 into
+# "absent" rather than "couldn't tell".
+_BIND_SOURCE_MISSING = "bind source path does not exist"
 
 
 class DockerFailure(StrEnum):
@@ -204,6 +219,22 @@ class ExecState:
     detail: str | None
 
 
+@dataclass(frozen=True)
+class HostPathProbe:
+    """The answer to "does this path exist on the HOST, from outside any
+    container's own bind mounts?".
+
+    `detail` carries the status code and Docker's own message (or a
+    connection error), for logs only - same contract as every other
+    `detail`-shaped field in this codebase. `"unknown"` covers every case
+    that isn't a clean present/absent classification - a caller must never
+    treat it as either answer.
+    """
+
+    result: Literal["present", "absent", "unknown"]
+    detail: str | None
+
+
 class DockerEngine(Protocol):
     """Access to Docker: the original read-only status check, plus the
     read and write operations the deploy engine needs to start and watch
@@ -226,6 +257,7 @@ class DockerEngine(Protocol):
     async def exec_start(self, container: str, cmd: Sequence[str]) -> ExecStartResult: ...
     async def exec_inspect(self, exec_id: str) -> ExecState: ...
     async def host_gateway(self, container: str) -> str | None: ...
+    async def probe_host_path(self, self_container: str, host_path: str) -> HostPathProbe: ...
 
 
 class SocketDockerEngine:
@@ -587,6 +619,105 @@ class SocketDockerEngine:
 
         return _parse_host_gateway_payload(payload)
 
+    async def probe_host_path(self, self_container: str, host_path: str) -> HostPathProbe:
+        # Our own running container's image id - never a tag, which can
+        # move after an update, and never `Config.Image` (a snapshot of
+        # whatever tag created it) - the id a `create` with this same image
+        # is guaranteed to still resolve.
+        try:
+            async with self._client() as client:
+                inspect_response = await client.get(f"/containers/{self_container}/json")
+        except (httpx.TimeoutException, httpx.ConnectError) as error:
+            return HostPathProbe(result="unknown", detail=str(error))
+
+        if inspect_response.status_code != 200:
+            return HostPathProbe(
+                result="unknown",
+                detail=f"HTTP {inspect_response.status_code} inspecting {self_container}",
+            )
+        try:
+            inspect_payload = inspect_response.json()
+        except ValueError as error:
+            return HostPathProbe(result="unknown", detail=str(error))
+
+        image = inspect_payload.get("Image") if isinstance(inspect_payload, dict) else None
+        if not isinstance(image, str):
+            return HostPathProbe(
+                result="unknown", detail=f"{self_container} has no top-level Image id"
+            )
+
+        # A leftover from a crashed earlier probe would otherwise make a
+        # genuinely present path look like a 409 name conflict - any answer
+        # (404 "never existed", 204 "removed", anything else) is ignored,
+        # exactly like Cancel's own force-remove.
+        try:
+            async with self._client() as client:
+                await client.delete(f"/containers/{_GRAPHICS_CHECK_CONTAINER_NAME}?force=true")
+        except (httpx.TimeoutException, httpx.ConnectError):
+            pass
+
+        body = {
+            "Image": image,
+            "Labels": _GRAPHICS_CHECK_LABELS,
+            "HostConfig": {
+                "Mounts": [
+                    {
+                        "Type": "bind",
+                        "Source": host_path,
+                        "Target": _GRAPHICS_CHECK_MOUNT_TARGET,
+                        "ReadOnly": True,
+                    }
+                ]
+            },
+        }
+        try:
+            async with self._client() as client:
+                create_response = await client.post(
+                    f"/containers/create?name={_GRAPHICS_CHECK_CONTAINER_NAME}", json=body
+                )
+        except (httpx.TimeoutException, httpx.ConnectError) as error:
+            return HostPathProbe(result="unknown", detail=str(error))
+
+        if create_response.status_code == 201:
+            await self._remove_graphics_check_container(create_response)
+            return HostPathProbe(result="present", detail=None)
+
+        if create_response.status_code == 400 and _BIND_SOURCE_MISSING in _docker_error_message(
+            create_response
+        ):
+            return HostPathProbe(result="absent", detail=None)
+
+        return HostPathProbe(
+            result="unknown",
+            detail=f"HTTP {create_response.status_code}: {_docker_error_message(create_response)}",
+        )
+
+    async def _remove_graphics_check_container(self, create_response: httpx.Response) -> None:
+        """Best-effort cleanup of the container `probe_host_path` just
+        created - never started, and never load-bearing for the "present"
+        answer itself. A failed DELETE here is logged, never surfaced to
+        the owner as an error - the leftover is harmless (it never runs)
+        and the next probe's own leading DELETE will try again.
+        """
+        try:
+            created = create_response.json()
+        except ValueError:
+            created = {}
+        container_id = created.get("Id") if isinstance(created, dict) else None
+        name = container_id if isinstance(container_id, str) else _GRAPHICS_CHECK_CONTAINER_NAME
+        try:
+            async with self._client() as client:
+                remove_response = await client.delete(f"/containers/{name}?force=true")
+        except (httpx.TimeoutException, httpx.ConnectError) as error:
+            logger.warning("graphics-chip probe left %s behind: %s", name, error)
+            return
+        if remove_response.status_code not in (204, 404):
+            logger.warning(
+                "graphics-chip probe left %s behind: HTTP %s",
+                name,
+                remove_response.status_code,
+            )
+
 
 def _classify_remove_response(response: httpx.Response) -> ContainerRemoveResult:
     """204 means removed, 404 means already gone - Cancel treats both as
@@ -918,6 +1049,7 @@ class FakeDockerEngine:
         exec_exit_codes: Mapping[str, int] | None = None,
         exec_running_polls: int = 0,
         host_gateway: str | None = "172.18.0.1",
+        host_paths: Iterable[str] = (),
     ) -> None:
         self._status = status
         self._containers = dict(containers) if containers is not None else {}
@@ -954,6 +1086,7 @@ class FakeDockerEngine:
         self._network_exists = network_exists
         self._self_container_id = self_container_id
         self._host_gateway = host_gateway
+        self._host_paths = frozenset(host_paths)
         self.calls: list[tuple[str, tuple[object, ...]]] = []
         # What a real Docker daemon uses to decide whether a recreate is a
         # no-op: the service's own rendered config, as last seen. Tracked
@@ -1130,3 +1263,14 @@ class FakeDockerEngine:
         if container == self._self_container_id:
             return self._host_gateway
         return None
+
+    async def probe_host_path(self, self_container: str, host_path: str) -> HostPathProbe:
+        self.calls.append(("probe_host_path", (self_container, host_path)))
+        # An unknown container can't be inspected for its own image id
+        # either (docker-fakes-model-state) - only Marrquee's own self
+        # container ever gets a real answer.
+        if self_container != self._self_container_id:
+            return HostPathProbe(result="unknown", detail=None)
+        if host_path in self._host_paths:
+            return HostPathProbe(result="present", detail=None)
+        return HostPathProbe(result="absent", detail=None)

@@ -198,6 +198,7 @@ def test_a_saved_install_ticks_exactly_the_saved_apps(tmp_path: Path) -> None:
         "qbittorrent": False,
         "recyclarr": False,
         "plex": False,
+        "jellyfin": False,
     }
 
 
@@ -215,6 +216,7 @@ def test_an_unknown_id_in_the_query_string_is_dropped_not_a_500(tmp_path: Path) 
         "qbittorrent": False,
         "recyclarr": False,
         "plex": False,
+        "jellyfin": False,
     }
 
 
@@ -418,6 +420,25 @@ def test_posting_an_unavailable_combination_is_refused_with_its_reason(
 
     assert response.status_code == 200
     assert words.wizard_app_unavailable("Radarr", reason) in html.unescape(response.text)
+
+
+def test_posting_plex_and_jellyfin_together_is_refused_with_story_2s_wording(
+    tmp_path: Path,
+) -> None:
+    """Ticking Plex and Jellyfin together is refused through the same
+    `unavailable_reason` mechanism as any other `excludes_any` rule - no
+    special-cased "one media server" check exists anywhere else.
+    """
+    client = _client(_settings(tmp_path))
+
+    response = client.post(
+        "/setup/apps", data={"apps": ["plex", "jellyfin"]}, follow_redirects=False
+    )
+
+    assert response.status_code == 200
+    assert words.wizard_app_unavailable("Plex", words.PLEX_EXCLUDES_JELLYFIN) in html.unescape(
+        response.text
+    )
 
 
 def test_an_available_combination_is_never_refused(tmp_path: Path) -> None:

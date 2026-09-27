@@ -445,6 +445,27 @@ _EXPECTED_INVENTORY = (
     "WIRING_LINE_PLEX_DIRECT_PLAY",
     "PLEX_NOTE_DIRECT_PLAY",
     "WIRING_PLEX_SIGN_IN_NEEDED",
+    "JELLYFIN_DESCRIPTION",
+    "JELLYFIN_EXCLUDES_PLEX",
+    "JELLYFIN_GRAPHICS_STEP_TITLE",
+    "JELLYFIN_GRAPHICS_STEP_LEDE",
+    "JELLYFIN_GRAPHICS_LABEL",
+    "JELLYFIN_GRAPHICS_YES",
+    "JELLYFIN_GRAPHICS_YES_HINT",
+    "JELLYFIN_GRAPHICS_NO",
+    "JELLYFIN_GRAPHICS_NO_HINT",
+    "JELLYFIN_SERVER_NAME",
+    "JELLYFIN_COMPOSE_COMMENT",
+    "JELLYFIN_MEDIA_LIBRARY_MOUNT_COMMENT",
+    "JELLYFIN_GRAPHICS_DEVICE_COMMENT",
+    "FAILURE_JELLYFIN_NOT_OURS",
+    "FAILURE_JELLYFIN_SETUP_REFUSED",
+    "FAILURE_JELLYFIN_PORT_TAKEN",
+    "JELLYFIN_LIBRARY_MOVIES",
+    "JELLYFIN_LIBRARY_TV",
+    "WIRING_LINE_JELLYFIN_GRAPHICS",
+    "JELLYFIN_NOTE_GRAPHICS",
+    "WIRING_JELLYFIN_NOT_SET_UP",
 )
 
 _DEPLOY_ENGINE_WORD_COUNT = 40
@@ -461,6 +482,7 @@ _VPN_CHANGE_WORD_COUNT = 32
 _DRIVE_WORD_COUNT = 27
 _RECYCLARR_WORD_COUNT = 24
 _PLEX_WORD_COUNT = 23
+_JELLYFIN_WORD_COUNT = 21
 
 
 def test_words_inventory_is_pinned() -> None:
@@ -838,9 +860,9 @@ def test_the_recyclarr_section_precedes_the_plex_section() -> None:
     assert "PLEX_DESCRIPTION" not in recyclarr_names
 
 
-def test_the_plex_section_is_last() -> None:
-    """Plex is the newest section. Later chunks in this story bump
-    `_PLEX_WORD_COUNT` as they append more words to it.
+def test_the_plex_section_precedes_the_jellyfin_section() -> None:
+    """Plex used to be the newest section - Jellyfin now follows it, the
+    same bounded-slice move every earlier story made.
     """
     plex_start = (
         _DEPLOY_ENGINE_WORD_COUNT
@@ -857,14 +879,45 @@ def test_the_plex_section_is_last() -> None:
         + _DRIVE_WORD_COUNT
         + _RECYCLARR_WORD_COUNT
     )
+    plex_end = plex_start + _PLEX_WORD_COUNT
 
-    plex_names = words.WORDS_INVENTORY[plex_start:]
+    plex_names = words.WORDS_INVENTORY[plex_start:plex_end]
 
-    assert plex_names == _EXPECTED_INVENTORY[plex_start:]
+    assert plex_names == _EXPECTED_INVENTORY[plex_start:plex_end]
     assert plex_names[0] == "PLEX_DESCRIPTION"
-    assert len(words.WORDS_INVENTORY) == len(_EXPECTED_INVENTORY)
     assert len(plex_names) == _PLEX_WORD_COUNT
     assert "RECYCLARR_DESCRIPTION" not in plex_names
+    assert "JELLYFIN_DESCRIPTION" not in plex_names
+
+
+def test_the_jellyfin_section_is_last() -> None:
+    """Jellyfin is the newest section. Later chunks in this story bump
+    `_JELLYFIN_WORD_COUNT` as they append more words to it.
+    """
+    jellyfin_start = (
+        _DEPLOY_ENGINE_WORD_COUNT
+        + _WIZARD_WORD_COUNT
+        + _WIRING_WORD_COUNT
+        + _DEPLOY_SCREEN_WORD_COUNT
+        + _HUB_WORD_COUNT
+        + _HUB_LINK_WORD_COUNT
+        + _HUB_INSTALL_WORD_COUNT
+        + _LOGIN_WORD_COUNT
+        + _VPN_WORD_COUNT
+        + _QBIT_WORD_COUNT
+        + _VPN_CHANGE_WORD_COUNT
+        + _DRIVE_WORD_COUNT
+        + _RECYCLARR_WORD_COUNT
+        + _PLEX_WORD_COUNT
+    )
+
+    jellyfin_names = words.WORDS_INVENTORY[jellyfin_start:]
+
+    assert jellyfin_names == _EXPECTED_INVENTORY[jellyfin_start:]
+    assert jellyfin_names[0] == "JELLYFIN_DESCRIPTION"
+    assert len(words.WORDS_INVENTORY) == len(_EXPECTED_INVENTORY)
+    assert len(jellyfin_names) == _JELLYFIN_WORD_COUNT
+    assert "PLEX_DESCRIPTION" not in jellyfin_names
 
 
 def test_drive_reason_and_todo_words_name_the_folder_and_match_content_direction() -> None:
@@ -1464,3 +1517,63 @@ def test_plex_sign_in_words_have_apostrophes_and_match_content_direction() -> No
     assert "didn't" in words.PLEX_SIGN_IN_DIDNT_FINISH
     assert "can't" in words.PLEX_STEP_LEDE
     assert "won't" in words.PLEX_STEP_LEDE
+
+
+def test_jellyfin_words_never_call_it_a_media_server() -> None:
+    """The Alignment rule holds for Jellyfin too: only the whole setup is
+    ever called a "media server" - Jellyfin's own copy always says
+    "Jellyfin" or "Plex or Jellyfin".
+    """
+    for word in (
+        words.JELLYFIN_DESCRIPTION,
+        words.JELLYFIN_EXCLUDES_PLEX,
+        words.JELLYFIN_GRAPHICS_STEP_TITLE,
+        words.JELLYFIN_GRAPHICS_STEP_LEDE,
+        words.JELLYFIN_GRAPHICS_LABEL,
+        words.JELLYFIN_GRAPHICS_YES,
+        words.JELLYFIN_GRAPHICS_YES_HINT,
+        words.JELLYFIN_GRAPHICS_NO,
+        words.JELLYFIN_GRAPHICS_NO_HINT,
+        words.JELLYFIN_COMPOSE_COMMENT,
+        words.JELLYFIN_MEDIA_LIBRARY_MOUNT_COMMENT,
+        words.JELLYFIN_GRAPHICS_DEVICE_COMMENT,
+        words.FAILURE_JELLYFIN_NOT_OURS,
+        words.FAILURE_JELLYFIN_SETUP_REFUSED,
+        words.FAILURE_JELLYFIN_PORT_TAKEN,
+    ):
+        assert "media server" not in word.lower()
+
+
+def test_jellyfin_compose_and_failure_words_match_content_direction() -> None:
+    """The compose comment names the network Jellyfin actually runs on, and
+    the port-taken failure reads like Plex's own, naming Jellyfin's port.
+    """
+    assert words.JELLYFIN_SERVER_NAME == "Marrquee"
+    assert "host networking" in words.JELLYFIN_COMPOSE_COMMENT
+    assert "Jellyfin" in words.JELLYFIN_MEDIA_LIBRARY_MOUNT_COMMENT
+    assert "Plex" not in words.JELLYFIN_MEDIA_LIBRARY_MOUNT_COMMENT
+    assert "graphics chip" in words.JELLYFIN_GRAPHICS_DEVICE_COMMENT
+    assert "8096" in words.FAILURE_JELLYFIN_PORT_TAKEN
+    assert "Try again" in words.FAILURE_JELLYFIN_NOT_OURS
+    assert "Try again" in words.FAILURE_JELLYFIN_SETUP_REFUSED
+
+
+def test_jellyfin_words_have_apostrophes_and_match_content_direction() -> None:
+    assert words.JELLYFIN_GRAPHICS_STEP_TITLE == "Use your NAS's graphics chip?"
+    assert words.JELLYFIN_GRAPHICS_LABEL == "Graphics chip"
+    assert words.JELLYFIN_GRAPHICS_YES == "Yes, use the graphics chip"
+    assert words.JELLYFIN_GRAPHICS_NO == "No, don't use it"
+    assert "NAS's" in words.JELLYFIN_GRAPHICS_STEP_LEDE
+    assert "can't" in words.JELLYFIN_GRAPHICS_STEP_LEDE
+    assert "don't" in words.JELLYFIN_GRAPHICS_NO
+    assert "you already have Plex" in words.JELLYFIN_EXCLUDES_PLEX
+
+
+def test_jellyfin_wiring_words_match_content_direction() -> None:
+    assert words.JELLYFIN_LIBRARY_MOVIES == "Movies"
+    assert words.JELLYFIN_LIBRARY_TV == "TV Shows"
+    assert words.wiring_line_libraries("Jellyfin") == "Adding your Movies and TV Shows to Jellyfin"
+    assert words.WIRING_LINE_JELLYFIN_GRAPHICS == "Setting Jellyfin to use your graphics chip"
+    assert "graphics chip" in words.JELLYFIN_NOTE_GRAPHICS
+    assert "Connect again" in words.WIRING_JELLYFIN_NOT_SET_UP
+    assert "media server" not in words.WIRING_JELLYFIN_NOT_SET_UP.lower()

@@ -36,6 +36,7 @@ from marrquee.docker_client import (
     DockerStatus,
     FakeDockerEngine,
 )
+from marrquee.graphics_chip import GRAPHICS_DEVICE_NODE
 from marrquee.hardlinks import HardlinkMonitor, HardlinkResult, save_hardlink_result
 from marrquee.login import load_login, save_login
 from marrquee.main import create_app
@@ -189,12 +190,14 @@ def test_catalog_route_lists_apps_in_deploy_order_with_port_only(tmp_path: Path)
         "qbittorrent",
         "recyclarr",
         "plex",
+        "jellyfin",
     ]
     assert apps[0].keys() == {"id", "name", "description", "port"}
     assert apps[0]["port"] == 9696
     apps_by_id = {app["id"]: app for app in apps}
     assert apps_by_id["recyclarr"]["port"] is None
     assert apps_by_id["plex"]["port"] == 32400
+    assert apps_by_id["jellyfin"]["port"] == 8096
 
 
 # --- The resting state: honest before any deploy has run ---------------------
@@ -837,6 +840,70 @@ async def test_hub_install_endpoint_refuses_with_409_when_no_login_is_saved(
 
     assert response.status_code == 409
     assert response.json()["message"] == HUB_INSTALL_LOGIN_FIRST
+
+
+async def test_hub_install_jellyfin_refuses_a_missing_graphics_answer_when_a_chip_exists(
+    tmp_path: Path,
+) -> None:
+    """The install endpoint applies the exact same graphics-chip predicate
+    the Hub page itself renders from - a POST can never skip a question the
+    GET would have shown.
+
+    The finale snapshot is written directly (as
+    `test_hub_install_sonarr_with_recyclarr_installed_asks_tv_quality` does)
+    rather than run through a real bring-up - this test has no opinion
+    about Prowlarr or Sonarr's own readiness, only about Jellyfin's step.
+    """
+    settings = _settings(tmp_path)
+    root = _fresh_root(settings)
+    save_state(settings.config_dir, _install_state(("prowlarr", "sonarr"), root))
+    save_login(settings.config_dir, "owner", "s3cret-password-1", honor_reset=None)
+    finished = DeploySnapshot(
+        run_id="run-1",
+        phase="finale",
+        apps=(
+            AppProgress(
+                app_id="prowlarr",
+                name="Prowlarr",
+                state="done",
+                chip="chip",
+                line="Ready",
+                note=None,
+                port=9696,
+            ),
+            AppProgress(
+                app_id="sonarr",
+                name="Sonarr",
+                state="done",
+                chip="chip",
+                line="Ready",
+                note=None,
+                port=8989,
+            ),
+        ),
+        headline="Now showing",
+        detail=None,
+        failure=None,
+        started_at="2026-09-19T00:00:00+00:00",
+        finished_at="2026-09-19T00:05:00+00:00",
+        wiring=(),
+    )
+    write_json_atomic(settings.config_dir / "deploy.json", dataclasses.asdict(finished))
+
+    engine = FakeDockerEngine(DockerStatus(connected=True), host_paths={GRAPHICS_DEVICE_NODE})
+    manager = DeployManager(settings, engine, probe=FakeReadinessProbe(default=True))
+    assert manager.snapshot().phase == "finale"
+
+    app = create_app(settings=settings, engine=engine, manager=manager)
+    with TestClient(app) as client:
+        refused = client.post("/api/hub/apps/jellyfin/install", json={"answers": {}})
+
+    assert refused.status_code == 400
+    body = refused.json()
+    assert body["ok"] is False
+    assert body["step_id"] == "graphics"
+    assert body["step_app_id"] == "jellyfin"
+    assert body["field"] == "graphics_chip"
 
 
 async def test_hub_install_fixture_step_refuses_with_400_and_saves_only_after_a_pass(

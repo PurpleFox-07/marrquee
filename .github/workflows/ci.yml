@@ -2457,6 +2457,444 @@ jobs:
             exit 1
           fi
 
+      # Plex was only ever grown into the compose plan in memory above - its
+      # container is still really running on the host, and the product's
+      # one-of rule means Plex and Jellyfin never run together for real, so
+      # it goes before Jellyfin's own proof begins.
+      - name: The graphics chip check asks the real Docker and leaves nothing behind
+        run: |
+          set -euo pipefail
+
+          docker rm -f plex > /dev/null 2>&1 || true
+          plex_leftover=$(docker ps -aq --filter name=^plex$) || plex_leftover=""
+          if [ -n "$plex_leftover" ]; then
+            echo "::error::Plex's container was still present after docker rm -f plex"
+            exit 1
+          fi
+
+          cat > "$RUNNER_TEMP/ci_graphics_probe.py" <<'PY'
+          import asyncio
+
+          from marrquee.config import Settings
+          from marrquee.docker_client import SocketDockerEngine
+
+
+          async def main() -> None:
+              settings = Settings.from_env()
+              engine = SocketDockerEngine(
+                  settings.docker_socket, compose_binary=settings.compose_binary
+              )
+              self_id = await engine.self_container_id()
+              if self_id is None:
+                  raise SystemExit("Marrquee could not find its own container id")
+
+              absent = await engine.probe_host_path(self_id, "/marrquee-ci-no-such-device")
+              present = await engine.probe_host_path(self_id, "/dev/null")
+              print(f"absent={absent.result}")
+              print(f"present={present.result}")
+
+
+          asyncio.run(main())
+          PY
+          docker cp "$RUNNER_TEMP/ci_graphics_probe.py" marrquee-stack-smoke:/tmp/ci_graphics_probe.py
+
+          if ! probe_output=$(docker exec marrquee-stack-smoke python3 /tmp/ci_graphics_probe.py); then
+            echo "::error::The graphics chip probe script failed to run"
+            exit 1
+          fi
+          echo "$probe_output"
+          absent_result=$(echo "$probe_output" | sed -n 's/^absent=//p')
+          present_result=$(echo "$probe_output" | sed -n 's/^present=//p')
+
+          case "$absent_result" in
+            absent) ;;
+            *) echo "::error::The graphics chip check read ${absent_result} for /marrquee-ci-no-such-device"; exit 1 ;;
+          esac
+          case "$present_result" in
+            present) ;;
+            *) echo "::error::The graphics chip check read ${present_result} for /dev/null"; exit 1 ;;
+          esac
+
+          leftover=$(docker ps -aq --filter name=marrquee-graphics-check) || leftover=""
+          if [ -n "$leftover" ]; then
+            echo "::error::The graphics chip check left a container behind"
+            exit 1
+          fi
+
+          if ! test ! -e /marrquee-ci-no-such-device; then
+            echo "::error::The graphics chip check created the path it was only ever meant to probe"
+            exit 1
+          fi
+
+          if [ -e /dev/dri/renderD128 ]; then
+            echo "the runner already has a graphics chip node"
+          else
+            sudo mkdir -p /dev/dri
+            sudo mknod -m 0666 /dev/dri/renderD128 c 226 128
+            touch "$RUNNER_TEMP/marrquee-made-dri"
+          fi
+
+          # Restarting (never recreating) clears GraphicsChipCheck's
+          # in-memory cache, which every earlier Hub load in this job already
+          # settled on "absent" - a fresh process is the only way it asks
+          # Docker again now that the node exists.
+          docker restart marrquee-stack-smoke
+
+          healthz_ready=false
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:7788/healthz > /dev/null 2>&1; then
+              healthz_ready=true
+              break
+            fi
+            sleep 2
+          done
+          if [ "$healthz_ready" != "true" ]; then
+            echo "::error::Marrquee never answered /healthz within 60s after restarting for the graphics chip"
+            exit 1
+          fi
+
+      # The whole point of this job's Jellyfin proof: the Hub's own install
+      # endpoint, on real Jellyfin 12.1, with the graphics chip question
+      # actually answered "yes" - never a script that pokes Jellyfin's API
+      # directly, since that would prove nothing about Marrquee's own setup.
+      - name: Jellyfin is set up with the one login, its libraries and the graphics chip
+        run: |
+          set -euo pipefail
+
+          install_html=$(curl -fsS "http://127.0.0.1:7788/?panel=install") || install_html=""
+          if ! echo "$install_html" | grep -qF 'data-question-step="jellyfin:graphics"'; then
+            echo "::error::The graphics question wasn't offered although /dev/dri/renderD128 exists"
+            exit 1
+          fi
+
+          pull_start=$(date +%s)
+          if ! response=$(curl -s -w '\n%{http_code}' -X POST http://127.0.0.1:7788/api/hub/apps/jellyfin/install -H "Content-Type: application/json" -d '{"answers":{"graphics_chip":"yes"}}'); then
+            echo "::error::couldn't reach Marrquee to install Jellyfin"
+            exit 1
+          fi
+          code=$(echo "$response" | tail -n1)
+          body=$(echo "$response" | sed '$d')
+          echo "hub install response (${code}): ${body}"
+          if [ "$code" != "202" ]; then
+            echo "::error::POST /api/hub/apps/jellyfin/install returned ${code}, expected 202: ${body}"
+            exit 1
+          fi
+
+          state=""
+          add_state=""
+          note=""
+          busy=""
+          line=""
+          for _ in $(seq 1 120); do
+            status=$(curl -fsS http://127.0.0.1:7788/api/hub/status) || status=""
+            if [ -n "$status" ]; then
+              jellyfin=$(echo "$status" | jq -c '.apps[] | select(.app_id == "jellyfin")')
+              state=$(echo "$jellyfin" | jq -r '.state')
+              add_state=$(echo "$jellyfin" | jq -r '.add_state')
+              note=$(echo "$jellyfin" | jq -r '.note')
+              busy=$(echo "$status" | jq -r '.busy')
+              line=$(echo "$jellyfin" | jq -r '.line')
+              echo "jellyfin state: $state / add_state: $add_state / note: $note / busy: $busy"
+              if [ "$add_state" = "error" ]; then
+                MESSAGE="adding Jellyfin failed: ${line}" \
+                  python3 -c "import os; text = os.environ['MESSAGE'][:500].replace('%', '%25').replace(chr(13), '%0D').replace(chr(10), '%0A').replace('::', ': :'); print('::error::' + text)"
+                exit 1
+              fi
+              if [ "$state" = "up" ] && [ "$add_state" = "null" ] && [ -z "$note" ] && [ "$busy" = "false" ]; then
+                break
+              fi
+            fi
+            sleep 5
+          done
+          if [ "$state" != "up" ] || [ "$add_state" != "null" ] || [ -n "$note" ] || [ "$busy" != "false" ]; then
+            echo "::error::Jellyfin never finished adding within 10 minutes (state=${state}, add_state=${add_state}, note=${note}, busy=${busy})"
+            exit 1
+          fi
+          pull_elapsed=$(( $(date +%s) - pull_start ))
+          echo "::notice::Jellyfin's image pull and first-time setup took ${pull_elapsed}s"
+
+          if ! network_mode=$(docker inspect -f '{{.HostConfig.NetworkMode}}' jellyfin) || [ -z "$network_mode" ]; then
+            echo "::error::couldn't inspect the jellyfin container's network mode"
+            exit 1
+          fi
+          if [ "$network_mode" != "host" ]; then
+            echo "::error::Jellyfin is not on the host network"
+            exit 1
+          fi
+
+          if ! device_path=$(docker inspect -f '{{range .HostConfig.Devices}}{{.PathOnHost}}{{end}}' jellyfin) || [ -z "$device_path" ]; then
+            echo "::error::couldn't inspect Jellyfin's device mappings"
+            exit 1
+          fi
+          if [ "$device_path" != "/dev/dri" ]; then
+            echo "::error::Jellyfin's graphics chip device was not passed through as /dev/dri (got: ${device_path})"
+            exit 1
+          fi
+          if ! docker exec jellyfin test -c /dev/dri/renderD128; then
+            echo "::error::/dev/dri/renderD128 is not a character device inside the jellyfin container"
+            exit 1
+          fi
+
+          cat > "$RUNNER_TEMP/ci_jellyfin_checks.py" <<'PY'
+          import asyncio
+
+          from marrquee.config import Settings
+          from marrquee.docker_client import SocketDockerEngine
+          from marrquee.graphics_chip import GRAPHICS_DEVICE_NODE
+          from marrquee.jellyfin import (
+              HttpJellyfinServer,
+              jellyfin_base_url,
+              load_jellyfin,
+              parse_virtual_folders,
+          )
+          from marrquee.login import load_login
+          from marrquee.plex import plex_host_address
+          from marrquee.storage import container_media_path
+
+
+          async def main() -> None:
+              settings = Settings.from_env()
+              engine = SocketDockerEngine(
+                  settings.docker_socket, compose_binary=settings.compose_binary
+              )
+              self_id = await engine.self_container_id()
+              address = await plex_host_address(engine, self_id)
+              if address is None:
+                  raise SystemExit("Marrquee could not work out its own reachable address for Jellyfin")
+              base_url = jellyfin_base_url(address)
+              server = HttpJellyfinServer()
+
+              public_info = await server.request("GET", base_url, "/System/Info/Public", token=None)
+              if not public_info.ok or not isinstance(public_info.payload, dict):
+                  raise SystemExit(f"Jellyfin's public system info was unreachable (status {public_info.status})")
+              if public_info.payload.get("StartupWizardCompleted") is not True:
+                  raise SystemExit("Jellyfin's own setup wizard was never marked complete")
+              if public_info.payload.get("ServerName") != "Marrquee":
+                  raise SystemExit(
+                      f"Jellyfin's server name is not Marrquee (got {public_info.payload.get('ServerName')!r})"
+                  )
+              print(f"jellyfin version: {public_info.payload.get('Version')}")
+
+              login_record = load_login(settings.config_dir)
+              if login_record.login is None:
+                  raise SystemExit("no login is saved to sign in to Jellyfin with")
+              auth = await server.request(
+                  "POST",
+                  base_url,
+                  "/Users/AuthenticateByName",
+                  token=None,
+                  json_body={
+                      "Username": login_record.login.username,
+                      "Pw": login_record.login.password,
+                  },
+              )
+              if not auth.ok or not isinstance(auth.payload, dict):
+                  raise SystemExit(f"signing in to Jellyfin as the one login failed (status {auth.status})")
+              session_token = auth.payload.get("AccessToken")
+              if not isinstance(session_token, str) or not session_token:
+                  raise SystemExit("Jellyfin's sign-in response carried no AccessToken")
+              await server.request("POST", base_url, "/Sessions/Logout", token=session_token)
+
+              record = load_jellyfin(settings.config_dir)
+              if record is None:
+                  raise SystemExit("no jellyfin.json was saved")
+
+              libraries_response = await server.request(
+                  "GET", base_url, "/Library/VirtualFolders", token=record.api_key
+              )
+              if not libraries_response.ok:
+                  raise SystemExit(f"could not read Jellyfin's libraries (status {libraries_response.status})")
+              units = {
+                  (library.collection_type, library.locations)
+                  for library in parse_virtual_folders(libraries_response.payload)
+              }
+              movies_path = str(container_media_path("movies"))
+              tv_path = str(container_media_path("tv"))
+              if ("movies", (movies_path,)) not in units:
+                  raise SystemExit("Jellyfin's Movies library was never created at the right path")
+              if ("tvshows", (tv_path,)) not in units:
+                  raise SystemExit("Jellyfin's TV Shows library was never created at the right path")
+
+              encoding = await server.request(
+                  "GET", base_url, "/System/Configuration/encoding", token=record.api_key
+              )
+              if not encoding.ok or not isinstance(encoding.payload, dict):
+                  raise SystemExit(f"could not read Jellyfin's encoding configuration (status {encoding.status})")
+              accel = encoding.payload.get("HardwareAccelerationType")
+              if accel not in ("vaapi", 5):
+                  raise SystemExit(f"Jellyfin's hardware acceleration is not vaapi (got {accel!r})")
+              if encoding.payload.get("VaapiDevice") != GRAPHICS_DEVICE_NODE:
+                  raise SystemExit("Jellyfin's VaapiDevice does not point at the graphics chip node")
+
+              print("jellyfin setup check: ok")
+
+
+          asyncio.run(main())
+          PY
+          docker cp "$RUNNER_TEMP/ci_jellyfin_checks.py" marrquee-stack-smoke:/tmp/ci_jellyfin_checks.py
+          if ! checks_output=$(docker exec marrquee-stack-smoke python3 /tmp/ci_jellyfin_checks.py 2>&1); then
+            echo "$checks_output"
+            MESSAGE="Jellyfin's own setup check failed: ${checks_output}" \
+              python3 -c "import os; text = os.environ['MESSAGE'][:800].replace('%', '%25').replace(chr(13), '%0D').replace(chr(10), '%0A').replace('::', ': :'); print('::error::' + text)"
+            exit 1
+          fi
+          echo "$checks_output"
+
+          web_code=$(curl -s -o /dev/null -w '%{http_code}' -L http://127.0.0.1:8096/) || web_code=""
+          if [ "$web_code" != "200" ]; then
+            echo "::error::Jellyfin's own sign-in page did not answer 200 (got ${web_code})"
+            exit 1
+          fi
+
+          if ! docker exec marrquee-stack-smoke sh -c 'command -v stat' > /dev/null; then
+            echo "::error::stat is not available inside marrquee-stack-smoke to check jellyfin.json's permissions"
+            exit 1
+          fi
+          if ! jellyfin_json_perms=$(docker exec marrquee-stack-smoke stat -c '%a %u' /config/jellyfin.json) || [ -z "$jellyfin_json_perms" ]; then
+            echo "::error::couldn't stat /config/jellyfin.json"
+            exit 1
+          fi
+          if [ "$jellyfin_json_perms" != "600 0" ]; then
+            echo "::error::jellyfin.json was not 0600 owned by root (got: ${jellyfin_json_perms})"
+            exit 1
+          fi
+
+          cat > "$RUNNER_TEMP/ci_jellyfin_key_check.py" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          jellyfin_json = Path("/config/jellyfin.json")
+          compose_yaml = Path(f"/host{os.environ['RUNNER_TEMP']}/marrquee-smoke/media/marrquee/compose.yaml")
+
+          raw_jellyfin_json = jellyfin_json.read_text()
+          record = json.loads(raw_jellyfin_json)
+          key = record["api_key"]
+
+          if key not in raw_jellyfin_json:
+              raise SystemExit("the positive control failed: the saved key is not even in its own raw file")
+
+          compose_text = compose_yaml.read_text()
+          print("verdict=leak" if key in compose_text else "verdict=clean")
+          print(f"key_length={len(key)}")
+          PY
+          docker cp "$RUNNER_TEMP/ci_jellyfin_key_check.py" marrquee-stack-smoke:/tmp/ci_jellyfin_key_check.py
+
+          if ! key_check_output=$(docker exec -e RUNNER_TEMP="$RUNNER_TEMP" marrquee-stack-smoke python3 /tmp/ci_jellyfin_key_check.py); then
+            echo "::error::the Jellyfin key check's positive control failed - the check below would prove nothing"
+            exit 1
+          fi
+          echo "$key_check_output"
+          verdict=$(echo "$key_check_output" | sed -n 's/^verdict=//p')
+
+          case "$verdict" in
+            clean) ;;
+            leak) echo "::error::the Jellyfin API key leaked into compose.yaml"; exit 1 ;;
+            *) echo "::error::the Jellyfin key check produced an unexpected verdict (${verdict})"; exit 1 ;;
+          esac
+
+      # The API key Marrquee minted stays valid through the rename - only
+      # the admin's name and password on Jellyfin itself change, so this
+      # never restarts Jellyfin, the same as every other login-change
+      # branch. This is the last step in the job to need the login at
+      # all, so there is no "change back": nothing later reads the
+      # original username or password again.
+      - name: Changing the one login changes Jellyfin's admin
+        run: |
+          set -euo pipefail
+
+          if ! new_password=$(openssl rand -hex 16); then
+            echo "::error::couldn't generate a second throwaway password"
+            exit 1
+          fi
+          echo "::add-mask::$new_password"
+
+          if ! change_code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:7788/hub/login/change --data-urlencode "current_password=${MARRQUEE_CI_PASSWORD}" --data-urlencode "username=marrquee-ci-two" --data-urlencode "password=${new_password}" --data-urlencode "password_again=${new_password}"); then
+            echo "::error::couldn't reach Marrquee to change the login"
+            exit 1
+          fi
+          if [ "$change_code" != "303" ]; then
+            echo "::error::POST /hub/login/change returned ${change_code:-<no response>}, expected 303"
+            exit 1
+          fi
+
+          busy=""
+          banner=""
+          for _ in $(seq 1 90); do
+            status=$(curl -fsS http://127.0.0.1:7788/api/hub/status) || status=""
+            if [ -n "$status" ]; then
+              busy=$(echo "$status" | jq -r '.busy')
+              banner=$(echo "$status" | jq -r '.login_banner')
+              echo "login change: busy=$busy login_banner=$banner"
+              if [ "$busy" = "false" ] && [ "$banner" = "none" ]; then
+                break
+              fi
+            fi
+            sleep 2
+          done
+          if [ "$busy" != "false" ] || [ "$banner" != "none" ]; then
+            echo "::error::the login change never finished within 3 minutes (busy=${busy}, login_banner=${banner})"
+            exit 1
+          fi
+
+          cat > "$RUNNER_TEMP/ci_jellyfin_login_change.py" <<'PY'
+          import asyncio
+          import os
+
+          from marrquee.config import Settings
+          from marrquee.docker_client import SocketDockerEngine
+          from marrquee.jellyfin import HttpJellyfinServer, jellyfin_base_url
+          from marrquee.plex import plex_host_address
+
+
+          async def main() -> None:
+              settings = Settings.from_env()
+              engine = SocketDockerEngine(
+                  settings.docker_socket, compose_binary=settings.compose_binary
+              )
+              self_id = await engine.self_container_id()
+              address = await plex_host_address(engine, self_id)
+              if address is None:
+                  raise SystemExit("Marrquee could not work out its own reachable address for Jellyfin")
+              base_url = jellyfin_base_url(address)
+              server = HttpJellyfinServer()
+
+              new_password = os.environ["JELLYFIN_NEW_PASSWORD"]
+              old_password = os.environ["JELLYFIN_OLD_PASSWORD"]
+
+              new_auth = await server.request(
+                  "POST",
+                  base_url,
+                  "/Users/AuthenticateByName",
+                  token=None,
+                  json_body={"Username": "marrquee-ci-two", "Pw": new_password},
+              )
+              if not new_auth.ok:
+                  raise SystemExit(f"signing in with the new login failed (status {new_auth.status})")
+
+              old_auth = await server.request(
+                  "POST",
+                  base_url,
+                  "/Users/AuthenticateByName",
+                  token=None,
+                  json_body={"Username": "marrquee-ci", "Pw": old_password},
+              )
+              if old_auth.status != 401:
+                  raise SystemExit(f"the old login still works (status {old_auth.status}, expected 401)")
+
+              print("jellyfin login change check: ok")
+
+
+          asyncio.run(main())
+          PY
+          docker cp "$RUNNER_TEMP/ci_jellyfin_login_change.py" marrquee-stack-smoke:/tmp/ci_jellyfin_login_change.py
+          if ! login_change_output=$(docker exec -e JELLYFIN_NEW_PASSWORD="$new_password" -e JELLYFIN_OLD_PASSWORD="$MARRQUEE_CI_PASSWORD" marrquee-stack-smoke python3 /tmp/ci_jellyfin_login_change.py 2>&1); then
+            echo "$login_change_output"
+            echo "::error::Jellyfin's admin was not changed by the one login's password change"
+            exit 1
+          fi
+          echo "$login_change_output"
+
       # The one place technical detail is allowed to show up, and exactly
       # where a first-time developer needs it: a red run here is debuggable
       # from the workflow's own log, not just "it failed". The same text
@@ -2481,12 +2919,21 @@ jobs:
           docker logs recyclarr || true
           echo "---- docker logs plex ----"
           docker logs plex || true
+          echo "---- docker logs jellyfin ----"
+          docker logs jellyfin || true
 
       - name: Clean up every container, network and temp folder this job made
         if: always()
         run: |
-          docker rm -f prowlarr sonarr radarr gluetun qbittorrent recyclarr plex marrquee-stack-smoke 2>/dev/null || true
+          docker rm -f prowlarr sonarr radarr gluetun qbittorrent recyclarr plex jellyfin marrquee-graphics-check marrquee-stack-smoke 2>/dev/null || true
           docker network rm marrquee 2>/dev/null || true
+          # A device node this job mknod'd on the runner's own /dev - never
+          # removed when the runner already had a real one, and `|| true`
+          # both ways means a leftover never turns a green run red.
+          if [ -f "$RUNNER_TEMP/marrquee-made-dri" ]; then
+            sudo rm -f /dev/dri/renderD128 || true
+            sudo rmdir /dev/dri 2>/dev/null || true
+          fi
           # Some of what's under here (a container's own /config contents)
           # can be created by the Docker daemon as root, which would block a
           # plain `rm -rf` run as the unprivileged runner user - GitHub-hosted

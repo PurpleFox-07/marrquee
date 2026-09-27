@@ -14,6 +14,7 @@ import pytest
 
 from marrquee.catalog import (
     CATALOG,
+    JELLYFIN_APP_ID,
     MEDIA_SERVER_APP_IDS,
     PLEX_APP_ID,
     RECYCLARR_APP_ID,
@@ -30,6 +31,8 @@ from marrquee.catalog import (
     unavailable_reason,
 )
 from marrquee.words import (
+    JELLYFIN_DESCRIPTION,
+    JELLYFIN_EXCLUDES_PLEX,
     PLEX_DESCRIPTION,
     PLEX_EXCLUDES_JELLYFIN,
     PROWLARR_DESCRIPTION,
@@ -53,6 +56,7 @@ def test_catalog_holds_the_three_arr_apps_gluetun_and_qbittorrent_in_deploy_orde
         "qbittorrent",
         "recyclarr",
         "plex",
+        "jellyfin",
     ]
     orders = [app.order for app in CATALOG]
     assert orders == sorted(orders)
@@ -100,6 +104,7 @@ def test_the_three_arr_apps_take_the_login_gluetun_takes_none_qbittorrent_its_ow
         "qbittorrent": "qbittorrent",
         "recyclarr": "none",
         "plex": "none",
+        "jellyfin": "jellyfin",
     }
 
 
@@ -191,6 +196,7 @@ def test_every_catalog_description_is_the_mockups_own_wording() -> None:
     assert descriptions_by_id["radarr"] == RADARR_DESCRIPTION
     assert descriptions_by_id["recyclarr"] == RECYCLARR_DESCRIPTION
     assert descriptions_by_id["plex"] == PLEX_DESCRIPTION
+    assert descriptions_by_id["jellyfin"] == JELLYFIN_DESCRIPTION
     assert PROWLARR_DESCRIPTION == "Your search sources, managed in one place."
     assert SONARR_DESCRIPTION == "Finds and organizes your TV shows."
     assert RADARR_DESCRIPTION == "Finds and organizes your movies."
@@ -380,7 +386,6 @@ def test_require_port_raises_for_recyclarr_and_returns_8989_for_sonarr() -> None
 def test_plex_sits_last_right_after_recyclarr() -> None:
     ids = [app.id for app in CATALOG]
 
-    assert ids[-1] == "plex"
     assert ids.index("plex") == ids.index("recyclarr") + 1
 
 
@@ -416,6 +421,50 @@ def test_plex_is_unavailable_beside_jellyfin() -> None:
     assert unavailable_reason(plex, ("jellyfin",)) == PLEX_EXCLUDES_JELLYFIN
     assert unavailable_reason(plex, ()) is None
     assert unavailable_reason(plex, ("sonarr",)) is None
+
+
+# --- Jellyfin: a media-server app that excludes, and is excluded by, Plex ---
+
+
+def test_jellyfin_sits_last_right_after_plex() -> None:
+    ids = [app.id for app in CATALOG]
+
+    assert ids[-1] == "jellyfin"
+    assert ids.index("jellyfin") == ids.index("plex") + 1
+
+
+def test_jellyfin_facts_match_the_verified_image_docs() -> None:
+    jellyfin = get_app(JELLYFIN_APP_ID)
+
+    assert jellyfin.id == "jellyfin"
+    assert jellyfin.name == "Jellyfin"
+    assert jellyfin.description == JELLYFIN_DESCRIPTION
+    assert jellyfin.image == "lscr.io/linuxserver/jellyfin:latest"
+    assert jellyfin.port == 8096
+    assert jellyfin.env_prefix == "JELLYFIN"
+    assert jellyfin.api_base == ""
+    assert jellyfin.media_folders == ()
+    assert jellyfin.needs_data_mount is False
+    assert jellyfin.glyph == "JF"
+    assert jellyfin.order == 7
+    assert jellyfin.default_ticked is False
+    assert jellyfin.web_page is True
+    assert jellyfin.login_kind == "jellyfin"
+    assert jellyfin.kind == "media_server"
+    assert jellyfin.offered is True
+    assert jellyfin.api_key_style == "hex32"
+    assert jellyfin.web_path == "/"
+    assert jellyfin.library_folders == ("movies", "tv")
+
+
+def test_jellyfin_and_plex_exclude_each_other_in_both_directions() -> None:
+    plex = get_app(PLEX_APP_ID)
+    jellyfin = get_app(JELLYFIN_APP_ID)
+
+    assert unavailable_reason(jellyfin, ("plex",)) == JELLYFIN_EXCLUDES_PLEX
+    assert unavailable_reason(jellyfin, ()) is None
+    assert unavailable_reason(plex, ("jellyfin",)) == PLEX_EXCLUDES_JELLYFIN
+    assert unavailable_reason(plex, ()) is None
 
 
 def test_media_server_of_picks_plex() -> None:

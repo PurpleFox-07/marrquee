@@ -21,6 +21,8 @@ from marrquee import words
 from marrquee.config import Settings
 from marrquee.deploy import AppProgress, DeploySnapshot
 from marrquee.docker_client import DockerStatus, FakeDockerEngine
+from marrquee.graphics_chip import GRAPHICS_DEVICE_NODE
+from marrquee.login import save_login
 from marrquee.main import create_app
 from marrquee.questions import (
     QuestionCheck,
@@ -253,6 +255,65 @@ def test_the_escape_link_is_on_the_vpn_question_only_when_qbittorrent_is_chosen(
 
     without_qbittorrent = client.get("/setup/questions/gluetun/vpn", params={"apps": "gluetun"})
     assert 'data-role="without-vpn-link"' not in without_qbittorrent.text
+
+
+def test_the_graphics_pill_only_appears_on_a_nas_that_reports_a_chip(tmp_path: Path) -> None:
+    """The real (never monkeypatched) registry: Jellyfin's own chip step is
+    a pill only when the injected engine reports the render node present -
+    the same page, the same apps, two different Docker answers.
+    """
+    settings = _settings(tmp_path)
+
+    without_chip = create_app(
+        settings=settings, engine=FakeDockerEngine(DockerStatus(connected=True))
+    )
+    no_chip_page = TestClient(without_chip).get("/setup/login", params={"apps": "jellyfin"}).text
+    assert words.JELLYFIN_GRAPHICS_STEP_TITLE not in html.unescape(no_chip_page)
+
+    with_chip_engine = FakeDockerEngine(
+        DockerStatus(connected=True), host_paths={GRAPHICS_DEVICE_NODE}
+    )
+    with_chip = create_app(settings=settings, engine=with_chip_engine)
+    chip_page = TestClient(with_chip).get("/setup/login", params={"apps": "jellyfin"}).text
+    assert words.JELLYFIN_GRAPHICS_STEP_TITLE in html.unescape(chip_page)
+
+
+def test_a_run_without_jellyfin_never_probes_docker_for_a_chip(tmp_path: Path) -> None:
+    """Walking every graphics-chip-aware page for an app list that never
+    includes Jellyfin must never touch Docker at all - the guard has to
+    skip the probe before it ever asks, not merely discard whatever answer
+    would have come back.
+    """
+    settings = _settings(tmp_path)
+    save_login(settings.config_dir, "owner", "s3cret-password-1", honor_reset=None)
+    engine = FakeDockerEngine(DockerStatus(connected=True))
+    client = TestClient(create_app(settings=settings, engine=engine))
+
+    client.get("/setup/login", params={"apps": "sonarr"})
+    client.get("/setup/drive", params={"apps": "sonarr"})
+
+    assert [name for name, _args in engine.calls if name == "probe_host_path"] == []
+
+
+def test_a_run_with_jellyfin_probes_docker_exactly_once_across_several_pages(
+    tmp_path: Path,
+) -> None:
+    """`GraphicsChipCheck`'s own cache (one instance per app) means walking
+    several graphics-chip-aware pages in the same run only ever asks Docker
+    once, however many pages ask the same question.
+    """
+    settings = _settings(tmp_path)
+    save_login(settings.config_dir, "owner", "s3cret-password-1", honor_reset=None)
+    engine = FakeDockerEngine(DockerStatus(connected=True), host_paths={GRAPHICS_DEVICE_NODE})
+    client = TestClient(create_app(settings=settings, engine=engine))
+
+    client.get("/setup/login", params={"apps": "jellyfin"})
+    client.get("/setup/questions/jellyfin/graphics", params={"apps": "jellyfin"})
+    client.get("/setup/drive", params={"apps": "jellyfin"})
+
+    assert [name for name, _args in engine.calls if name == "probe_host_path"] == [
+        "probe_host_path"
+    ]
 
 
 def test_a_password_field_never_carries_a_value_even_with_a_saved_answer(
