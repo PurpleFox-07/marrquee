@@ -3786,3 +3786,27 @@ def test_plex_claim_log_check_waits_for_init_plex_claim_to_finish() -> None:
     assert "sleep 5" in log_check
     assert "Last lines:" in log_check
     assert "claim-[redacted]" in log_check
+
+
+def test_seerr_sign_ins_after_setup_send_only_username_and_password() -> None:
+    """Once Seerr has its Jellyfin address saved, v3.4.1 answers any
+    `auth/jellyfin` that still carries `hostname` with 500 "Jellyfin
+    hostname already configured" - the first real CI run failed on exactly
+    that. Both CI sign-ins happen after Marrquee set Seerr up, so both must
+    send what Seerr's own sign-in page sends: a username and a password."""
+    for needles in (
+        ("seerr is set up with",),
+        ("a request in seerr reaches radarr",),
+    ):
+        run = _step_named(_stack_smoke_job(), *needles)["run"]
+        sign_in = run[run.index("auth/jellyfin") :]
+        sign_in = sign_in[: sign_in.index(")")]
+        assert '"password"' in sign_in
+        assert '"hostname"' not in sign_in
+        assert '"serverType"' not in sign_in
+
+
+def test_seerr_setup_check_proves_jellyfin_sign_in_is_switched_on() -> None:
+    run = _step_named(_stack_smoke_job(), "seerr is set up with")["run"]
+
+    assert 'public.payload.get("mediaServerLogin") is not True' in run

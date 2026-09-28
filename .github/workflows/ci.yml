@@ -3280,6 +3280,8 @@ jobs:
                   raise SystemExit("seerr's media server type is not jellyfin")
               if public.payload.get("localLogin") is not False:
                   raise SystemExit("seerr still allows a local sign-in")
+              if public.payload.get("mediaServerLogin") is not True:
+                  raise SystemExit("seerr does not allow signing in with Jellyfin")
 
               main_settings = await client.request("GET", base_url, "api/v1/settings/main", api_key=api_key)
               if not main_settings.ok or not isinstance(main_settings.payload, dict):
@@ -3341,23 +3343,23 @@ jobs:
               if radarr_entry.get("activeProfileName") != "UHD Bluray + WEB":
                   raise SystemExit("seerr's radarr entry is not on Recyclarr's chosen profile")
 
+              # A set-up Seerr takes a Jellyfin sign-in as username and
+              # password only - exactly what its own sign-in page sends. The
+              # server fields belong to first-time setup alone: once
+              # `jellyfin.ip` is saved, Seerr v3.4.1 answers any sign-in that
+              # still carries `hostname` with 500 "Jellyfin hostname already
+              # configured" (`server/routes/auth.ts`).
               auth = await client.request(
                   "POST",
                   base_url,
                   "api/v1/auth/jellyfin",
                   api_key=None,
-                  json_body={
-                      "username": login.username,
-                      "password": login.password,
-                      "hostname": seerr_gateway,
-                      "port": 8096,
-                      "useSsl": False,
-                      "urlBase": "",
-                      "serverType": 2,
-                  },
+                  json_body={"username": login.username, "password": login.password},
               )
               if not auth.ok:
-                  raise SystemExit(f"signing in to seerr with the one login failed (status {auth.status})")
+                  raise SystemExit(
+                      f"signing in to seerr with the one login failed (status {auth.status}): {auth.detail}"
+                  )
 
               # Each printed verdict is its own real comparison, never a bare
               # `True` - a mutation that hollowed one of the `if` checks
@@ -3480,10 +3482,6 @@ jobs:
               if jellyfin_record is None:
                   raise SystemExit("no jellyfin.json was saved to create the friend's account")
 
-              seerr_gateway = await engine.host_gateway("seerr")
-              if seerr_gateway is None:
-                  raise SystemExit("could not read seerr's own gateway address to sign the friend in")
-
               friend_password = secrets.token_hex(16)
               jellyfin_server = HttpJellyfinServer()
               new_user = await jellyfin_server.request(
@@ -3500,19 +3498,14 @@ jobs:
               async with httpx.AsyncClient(base_url=seerr_url) as friend_session:
                   friend_auth = await friend_session.post(
                       "/api/v1/auth/jellyfin",
-                      json={
-                          "username": "marrquee-ci-friend",
-                          "password": friend_password,
-                          "hostname": seerr_gateway,
-                          "port": 8096,
-                          "useSsl": False,
-                          "urlBase": "",
-                          "serverType": 2,
-                      },
+                      # Username and password only, as Seerr's own sign-in
+                      # page sends - see the one-login sign-in above.
+                      json={"username": "marrquee-ci-friend", "password": friend_password},
                   )
                   if friend_auth.status_code != 200:
                       raise SystemExit(
-                          f"signing the friend in to seerr failed (status {friend_auth.status_code})"
+                          f"signing the friend in to seerr failed (status {friend_auth.status_code}): "
+                          f"{friend_auth.text[:300]}"
                       )
 
                   friend_request = await friend_session.post(
